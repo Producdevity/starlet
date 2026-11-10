@@ -47,3 +47,8 @@ target_link_libraries(port PRIVATE starlet::gx_gles)
 ```
 
 An embedding project builds Starlet's tests only with `STARLET_TESTS` set.
+
+## License
+
+Starlet is licensed under the GNU General Public License, version 3. See
+[LICENSE](LICENSE).
