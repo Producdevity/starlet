@@ -8,8 +8,14 @@ token.
 The supported domain is RGB8/RGBA6 EFB color or high-byte D24 depth, non-AA and
 progressive. Copies may use unity size or the requested 2x2 box reduction. Color
 outputs include RGB565, RGB5A3, RGBA8, A8, R8/G8/B8 and video-range I8 luminance.
-Other depth formats fail with an error. The copy uses its configured rectangle and
+Other depth formats fail with an error. The SDK selects the Z24 pixel format just
+for a depth copy, so a port decoding the GX stream may plan depth copies while the
+PE control holds Z24; colour copies under Z24 are refused. The copy uses its configured rectangle and
 tile-row stride, independently of raster scissor.
+A rectangle reaching past the frame's right or bottom edge (or past the strip
+rows below it) is cut to them, as Dolphin does, and the destination keeps only
+the rows the cut rectangle covers; Pikmin 2's split-screen shadows rely on it.
+What the hardware reads past the EFB is unverified.
 
 The vertical filter's seven taps fold into weights for the rows above, at and
 below each source row, as for display copies. Each RGB channel becomes the

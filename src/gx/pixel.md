@@ -2,7 +2,8 @@
 
 `capture_pixel` owns BP00/41/42/43 and their revision. It validates only the color
 operation, producing an immutable plan and uniforms. It does not admit a draw,
-interpret depth/fog/Z-texture, perform alpha tests, or change renderer gates.
+interpret depth, fog or Z textures (depth.md), perform alpha tests, or change
+renderer gates.
 `evaluate_pixel` consumes RGBA8 source, canonical destination codes, EFB x/y,
 and the caller's color-acceptance result. A rejected color or masked channel
 preserves the old code exactly.

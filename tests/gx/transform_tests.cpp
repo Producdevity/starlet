@@ -178,6 +178,99 @@ void texture_coordinates() {
     Fixture color(false,0,0); auto cv=vertex(); color.xf(0x100c,0x804020ff); color.texgen(0,2,false,false,2);
     auto co=evaluate(color.capture(cv),cv); close(co.texcoords[0][0],128.0f/255,"SRTG red"); close(co.texcoords[0][1],64.0f/255,"SRTG green");
 }
+void emboss() {
+    Fixture f; auto v=vertex();
+    f.texgen(0,5,false,false);
+    // Texgen 1 embosses texgen 0 towards light 2; the vertex's binormal is +x, its tangent +y.
+    f.xf(0x103f,2); f.xf(0x1041,(1u<<4)|(0u<<12)|(2u<<15));
+    f.light(2,{5,7,-4,0},{0,0,0,0},{1,0,0,0},{1,0,0,0},0xffffffffu);
+    auto c=f.capture(v); auto o=evaluate(c,v);
+    close(o.texcoords[1][0],0.25f+0.6f,"emboss s offset is the light direction on the binormal");
+    close(o.texcoords[1][1],0.5f+0.8f,"emboss t offset is the light direction on the tangent");
+    close(o.texcoords[1][2],1,"emboss keeps the source q");
+    f.normal_matrix(0,{{{2,0,0,0},{0,1,0,0},{0,0,1,0}}});
+    o=evaluate(f.capture(v),v);
+    close(o.texcoords[1][0],0.25f+1.2f,"emboss axes go through the normal matrix unnormalized");
+    f.normal_matrix(0,identity);
+    const auto key=generate_transform_glsl(c.snapshot->pipeline,TransformArithmetic::float32_candidate_v1);
+    ok(key.status);
+    require(key.source.find("gx_tex1 = gx_tex0 + vec3(offset,0.0)")!=std::string::npos,"emboss GLSL offsets its source");
+    require(generate_transform_glsl(c.snapshot->pipeline,TransformArithmetic::float32_candidate_v1,false,false,0,false,true).status.error==
+            TransformError::unsupported_state,"instanced transforms reject emboss texgens");
+    auto other=c.snapshot->pipeline; other.texgens[1].emboss_light=3;
+    require(generate_transform_glsl(other,TransformArithmetic::float32_candidate_v1,false).key!=key.key,"the emboss light is program identity");
+    f.xf(0x1041,(1u<<4)|(1u<<12)|(2u<<15));
+    require(f.capture(v).status.error==TransformError::unsupported_state,"emboss needs an earlier source");
+    Fixture plain(false); auto pv=vertex(); plain.texgen(0,5,false,false);
+    plain.xf(0x103f,2); plain.xf(0x1041,(1u<<4)|(2u<<15));
+    require(plain.capture(pv).status.error==TransformError::missing_input,"emboss without NBT is rejected");
+}
+// The instanced variant reads the position and normal matrix rows per instance and
+// everything else from the shared block.
+void instanced_variant() {
+    Fixture lit; auto v=vertex(); v.position={0,0,0};
+    lit.xf(0x1009,1); lit.xf(0x100c,0xffffffff); lit.xf(0x100a,0);
+    lit.light(0,{0,0,2,0},{0,0,1,0},{1,0,0,0},{1,0,0,0},0x64281414);
+    lit.channel(0,true,false,false,1,2,0);
+    const auto c=lit.capture(v); ok(c.status);
+    const auto& p=c.snapshot->pipeline;
+    const auto plain=generate_transform_glsl(p,TransformArithmetic::float32_candidate_v1); ok(plain.status);
+    const auto instanced=generate_transform_glsl(p,TransformArithmetic::float32_candidate_v1,true,false,0,false,true); ok(instanced.status);
+    require(instanced.key!=plain.key,"instancing is program identity");
+    require(instanced.source.find("dot(u_instance[ib],position)")!=std::string::npos &&
+            instanced.source.find("dot(u_instance[ib+3].xyz,normalIn)")!=std::string::npos &&
+            instanced.source.find("u_position[pn]")==std::string::npos && instanced.source.find("u_normal[nr]")==std::string::npos,
+            "instanced GLSL takes both matrices from the instance rows");
+    require(plain.source.find("u_instance")==std::string::npos,"the plain variant has no instance block");
+    require(generate_transform_glsl(p,TransformArithmetic::float32_candidate_v1,true,true,0,false,true).status.error==
+            TransformError::unsupported_state,"a transform is batched or instanced, not both");
+}
+// Draws without normals light with the vectors the XF latched from an earlier vertex.
+void latched_normals() {
+    Fixture lit; auto v=vertex(); v.position={0,0,0};
+    lit.xf(0x1009,1); lit.xf(0x100c,0xffffffff); lit.xf(0x100a,0);
+    lit.light(0,{0,0,2,0},{0,0,1,0},{1,0,0,0},{1,0,0,0},0x64281414);
+    lit.channel(0,true,false,false,1,2,0);
+    const auto with_normal=evaluate(lit.capture(v),v);
+    Fixture bare(false,3,255); auto bv=vertex(); bv.position={0,0,0};
+    bare.xf(0x1009,1); bare.xf(0x100c,0xffffffff); bare.xf(0x100a,0);
+    bare.light(0,{0,0,2,0},{0,0,1,0},{1,0,0,0},{1,0,0,0},0x64281414);
+    bare.channel(0,true,false,false,1,2,0);
+    require(bare.capture(bv).status.error==TransformError::missing_input,"lighting without a normal or latch is rejected");
+    const auto vs=bare.vertices({bv}); require(bool(vs),vs.message.c_str());
+    TransformPipeline p;
+    ok(capture_transform_pipeline(bare.decoder.state(),vs.snapshot->layout(),3,p,3));
+    require(p.latched_normal && p.normal_components==3,"a latched normal stands in for the attribute");
+    TransformUniforms u; direct_transform_uniforms(bare.decoder.state(),u);
+    u.latched_normal[0]={0,0,2,0};
+    const auto r=evaluate_transform(p,u,bv,TransformArithmetic::float32_candidate_v1); ok(r.status);
+    require(r.output.colors[0]==with_normal.colors[0],"latched normal lights like the same normal attribute");
+    TransformPipeline unlit; bare.channel(0,false,false,false,0,0,0);
+    ok(capture_transform_pipeline(bare.decoder.state(),vs.snapshot->layout(),3,unlit,3));
+    require(!unlit.latched_normal && !unlit.normal_components,"pipelines that need no normal ignore the latch");
+    const auto shader=generate_transform_glsl(p,TransformArithmetic::float32_candidate_v1);
+    ok(shader.status);
+    require(shader.source.find("vec3 normalIn = u_latched_normal[0].xyz;")!=std::string::npos,"latched GLSL reads the uniform");
+    TransformPipeline attribute=p; attribute.latched_normal=false;
+    require(generate_transform_glsl(attribute,TransformArithmetic::float32_candidate_v1,false).key!=shader.key,"the latch is program identity");
+    // The latch comes from the last enabled vertex of a draw with normals.
+    std::vector<std::uint8_t> bytes;
+    ExpandedVertex a=vertex(), b=vertex(); b.normal={0,1,0, 1,0,0, 0,0,1};
+    for(const auto* x:{&a,&b}) {
+        bytes.insert(bytes.end(),x->matrix_indices.begin(),x->matrix_indices.end());
+        for(float c:x->position) append32(bytes,bits(c));
+        for(float c:x->normal) append32(bytes,bits(c));
+        for(unsigned i=0;i<2;++i) bytes.insert(bytes.end(),x->colors[i].begin(),x->colors[i].end());
+        for(unsigned i=0;i<8;++i) for(float c:x->texcoords[i]) append32(bytes,bits(c));
+    }
+    Draw d; d.primitive=0xb8; d.vertex_count=2;
+    std::string error; require(lit.decoder.state().vertex_layout(0,d.layout,error),error.c_str());
+    d.vertices={bytes.data(),bytes.size()};
+    std::array<float,9> latch{};
+    require(latest_normal(lit.decoder.state(),d,lit.memory,latch)==9 && latch==b.normal,"last vertex's NBT is latched");
+    d.layout.normal.mode=AttributeMode::none;
+    require(latest_normal(lit.decoder.state(),d,lit.memory,latch)==0,"draws without normals leave the latch");
+}
 void lighting() {
     Fixture f; auto v=vertex(); v.position={0,0,0};
     f.xf(0x1009,2); f.xf(0x100c,0x804020ff); f.xf(0x100d,0x10203040);
@@ -250,7 +343,7 @@ void failures_and_keys() {
     f.texgen(0,2,false,false,3); require(f.capture(v).status.error==TransformError::unsupported_state,"SRTG channel ordering constraint");
     f.texgen(0,2,false,false,2); f.texgen(1,2,false,false,2);
     require(f.capture(v).status.error==TransformError::unsupported_state,"duplicate SRTG color0 rejected");
-    f.texgen(0,5,false,false,1); require(f.capture(v).status.error==TransformError::unsupported_state,"emboss must fail explicitly");
+    f.texgen(0,5,false,false,1); require(f.capture(v).status.error==TransformError::unsupported_state,"emboss without an earlier source fails explicitly");
     // Bits above the 18-bit texgen and 9-bit post registers do not exist; bits inside them that do nothing are rejected.
     f.texgen(0,5,false); f.xf(0x1040,0xffff4000u|(5u<<7)); f.xf(0x1050,0xfffffe00u|61u); ok(f.capture(v));
     f.xf(0x1040,(5u<<7)|1u); require(f.capture(v).status.error==TransformError::unsupported_state,"reserved texgen bit 0 rejected");
@@ -287,7 +380,20 @@ void failures_and_keys() {
     ok(f.diagnose(v)); // A zero divisor saturates the light.
     f.xf(0x1009,0);
     Fixture missing(false,0,0); auto mv=vertex(); missing.texgen(0,1,true); require(missing.capture(mv).status.error==TransformError::missing_input,"absent normals are not zeros");
-    missing.texgen(0,5,false); require(missing.capture(mv).status.error==TransformError::missing_input,"absent ST rejected");
+    // An absent ST reads (0, 0, 1, 1) whatever the vertex holds: s and t are the
+    // matrix's third and fourth columns summed.
+    missing.matrix(0,60,{{TransformVector{1,0,2,3},TransformVector{0,1,4,5},TransformVector{0,0,1,0}}});
+    missing.texgen(0,5,false); const auto absent_st=missing.capture(mv); ok(absent_st);
+    require(evaluate(absent_st,mv).texcoords[0]==std::array<float,3>{{5,9,1}},"absent ST reads (0, 0, 1, 1)");
+    const auto absent_shader=generate_transform_glsl(absent_st.snapshot->pipeline,TransformArithmetic::float32_candidate_v1); ok(absent_shader);
+    require(absent_shader.source.find("vec4 source = vec4(0.0,0.0,1.0,1.0)")!=std::string::npos &&
+            absent_shader.source.find("vec4 source = vec4(a_tex0")==std::string::npos,"the shader supplies (0, 0, 1, 1) for an absent ST");
+    {
+        Fixture present(false,0,1); auto pv=vertex(); present.texgen(0,5,false); const auto with_st=present.capture(pv); ok(with_st);
+        require(generate_transform_glsl(with_st.snapshot->pipeline,TransformArithmetic::float32_candidate_v1).key!=absent_shader.key,
+                "ST presence is part of the program key");
+    }
+    missing.matrix(0,60,identity);
     missing.xf(0x103f,0); missing.xf(0x1009,1); missing.channel(0,false,true,false,0,0,0);
     require(bool(missing.capture(mv)),"an absent color reads white instead of failing");
     f.xf(0x103f,0); v=vertex(); auto c=f.capture(v); ok(c); auto p=c.snapshot->pipeline;
@@ -461,7 +567,7 @@ void unused_raster_colors() {
 }
 int main(int argc,char** argv) {
     try {
-        clip_disabled_domain(); unused_raster_colors(); projection_and_aliases(); texture_coordinates(); lighting(); prepared_lighting_channels(); failures_and_keys();
+        clip_disabled_domain(); unused_raster_colors(); projection_and_aliases(); texture_coordinates(); emboss(); instanced_variant(); latched_normals(); lighting(); prepared_lighting_channels(); failures_and_keys();
         if(argc==3 && std::string(argv[1])=="--fixtures") fixtures(argv[2]);
         else require(argc==1,"usage: starlet_gx_transform_tests [--fixtures EXISTING_DIRECTORY]");
         std::cout << "GX transform tests passed\n";

@@ -14,10 +14,13 @@ scissor endpoints become a half-open lower-left rectangle. The viewport is not
 clipped or rounded.
 
 `plan_gles_raster` is the initial GPU integration domain, not complete GX support.
-It admits integral viewports, scissor contained inside
+It admits integral viewports (or, with `FractionalViewport::round`, any viewport
+with its edges rounded to the nearest pixel), scissor contained inside
 the viewport, smooth unculled RGB8 triangles and ordinary blending. Depth,
 interlace, fog, logic operations, reduced EFB formats and other unsupported
 settings fail with an error. The draw layer also validates topology and sampling.
+An active Z texture (BP F4/F5, depth.md) clears `early_depth`: the depth test runs
+after texturing. Reserved Z-texture state fails with an error.
 
 `plan_gles_raster_fast` admits fog: BP 0xEE..0xF1 decode as written by the SDK's
 GXSetFog (A and C as 20-bit floats, B as a 24-bit magnitude over 2^24 with a

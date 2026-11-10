@@ -21,11 +21,19 @@ struct GlesDirectLimits {
     // spans are unchanged; both are compared on every use.
     std::size_t geometry_bytes = 32 * 1024 * 1024;
     std::size_t geometries = 8192;
+    // Smallest indexed draw kept as resident geometry; smaller ones stream. Resident draws
+    // can be instanced, which suits games that repeat small models (Pikmin 2's title).
+    unsigned geometry_min_vertices = 8;
     // Hash texture sources on every use instead of once per frame.
     bool verify_textures = false;
     DirectShading shading = DirectShading::exact;
+    // EFB pixels per draw-sync snapshot sample along each axis (1, 2 or 4); 0 keeps
+    // quarter resolution under fast shading and full resolution otherwise.
+    int snapshot_scale = 0;
     // How scissors reaching past the viewport are drawn; see GuardBand.
     GuardBand guard_band = GuardBand::reject;
+    // Whether viewports off the pixel grid are refused or rounded; see FractionalViewport.
+    FractionalViewport fractional_viewport = FractionalViewport::reject;
     // Directory for linked program binaries kept across runs; empty disables it.
     // With fast shading, the words of every linked program are added to programs.list there.
     std::string program_cache;
@@ -34,6 +42,11 @@ struct GlesDirectLimits {
     // Fast shading with a cache: programs missing from it are built in the background while
     // their draws are skipped. Otherwise the GL thread compiles them before the draw.
     bool background_programs = true;
+    // For destination memory whose writes nobody reports, such as a recompiled game's RAM:
+    // resident copies stamp up to 64 32-byte blocks spread over their destination (first
+    // and last included) and are sampled or materialized only while every stamp is
+    // intact. A game that reuses the memory breaks a stamp, and its bytes then stay.
+    bool stamp_resident_copies = false;
 };
 // An EFB texture copy held only on the GPU: texture holds the texels the copy's
 // sample format decodes, so memory at destination is stale until materialized.
@@ -45,6 +58,13 @@ struct GlesResidentCopy {
     TextureCopy plan;
     std::uint8_t* destination = nullptr;
     std::size_t capacity = 0;
+    // Nonzero when the destination is stamped; see GlesDirectLimits::stamp_resident_copies.
+    std::uint64_t stamp = 0;
+    void write_stamps() const;
+    // Whether the destination's 32-byte block still holds its stamp.
+    bool stamped(std::size_t block) const;
+    // Unstamped, or every stamped block still holds its stamp.
+    bool intact() const;
 };
 struct GlesDirectStats {
     std::uint64_t draws = 0, zero_area = 0, submissions = 0, segments = 0, vertex_bytes = 0;
@@ -58,6 +78,10 @@ struct GlesDirectStats {
     std::uint64_t program_link_us = 0;
     // Draws skipped while the program builder compiled their program.
     std::uint64_t unready_draws = 0;
+    // Draws added as instances to the previous resident draw; see the instancing notes in direct.md.
+    std::uint64_t instanced_draws = 0;
+    // Texture resolutions (cache lookups, validation, decoding) the draws needed.
+    std::uint64_t texture_lookups = 0;
     GlesProgramCacheStats program_cache;
 };
 

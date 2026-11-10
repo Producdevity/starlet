@@ -189,7 +189,8 @@ void GlesProgramBuilder::plan() {
             if (!seen.insert(words).second) continue;
             ++listed_;
             const bool batched = words.size() == 102 && words.back() == batched_program_word;
-            if (batched) words.pop_back();
+            const bool instanced = words.size() == 102 && words.back() == instanced_program_word;
+            if (batched || instanced) words.pop_back();
             // The device's own fetch mode keys the programs its draws will ask for.
             words[0] = (words[0] & ~0xf0000u) | (static_cast<std::uint32_t>(fetch_) << 16);
             try {
@@ -197,13 +198,13 @@ void GlesProgramBuilder::plan() {
                 VertexLayout layout;
                 DirectProgramResult planned;
                 if (!direct_program_state(words, state, layout) ||
-                    !(planned = plan_direct_program(state, layout, fetch_, DirectShading::fast, batched))) {
+                    !(planned = plan_direct_program(state, layout, fetch_, DirectShading::fast, batched, 0, instanced))) {
                     ++rejected_;
                     continue;
                 }
                 const auto& p = *planned.program;
                 if (sources.insert(source_key(p.vertex, p.fragment)).second && !cache_.contains(p.vertex, p.fragment))
-                    todo_.push_back({std::move(words), batched});
+                    todo_.push_back({std::move(words), batched, instanced});
             } catch (const std::exception&) {
                 ++rejected_;
             }
@@ -246,7 +247,7 @@ void GlesProgramBuilder::work(unsigned index) {
             VertexLayout layout;
             DirectProgramResult planned;
             if (direct_program_state(todo_[at].words, state, layout) &&
-                (planned = plan_direct_program(state, layout, fetch_, DirectShading::fast, todo_[at].batched)))
+                (planned = plan_direct_program(state, layout, fetch_, DirectShading::fast, todo_[at].batched, 0, todo_[at].instanced)))
                 build(planned.program->vertex, planned.program->fragment, built_);
         } catch (const std::exception&) {
             ++failed_;

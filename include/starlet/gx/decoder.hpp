@@ -2,6 +2,7 @@
 
 #include "starlet/gx/state.hpp"
 
+#include <array>
 #include <bitset>
 #include <string>
 #include <vector>
@@ -27,12 +28,27 @@ public:
     // Return exactly size canonical big-endian GX bytes, or false. Native arrays need
     // an explicit typed view/conversion. Do not call back into Decoder.
     virtual bool copy(std::uint32_t address, std::uint8_t* destination, std::size_t size) = 0;
+    // An indexed XF load (CP opcodes 0x20, 0x28, 0x30, 0x38) reads matrices or lights from
+    // array 12 + n. Games fill those arrays on the CPU each frame; a port whose CPU memory
+    // is not canonical returns them converted here. The default reads through copy().
+    virtual bool copy_indexed_xf(std::uint8_t array, std::uint32_t address, std::uint8_t* destination, std::size_t size) {
+        (void)array;
+        return copy(address, destination, size);
+    }
     // Optional exact canonical span, borrowed only until the next reader call or
     // source mutation. Consumers must finish reading it before returning a snapshot.
     virtual ByteView view(std::uint32_t, std::size_t) { return {}; }
     // Optional array suffix, stable across reader calls until the synchronous draw
     // callback returns. No pointer from it may enter a retained snapshot.
     virtual MemoryArrayView array_view(std::uint32_t) { return {}; }
+    // Write generation of the size bytes at address, inside view (array_view of the array
+    // base): an unchanged nonzero value promises unchanged bytes. For readers that track
+    // writes finer than whole arrays; the default is the array's generation.
+    virtual std::uint64_t range_generation(const MemoryArrayView& view, std::uint32_t address, std::size_t size) {
+        (void)address;
+        (void)size;
+        return view.generation;
+    }
     // Write generation of the registered source containing native bytes, such as a
     // draw's display-list payload; zero when unknown. See MemoryArrayView::generation.
     virtual std::uint64_t source_generation(const void*) { return 0; }
@@ -124,6 +140,13 @@ public:
     Decoder(MemoryReader& memory, CommandSink& sink, Limits limits = {}, EfbLayout efb = {});
     const State& state() const { return state_; }
     const Status& status() const { return status_; }
+    // Commands decoded so far: those fast_command applied, the general path's by opcode
+    // (VAT bits cleared for primitives), and display lists run.
+    struct Counts {
+        std::uint64_t fast_bp = 0, fast_cp = 0, fast_xf = 0, nops = 0, lists = 0, list_bytes = 0;
+        std::array<std::uint64_t, 256> general{};
+    };
+    const Counts& counts() const { return counts_; }
     // Feeds may end anywhere, including within a vertex. Whole commands commit in order.
     // Errors latch; discard this decoder after failure. Earlier commands remain applied.
     // Processing exceptions latch failure and propagate without changing their type.
@@ -179,10 +202,14 @@ private:
     bool feeding_ = false;
     bool injecting_ = false;
     bool host_callback_ = false; // Inside host_command or filter_bp, where inject may run.
-    // The feed loop applies NOP runs, these BP and CP writes and XF matrix-memory writes itself.
+    // The feed loop and display lists apply NOP runs, these BP and CP writes and XF
+    // matrix-memory writes themselves (fast_command).
+    enum class Fast { none, applied, failed };
+    Fast fast_command(const std::uint8_t* p, std::size_t remaining, unsigned depth, Budget& budget, std::size_t& consumed);
     bool fast_nop_ = false, fast_xf_ = false;
     std::bitset<256> plain_bp_, dropped_bp_, plain_cp_;
     Budget* budget_ = nullptr; // The running feed's budget, which injected commands share.
+    Counts counts_;
 };
 
 } // namespace starlet::gx

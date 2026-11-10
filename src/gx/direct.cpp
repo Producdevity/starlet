@@ -38,24 +38,29 @@ std::uint8_t affine_coordinates(const State& state, const TransformPipeline& p) 
     std::uint8_t mask = 0;
     for (unsigned i = 0; i < p.texgen_count; ++i) {
         const auto& t = p.texgens[i];
+        if (t.type == 1) { mask |= ((mask >> t.emboss_source) & 1u) << i; continue; }
         if (t.type >= 2 || (!t.projected && (!p.dual_texture || (identity && t.post_row == 61 && !t.normalize)))) mask |= 1u << i;
     }
     return mask;
 }
 // Fog type, projection and range-adjustment enable select the fast fragment program.
+// Projection and range adjustment are read only while fog is on, as the raster plan reads them.
 std::uint8_t fast_fog(const State& state) {
-    return static_cast<std::uint8_t>(((state.bp(0xf1) >> 21) & 7) | ((state.bp(0xf1) >> 20) & 1) << 3 |
-                                     ((state.bp(0xe8) >> 10) & 1) << 4);
+    const unsigned type = (state.bp(0xf1) >> 21) & 7;
+    if (!type) return 0;
+    return static_cast<std::uint8_t>(type | ((state.bp(0xf1) >> 20) & 1) << 3 | ((state.bp(0xe8) >> 10) & 1) << 4);
 }
 }
 
 void direct_program_words(const State& state, const VertexLayout& layout, FramebufferFetch fetch, DirectShading shading,
-                          std::vector<std::uint32_t>& words) {
+                          std::vector<std::uint32_t>& words, std::uint8_t latched_normal) {
     words.clear();
     const auto format = stream_format(layout);
     const bool fast = shading == DirectShading::fast;
+    const std::uint32_t latched = format.normal_vectors ? 0 : latched_normal;
     words.push_back(std::uint32_t{format.normal_vectors} | (std::uint32_t{format.colors} << 4) |
-                    (std::uint32_t{format.texcoords} << 8) | (static_cast<std::uint32_t>(fetch) << 16) | (std::uint32_t{fast} << 20));
+                    (std::uint32_t{format.texcoords} << 8) | (static_cast<std::uint32_t>(fetch) << 16) | (std::uint32_t{fast} << 20) |
+                    (latched << 21));
     for (std::uint16_t a : {0x1005, 0x1009, 0x100e, 0x100f, 0x1010, 0x1011, 0x1012, 0x1026, 0x103f}) words.push_back(state.xf(a));
     for (std::uint16_t a = 0x1040; a < 0x1048; ++a) words.push_back(state.xf(a));
     for (std::uint16_t a = 0x1050; a < 0x1058; ++a) words.push_back(state.xf(a));
@@ -153,7 +158,7 @@ bool direct_program_state(const std::vector<std::uint32_t>& words, State& state,
 }
 
 DirectProgramResult plan_direct_program(const State& state, const VertexLayout& layout, FramebufferFetch fetch, DirectShading shading,
-                                        bool batched) {
+                                        bool batched, std::uint8_t latched_normal, bool instanced) {
     auto fail = [](DrawError error, const std::string& message) { return DirectProgramResult{reject(error, message), {}}; };
     auto p = std::make_shared<DirectProgram>();
     const auto tev = capture_tev(state);
@@ -164,7 +169,7 @@ DirectProgramResult plan_direct_program(const State& state, const VertexLayout& 
     p->indirect = *indirect.snapshot;
     std::uint8_t raster_colors = 0;
     for (unsigned i = 0; i < p->tev.stage_count; ++i) raster_colors |= tev_input_use(p->tev.stages[i]).raster_mask;
-    const auto transform = capture_transform_pipeline(state, layout, raster_colors, p->transform);
+    const auto transform = capture_transform_pipeline(state, layout, raster_colors, p->transform, latched_normal);
     if (!transform) return fail(DrawError::transform, transform.message);
     std::uint8_t direct_maps = 0;
     for (unsigned i = 0; i < p->tev.stage_count; ++i) {
@@ -172,7 +177,7 @@ DirectProgramResult plan_direct_program(const State& state, const VertexLayout& 
         const auto use = tev_input_use(stage);
         if (use.raster_mask & ~p->transform.computed_colors)
             return fail(DrawError::missing_input, "TEV consumes an unavailable raster color");
-        if (!use.texture) continue;
+        if (!tev_stage_samples(p->tev, i)) continue;
         if (stage.texture_coord >= p->transform.texgen_count)
             return fail(DrawError::missing_input, "TEV consumes an unavailable texture coordinate");
         direct_maps |= 1u << stage.texture_map;
@@ -196,18 +201,21 @@ DirectProgramResult plan_direct_program(const State& state, const VertexLayout& 
     }
     p->rgba6 = (state.bp(0x43) & 7) == 1;
     p->fast = shading == DirectShading::fast;
-    p->early_depth = (state.bp(0x40) & 1) && (state.bp(0x43) & 64);
-    if (batched && !p->fast) return fail(DrawError::unsupported_state, "batched programs require fast shading");
+    p->early_depth = (state.bp(0x40) & 1) && (state.bp(0x43) & 64) && !p->tev.z_texture_op;
+    p->z_texture = {p->tev.z_texture_op, p->tev.z_texture_type, (state.bp(0x40) & 1) != 0};
+    if ((batched || instanced) && !p->fast) return fail(DrawError::unsupported_state, "batched and instanced programs require fast shading");
     p->batched = batched;
+    p->instanced = instanced;
     if (p->fast) {
         p->constant_alpha = p->rgba6 && (state.bp(0x42) & 0x100);
         p->fog = fast_fog(state);
         p->affine = affine_coordinates(state, p->transform);
-        const auto vertex = generate_transform_glsl(p->transform, TransformArithmetic::float32_candidate_v1, true, batched, p->affine, true);
+        const auto vertex = generate_transform_glsl(p->transform, TransformArithmetic::float32_candidate_v1, true, batched, p->affine, true,
+                                                    instanced);
         if (!vertex) return fail(DrawError::transform, vertex.status.message);
         p->vertex = vertex.source;
         p->fragment = fast_fragment_source(p->tev, p->indirect, p->maps, p->early_depth, p->constant_alpha, batched, p->affine, p->fog,
-                                           wide_registers(state));
+                                           wide_registers(state), p->z_texture);
         return {{}, std::move(p)};
     }
     if (p->rgba6) {
@@ -227,16 +235,16 @@ DirectProgramResult plan_direct_program(const State& state, const VertexLayout& 
     p->vertex = vertex.source;
     p->fragment = gles_fragment_source(p->tev, shader.functions, p->indirect, p->maps, p->mip_maps, p->rgba6 ? &p->pixel : nullptr,
                                        p->needs_fetch, p->needs_fetch ? fetch : FramebufferFetch::none, p->early_depth,
-                                       state.efb().height);
+                                       state.efb().height, p->z_texture);
     return {{}, std::move(p)};
 }
 
 DrawStatus plan_direct_state(const State& state, const DirectProgram& program, TextureCmprModel cmpr, DirectDrawState& out,
-                             GuardBand guard_band) {
+                             GuardBand guard_band, FractionalViewport fractional) {
     const auto raster = capture_raster(state);
     if (!raster) return reject(DrawError::raster, raster.status.message);
-    const auto plan = program.fast ? plan_gles_raster_fast(*raster.snapshot, guard_band)
-                                   : plan_gles_raster(*raster.snapshot, program.rgba6, guard_band);
+    const auto plan = program.fast ? plan_gles_raster_fast(*raster.snapshot, guard_band, fractional)
+                                   : plan_gles_raster(*raster.snapshot, program.rgba6, guard_band, fractional);
     if (!plan) return reject(DrawError::raster, plan.status.message);
     out.raster = plan.plan;
     if (out.raster.early_depth != program.early_depth) return reject(DrawError::unsupported_state, "early depth differs from program");
@@ -285,7 +293,7 @@ DrawStatus plan_direct_state(const State& state, const DirectProgram& program, T
     };
     for (unsigned i = 0; i < program.tev.stage_count; ++i) {
         const auto& stage = program.tev.stages[i];
-        if (!tev_input_use(stage).texture) continue;
+        if (!tev_stage_samples(program.tev, i)) continue;
         if (const auto error = check_scale(stage.texture_map, stage.texture_coord)) return reject(DrawError::unsupported_state, error);
         const auto& d = out.textures[stage.texture_map];
         const auto& scale = raster.snapshot->coordinates[stage.texture_coord];

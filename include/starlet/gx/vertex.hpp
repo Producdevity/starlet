@@ -99,5 +99,10 @@ private:
 VertexResult capture_vertices(const State& state, const Draw& draw, MemoryReader& memory,
                               VertexLimits limits = {});
 VertexResult capture_vertices(const State&, const Draw&, MemoryReader&, VertexLimits, VertexCache*);
+// The XF keeps the normal, binormal and tangent of the last vertex it received; a later
+// draw without them lights and generates coordinates with those. Writes the last enabled
+// vertex's vectors (the first 3 or all 9 floats) and returns how many were written: 0 when
+// the draw has no normal or its arrays cannot be read.
+unsigned latest_normal(const State&, const Draw&, MemoryReader&, std::array<float, 9>& normal);
 
 } // namespace starlet::gx

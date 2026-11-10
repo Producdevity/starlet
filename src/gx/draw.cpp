@@ -115,7 +115,7 @@ std::string validate_visible_projection(const DrawPacket& packet, const GlesDraw
         };
         for (unsigned i = 0; i < packet.tev->pipeline.stage_count; ++i) {
             const auto& stage = packet.tev->pipeline.stages[i];
-            if (tev_input_use(stage).texture && !coordinate_valid(stage.texture_coord,
+            if (tev_stage_samples(packet.tev->pipeline, i) && !coordinate_valid(stage.texture_coord,
                 pipeline.coordinate_scale[i][0], pipeline.coordinate_scale[i][1], false))
                 return "visible texture coordinate exceeds the floating-point domain";
         }
@@ -185,7 +185,7 @@ DrawCapture capture_draw(const State& state, const Draw& draw, MemoryReader& mem
         const auto use = tev_input_use(stage);
         if (use.raster_mask & ~transform.snapshot->pipeline.computed_colors)
             return failure(DrawError::missing_input, "TEV consumes an unavailable raster color");
-        if (!use.texture) continue;
+        if (!tev_stage_samples(tev.material->pipeline, i)) continue;
         if (stage.texture_coord >= transform.snapshot->pipeline.texgen_count)
             return failure(DrawError::missing_input, "TEV consumes an unavailable texture coordinate");
         const auto status = capture_map(stage.texture_map);
@@ -269,7 +269,7 @@ GlesDrawResult plan_gles_draw(const DrawPacket& packet, FramebufferFetch fetch, 
         const auto use = tev_input_use(stage);
         if (use.raster_mask & ~packet.transform->pipeline.computed_colors)
             return reject("TEV raster input is absent from the transform");
-        if (!use.texture) continue;
+        if (!tev_stage_samples(packet.tev->pipeline, i)) continue;
         const auto error = sampling(stage.texture_map, stage.texture_coord);
         if (!error.empty()) return reject(error);
         const auto& desc = packet.textures[stage.texture_map]->descriptor();
@@ -318,7 +318,7 @@ GlesDrawResult plan_gles_draw(const DrawPacket& packet, FramebufferFetch fetch, 
         }
         for (unsigned i = 0; i < packet.tev->pipeline.stage_count; ++i) {
             const auto& stage = packet.tev->pipeline.stages[i];
-            if (!tev_input_use(stage).texture) continue;
+            if (!tev_stage_samples(packet.tev->pipeline, i)) continue;
             const auto& stq = evaluated.output.texcoords[stage.texture_coord];
             if (stq[2] == 0 || !std::isfinite(stq[0] / stq[2] * p.coordinate_scale[i][0]) ||
                 !std::isfinite(stq[1] / stq[2] * p.coordinate_scale[i][1]))
@@ -340,13 +340,15 @@ GlesDrawResult plan_gles_draw(const DrawPacket& packet, FramebufferFetch fetch, 
         if (!error.empty()) return reject(error);
     }
     p.key.push_back(mip_maps);
+    const ZTextureProgram z_texture{packet.tev->pipeline.z_texture_op, packet.tev->pipeline.z_texture_type, p.raster.depth_test};
+    if (z_texture.op) p.key.insert(p.key.end(), {'Z', z_texture.op, z_texture.type, static_cast<std::uint8_t>(z_texture.depth)});
     if (include_source) {
         const auto vertex = generate_transform_glsl(packet.transform->pipeline, TransformArithmetic::float32_candidate_v1);
         const auto tev = generate_tev_shader(packet.tev->pipeline, TevArithmeticModel::fixed8_candidate_v1);
         p.vertex = vertex.source;
         p.fragment = gles_fragment_source(packet.tev->pipeline, tev.functions, *packet.indirect, maps, mip_maps,
                                           rgba6 ? &packet.pixel->plan() : nullptr, needs_fetch, fetch, p.raster.early_depth,
-                                          packet.raster->efb.height);
+                                          packet.raster->efb.height, z_texture);
     }
     // Replacing every color component avoids reinterpreting the prior EFB format.
     if (!needs_fetch && !p.raster.cull && !p.raster.depth_test && p.raster.color_write && (rgba6 ? p.alpha_write : !p.raster.blend) && !packet.texture_mask &&
@@ -381,7 +383,7 @@ GlesDrawResult plan_gles_draw(const DrawPacket& packet, FramebufferFetch fetch, 
 std::string gles_fragment_source(const TevPipeline& tev_pipeline, const std::string& tev_functions,
                                  const IndirectSnapshot& indirect, std::uint8_t maps, std::uint8_t mip_maps,
                                  const PixelPlan* rgba6, bool needs_fetch, FramebufferFetch fetch, bool early_depth,
-                                 int efb_height) {
+                                 int efb_height, const ZTextureProgram& z_texture) {
     std::ostringstream fragment;
     fragment << "#version 310 es\n";
     if (needs_fetch) fragment << (fetch==FramebufferFetch::arm ?
@@ -392,7 +394,7 @@ std::string gles_fragment_source(const TevPipeline& tev_pipeline, const std::str
              << "in vec4 gx_color0;\nin vec4 gx_color1;\n";
     std::uint8_t coordinates = 0;
     for (unsigned i = 0; i < tev_pipeline.stage_count; ++i)
-        if (tev_input_use(tev_pipeline.stages[i]).texture) coordinates |= 1u << tev_pipeline.stages[i].texture_coord;
+        if (tev_stage_samples(tev_pipeline, i)) coordinates |= 1u << tev_pipeline.stages[i].texture_coord;
     for (unsigned i = 0; i < 4; ++i) if (indirect.lookup_mask & (1u << i)) coordinates |= 1u << indirect.lookups[i].coordinate;
     for (unsigned i = 0; i < 8; ++i) if (coordinates & (1u << i)) fragment << "in vec3 gx_tex" << i << ";\n";
     if (mip_maps) fragment << texture_sampling_glsl();
@@ -407,11 +409,16 @@ std::string gles_fragment_source(const TevPipeline& tev_pipeline, const std::str
         "layout(location=0) inout highp vec4 gxFragmentColor;\n" :
         "layout(location=0) out vec4 gxFragmentColor;\n");
     if (needs_fetch && fetch==FramebufferFetch::arm) fragment << "highp vec4 gl_LastFragColorARM;\n";
+    // The Z texel is the last stage's raw lookup, before its swap table.
+    const bool z_code = z_texture.op && z_texture.depth;
+    const auto z_glsl = z_code ? z_texture_glsl(z_texture, "samples[" + std::to_string(tev_pipeline.stage_count - 1) + "]")
+                               : ZTextureGlsl{};
     fragment
              << "ivec4 gxQuantize(vec4 v) { return ivec4(floor(clamp(v,0.0,1.0)*255.0+0.5)); }\n"
              << (rgba6 ? pixel_stage_glsl(*rgba6) + "uniform uvec4 uGxPixel;\n" : "")
+             << z_glsl.globals
              << tev_functions
-             << "void main() {\n    ivec4 samples[16];\n    ivec4 raster[2];\n"
+             << "void main() {\n" << z_glsl.reference << "    ivec4 samples[16];\n    ivec4 raster[2];\n"
              << "    for (int i=0;i<16;++i) samples[i]=ivec4(0);\n"
              << "    raster[0]=gxQuantize(gx_color0); raster[1]=gxQuantize(gx_color1);\n";
     auto sample_expression = [&](unsigned map, const std::string& uv) {
@@ -429,7 +436,7 @@ std::string gles_fragment_source(const TevPipeline& tev_pipeline, const std::str
     }
     for (unsigned i = 0; i < tev_pipeline.stage_count; ++i) {
         const auto& stage = tev_pipeline.stages[i];
-        if (!tev_input_use(stage).texture) continue;
+        if (!tev_stage_samples(tev_pipeline, i)) continue;
         const auto& stage_indirect = indirect.stages[i];
         if (indirect_coordinate(stage_indirect)) {
             fragment << "    ivec2 base" << i << "=ivec2((gx_tex" << unsigned(stage.texture_coord)
@@ -452,7 +459,7 @@ std::string gles_fragment_source(const TevPipeline& tev_pipeline, const std::str
         }
     }
     fragment << "    ivec4 color=gxTevEvaluate(samples,raster);\n"
-             << "    if (!gxTevAlphaPass(color.a)) discard;\n";
+             << "    if (!gxTevAlphaPass(color.a)) discard;\n" << z_glsl.depth;
     if (rgba6) {
         fragment << "    uvec4 destination=";
         if (needs_fetch) fragment << "uvec4(floor(" << (fetch==FramebufferFetch::arm ? "gl_LastFragColorARM" : "gxFragmentColor") << "*255.0+0.5))>>2u;\n";

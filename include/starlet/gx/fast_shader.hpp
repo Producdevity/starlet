@@ -1,5 +1,6 @@
 #pragma once
 
+#include "starlet/gx/depth.hpp"
 #include "starlet/gx/indirect.hpp"
 
 #include <string>
@@ -19,9 +20,11 @@ namespace starlet::gx {
 // from the flat gx_register0..3 inputs of a batched transform instead. Coordinates
 // in affine are vec2 inputs used without the projective division. fog (type |
 // orthographic << 3 | range << 4, see GlesRasterPlan::Fog) adds uGxFog (a, b,
-// shift, c), uGxFogColor and, with range adjustment, uGxFogCenter/uGxFogTable[10].
+// shift, c), uGxFogColor and, with range adjustment, uGxFogCenter/uGxFogTable[10]. A Z texture
+// (z_texture_glsl) adds uGxZBias; its Z writes gl_FragDepth with depth and replaces the window
+// depth in fog.
 std::string fast_fragment_source(const TevPipeline&, const IndirectSnapshot&, std::uint8_t maps,
                                  bool early_depth, bool constant_alpha, bool batched = false, std::uint8_t affine = 0,
-                                 std::uint8_t fog = 0, std::uint8_t wide_registers = 0);
+                                 std::uint8_t fog = 0, std::uint8_t wide_registers = 0, const ZTextureProgram& = {});
 
 } // namespace starlet::gx

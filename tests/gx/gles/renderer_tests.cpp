@@ -1,5 +1,6 @@
 #include "starlet/gx/gles/renderer.hpp"
 #include "draw_fixture.hpp"
+#include "jfw_clear_fixture.hpp"
 #include <GLES3/gl31.h>
 #include <iostream>
 #include <mutex>
@@ -29,7 +30,15 @@ extern std::size_t pack_required, unpack_required;
 extern std::map<GLuint, GLuint> color_attachments;
 extern std::map<GLuint, GLuint> depth_attachments;
 extern unsigned uniform_ranges, read_pixels;
+extern unsigned instanced_draws, instance_count;
+extern GLintptr instance_offset;
+extern GLsizeiptr instance_size;
+extern std::vector<unsigned char> uniform_bytes;
 extern GLsizeiptr element_bytes;
+extern std::vector<std::string> shader_sources;
+extern std::vector<GLenum> invalidated;
+extern GLenum depth_func;
+extern GLboolean depth_mask, depth_test;
 } // namespace fake
 using namespace starlet::gx;
 using namespace starlet::gx::test;
@@ -468,10 +477,21 @@ void direct_draw_path() {
     renderer.draw_direct(f.decoder.state(),command,f.memory); renderer.wait_until_idle();
     s=renderer.stats().direct;
     check(s.program_misses==1 && s.state_plans==5,"alpha reference is per-draw state");
+    // Texture registers written again with the same values keep the plan and resolved textures.
+    renderer.draw_direct(f.decoder.state(),command,f.memory);
+    const auto lookups=renderer.stats().direct.texture_lookups, plans=renderer.stats().direct.state_plans;
+    f.bp(0x97,f.decoder.state().bp(0x97)); renderer.draw_direct(f.decoder.state(),command,f.memory);
+    f.bp(0x97,f.decoder.state().bp(0x97)); renderer.draw_direct(f.decoder.state(),command,f.memory);
+    s=renderer.stats().direct;
+    check(s.texture_lookups==lookups && s.state_plans==plans,"identical register writes reuse the plan and resolved textures");
+    f.bp(0x88,f.decoder.state().bp(0x88)^1); renderer.draw_direct(f.decoder.state(),command,f.memory);
+    s=renderer.stats().direct;
+    check(s.texture_lookups==lookups+1 && s.state_plans==plans+1,"a changed register plans and resolves again");
+    renderer.wait_until_idle();
     f.bp(0x43,2);
     const auto draws=fake::draws;
     rejects([&]{renderer.draw_direct(f.decoder.state(),command,f.memory);},"unsupported pixel format rejected before submission");
-    check(fake::draws==draws,"rejected direct draw issues no GL draw");
+    check(fake::draws==draws && !renderer.failed(),"rejected direct draw issues no GL draw and leaves the renderer usable");
     f.bp(0x43,0);
     GlesLimits limits; limits.direct.verify_textures=true; GlesRenderer verified(limits); Fixture g; const auto other=g.command();
     verified.draw_direct(g.decoder.state(),other,g.memory);
@@ -512,6 +532,121 @@ void resident_copies() {
     const auto zero=renderer.stats().direct.zero_area;
     renderer.draw_direct(f.decoder.state(),flat,f.memory);
     check(renderer.stats().direct.zero_area==zero+1,"byte-identical vertices are zero-area draws");
+}
+void stamped_resident_copies() {
+    GlesLimits limits; limits.direct.stamp_resident_copies=true;
+    GlesRenderer renderer(limits); Fixture f; f.memory.bytes.resize(64,0xa5); f.bp(0x8b,0x100c0f);
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    TextureCopy p; p.width=16; p.height=4; p.format=1; p.luminance=true; p.stride=64;
+    alignas(32) std::array<std::uint8_t,64> bytes{};
+    const std::array<std::uint8_t,64> zero{};
+    const auto reads=fake::read_pixels;
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    check(fake::read_pixels==reads && bytes!=zero,"stamped copy overwrites its destination without a readback");
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    auto s=renderer.stats().direct;
+    check(s.resident_hits==1 && s.materialized==0,"intact stamps sample the resident copy");
+    const auto stamped=bytes;
+    std::fill(bytes.begin()+32,bytes.end(),0x11);
+    const auto reads_before=fake::read_pixels;
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    s=renderer.stats().direct;
+    check(s.resident_hits==1 && s.materialized==1,"a later CPU write ends sampling and retires the copy");
+    check(std::equal(bytes.begin(),bytes.begin()+32,stamped.begin()) &&
+          std::all_of(bytes.begin()+32,bytes.end(),[](std::uint8_t b){return b==0x11;}) && fake::read_pixels==reads_before,
+          "a copy with a broken stamp writes nothing and reads nothing back");
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    const auto first=bytes;
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    check(bytes!=first,"each copy stamps its destination anew");
+    bytes.fill(0x22);
+    f.bp(0x8b,0x100c07);
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    check(renderer.stats().direct.materialized==2 && std::all_of(bytes.begin(),bytes.end(),[](std::uint8_t b){return b==0x22;}),
+          "a fully overwritten copy materializes nothing");
+}
+// JFWDisplay::clearEfb on every draw path: the Z texel becomes the fragment depth, the depth
+// test runs ALWAYS with writes, and the bias is a uniform of the program.
+void z_texture_clear() {
+    fake::track_uniforms = true;
+    const auto fragment_depth = [](std::size_t first) {
+        for (auto i = first; i < fake::shader_sources.size(); ++i)
+            if (fake::shader_sources[i].find("gl_FragDepth=float(gxZ)/16777216.0;") != std::string::npos) return true;
+        return false;
+    };
+    const auto bias = [] { return fake::uniform_values.at(fake::uniform_locations.at({fake::current_program, "uGxZBias"}))[0]; };
+    for (const auto shading : {DirectShading::fast, DirectShading::exact}) {
+        GlesLimits limits; limits.direct.shading = shading; limits.direct.background_programs = false;
+        GlesRenderer renderer(limits); Fixture f; jfw_clear_efb(f, {{0x20, 0x40, 0x60, 0xff}}, shading == DirectShading::fast);
+        const auto sources = fake::shader_sources.size(); const auto before = fake::draws;
+        fake::depth_test = GL_FALSE; fake::depth_func = GL_NEVER; fake::depth_mask = GL_FALSE;
+        renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+        check(fake::draws == before + 1 && renderer.stats().direct.texture_uploads == 1, "the JFWDisplay clear draws with its Z24X8 map");
+        check(fragment_depth(sources), "the direct program writes the Z texel as fragment depth");
+        check(fake::depth_test && fake::depth_func == GL_ALWAYS && fake::depth_mask, "late ALWAYS depth test with writes");
+        check(bias() == 0, "zero bias uploaded");
+        const auto misses = renderer.stats().direct.program_misses;
+        f.bp(0xf4, 0x123456);
+        renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+        check(fake::draws == before + 2 && renderer.stats().direct.program_misses == misses && bias() == 0x123456,
+              "a bias change updates the uniform, not the program");
+    }
+    GlesRenderer renderer; Fixture f; jfw_clear_efb(f, {{0x20, 0x40, 0x60, 0xff}});
+    f.bp(0xf4, 0x654321);
+    const auto sources = fake::shader_sources.size(); const auto before = fake::draws;
+    fake::depth_test = GL_FALSE; fake::depth_func = GL_NEVER; fake::depth_mask = GL_FALSE;
+    renderer.draw(f.decoder.state(), f.command(), f.memory);
+    check(fake::draws == before + 1 && fragment_depth(sources) && fake::depth_test && fake::depth_func == GL_ALWAYS &&
+          fake::depth_mask && bias() == 0x654321, "the packet path draws the clear with its Z texture");
+    fake::track_uniforms = false;
+}
+// Luigi's Mansion's intro: in an RGBA6 frame the SDK selects Z24 for a depth copy, whose
+// clear leaves the EFB in the RGB8 layout, then draws RGBA6 again and copies the result.
+// Exact shading converts the EFB back before that draw; fast shading never reinterprets, so
+// the later RGBA6 copy reads what the fast programs drew.
+void format_after_depth_copy() {
+    for (const auto shading : {DirectShading::fast, DirectShading::exact}) {
+        const unsigned exact = shading == DirectShading::exact;
+        GlesLimits limits; limits.direct.shading = shading; limits.direct.background_programs = false;
+        GlesRenderer renderer(limits); Fixture f;
+        f.bp(0x41, 0xf4a8); f.bp(0x43, 0x41); // No blending: exact RGBA6 blending needs framebuffer fetch.
+        renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+        check(renderer.stats().format_conversions == exact, "only exact shading converts the RGB8 EFB for RGBA6");
+        TextureCopy depth; depth.width = 8; depth.height = 4; depth.format = 11; depth.depth = true; depth.stride = 64;
+        EfbClear clear; clear.rectangle = {0, 452, 8, 4}; clear.color_write = true; depth.clear = clear;
+        alignas(32) std::array<std::uint8_t, 64> z{};
+        renderer.copy_texture_resident(depth, z.data(), z.size(), 0x8000); renderer.wait_until_idle();
+        const auto cleared = renderer.stats().format_conversions;
+        check(cleared == 2 * exact, "only exact shading converts for the Z24 clear");
+        renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+        check(renderer.stats().format_conversions == cleared + exact, "exact shading restores the RGBA6 layout before drawing");
+        TextureCopy color; color.width = 8; color.height = 4; color.format = 4; color.rgba6 = true; color.stride = 64;
+        alignas(32) std::array<std::uint8_t, 64> texels{};
+        renderer.copy_texture_resident(color, texels.data(), texels.size(), 0x9000); renderer.wait_until_idle();
+        check(renderer.stats().format_conversions == cleared + exact, "the RGBA6 copy reinterprets nothing it was drawn in");
+    }
+}
+// A copy whose clear rewrites the whole EFB depth leaves the depth the copy does not read
+// dead before the pass ends: it is invalidated. Partial clears, clears that keep depth and
+// depth copies (which read it) keep it.
+void copy_clear_invalidation() {
+    GlesRenderer renderer; Fixture f;
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+    alignas(32) std::array<std::uint8_t, 0x96000> bytes{};
+    auto copy = [&](int width, int height, bool depth, bool depth_write, bool color_write, bool alpha_write) {
+        TextureCopy p; p.width = width; p.height = height; p.format = depth ? 11 : 4; p.depth = depth; p.stride = ((width + 3) / 4) * 32;
+        EfbClear clear; clear.rectangle = {0, 456 - height, width, height};
+        clear.depth_write = depth_write; clear.color_write = color_write; clear.alpha_write = alpha_write; p.clear = clear;
+        fake::invalidated.clear();
+        renderer.copy_texture_resident(p, bytes.data(), bytes.size(), 0x8000); renderer.wait_until_idle();
+        return fake::invalidated;
+    };
+    check(copy(640, 456, false, true, true, false) == std::vector<GLenum>{GL_DEPTH_ATTACHMENT}, "a full colour copy and clear invalidates depth");
+    check(copy(320, 456, false, true, true, false).empty(), "a partial clear invalidates nothing");
+    check(copy(640, 456, false, false, true, false).empty(), "a clear that keeps depth invalidates nothing");
+    check(copy(640, 456, true, true, true, true) == std::vector<GLenum>{GL_COLOR_ATTACHMENT0}, "a full depth copy and colour clear invalidates colour");
+    check(copy(640, 456, true, true, true, false).empty(), "colour stays while its alpha is kept");
+    check(renderer.stats().invalidations == 2, "invalidations are counted");
 }
 void direct_batched_draws() {
     GlesLimits limits; limits.direct.shading = DirectShading::fast;
@@ -739,6 +874,29 @@ void snapshot_layout() {
     renderer.release_snapshots();
     check(renderer.stats().live_peeks == 0 && renderer.stats().peeks == 2, "selected snapshots answer renderer peeks");
 }
+void full_resolution_snapshots() {
+    GlesLimits limits; limits.direct.shading = DirectShading::fast; limits.direct.snapshot_scale = 1;
+    GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
+    renderer.draw_direct(f.decoder.state(), command, f.memory);
+    const int index = renderer.snapshot_efb();
+    check(index >= 0 && fake::pack_required == 1280 * 456 * 4, "snapshot_scale 1 reads back every EFB pixel under fast shading");
+    fake::map_pattern = true;
+    // Bottom-up rows of 640 depth then 640 colour texels; neighbours are distinct samples.
+    const auto at = [](int x, int y) { return std::uint32_t(((455 - y) * 1280 + 640 + x) * 4); };
+    const auto byte = [](std::uint32_t offset) { return offset % 251; };
+    renderer.select_snapshot(index);
+    const std::uint32_t waited = renderer.peek_color(13, 7);
+    std::uint32_t a = 0, b = 0;
+    check(renderer.peek_color_snapshot(index, 13, 7, a) && renderer.peek_color_snapshot(index, 14, 7, b) && a != b && a == waited &&
+          a == (byte(at(13, 7) + 3) << 24 | byte(at(13, 7)) << 16 | byte(at(13, 7) + 1) << 8 | byte(at(13, 7) + 2)),
+          "full-resolution snapshots answer each pixel exactly");
+    fake::map_pattern = false;
+    renderer.release_snapshots();
+    bool refused = false;
+    GlesLimits bad; bad.direct.snapshot_scale = 3;
+    try { GlesRenderer invalid(bad); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "snapshot scales other than 1, 2 and 4 are refused");
+}
 void host_bloom() {
     GlesLimits limits; limits.direct.shading = DirectShading::fast;
     GlesRenderer renderer(limits);
@@ -835,6 +993,132 @@ void direct_geometry_cache() {
     s = renderer.stats().direct;
     check(s.geometry_misses == misses && s.geometry_hits == hits + 70, "packed geometry keeps hitting after an arena move");
 }
+// Resident draws of one geometry that change only their position matrix become one
+// instanced draw whose per-instance rows are each draw's own matrix, bit for bit.
+void direct_instancing() {
+    struct Indexed : test::Memory {
+        std::vector<std::uint8_t> positions;
+        MemoryArrayView array_view(std::uint32_t address) override {
+            if (address != 0x9000) return {};
+            return {{positions.data(), positions.size()}, 0};
+        }
+    };
+    Fixture f; Indexed memory; memory.bytes = f.memory.bytes;
+    for (unsigned i = 0; i < 8; ++i) for (float c : {100.0f + 25 * i, 100.0f + 10 * i, -0.5f}) append_float(memory.positions, c);
+    f.cp(0x50, (2u << 9) | (1u << 13)); f.cp(0xa0, 0x9000); f.cp(0xb0, 12);
+    // More vertices than draws that are batched instead take.
+    std::vector<std::uint8_t> fifo;
+    for (unsigned i = 0; i < 68; ++i) {
+        fifo.push_back(static_cast<std::uint8_t>(i % 8));
+        fifo.insert(fifo.end(), {255, 32, 64, 255});
+        append_float(fifo, .25f); append_float(fifo, .75f); append_float(fifo, i & 1 ? 1 : 0); append_float(fifo, i & 2 ? 1 : 0);
+    }
+    Draw draw; draw.primitive = 0x80; draw.vertex_count = 68;
+    std::string error; check(f.decoder.state().vertex_layout(0, draw.layout, error), error.c_str());
+    draw.vertices = {fifo.data(), fifo.size()};
+    GlesLimits limits; limits.direct.shading = DirectShading::fast;
+    GlesRenderer renderer(limits);
+    const float shifts[] = {0.0f, 12.5f, -40.25f};
+    const auto draws = fake::draws, instanced = fake::instanced_draws;
+    for (float shift : shifts) { f.f(3, shift); renderer.draw_direct(f.decoder.state(), draw, memory); }
+    renderer.wait_until_idle();
+    auto s = renderer.stats().direct;
+    check(s.draws == 3 && s.instanced_draws == 2 && s.submissions == 1 && s.uniform_blocks == 1,
+          "matrix-only changes on resident geometry join one instanced draw with one shared block");
+    check(fake::draws == draws + 1 && fake::instanced_draws == instanced + 1 && fake::instance_count == 3,
+          "one instanced driver draw of three instances");
+    check(fake::instance_size == 3 * 6 * 16 && std::size_t(fake::instance_offset) + std::size_t(fake::instance_size) <= fake::uniform_bytes.size(),
+          "the instance rows are bound at binding 1");
+    bool rows = true;
+    for (unsigned i = 0; i < 3; ++i) {
+        float row[12];
+        std::memcpy(row, fake::uniform_bytes.data() + fake::instance_offset + i * 96, sizeof row);
+        rows = rows && row[0] == 1 && row[1] == 0 && row[2] == 0 && row[3] == shifts[i] && row[5] == 1 && row[10] == 1;
+    }
+    check(rows, "each instance carries its own position matrix rows");
+    check(std::any_of(fake::shader_sources.begin(), fake::shader_sources.end(),
+                      [](const std::string& v) { return v.find("u_instance[ib]") != std::string::npos; }),
+          "the instanced variant reads the position matrix per instance");
+    // Rewriting unchanged state between draws keeps the run.
+    renderer.present(640, 480);
+    const auto before = renderer.stats().direct;
+    for (float shift : shifts) { f.bp(0x41, 0xf4a9); f.f(3, shift); renderer.draw_direct(f.decoder.state(), draw, memory); }
+    renderer.wait_until_idle();
+    s = renderer.stats().direct;
+    check(s.instanced_draws == before.instanced_draws + 2 && s.submissions == before.submissions + 1,
+          "identical state written again still joins the instance run");
+    // A texture or state change, or a different geometry, starts a separate draw.
+    f.f(3, 7.0f); renderer.draw_direct(f.decoder.state(), draw, memory);
+    f.bp(0x41, 0xf118); f.f(3, 8.0f); renderer.draw_direct(f.decoder.state(), draw, memory); renderer.wait_until_idle();
+    s = renderer.stats().direct;
+    check(s.draws == before.draws + 5 && s.instanced_draws == before.instanced_draws + 2 && s.submissions == before.submissions + 3,
+          "a state change ends the instance run");
+    // An evicted instanced variant is planned again, not reused.
+    GlesLimits small = limits; small.direct.programs = 2;
+    GlesRenderer evicting(small);
+    f.bp(0x41, 0xf4a9);
+    auto instance_pair = [&] {
+        for (float shift : {1.0f, 2.0f}) { f.f(3, shift); evicting.draw_direct(f.decoder.state(), draw, memory); }
+        evicting.wait_until_idle(); evicting.present(640, 480);
+    };
+    instance_pair();
+    // The base program is used again alone, then a third program evicts the variant.
+    f.f(3, 5.0f); evicting.draw_direct(f.decoder.state(), draw, memory); evicting.wait_until_idle(); evicting.present(640, 480);
+    const auto first = evicting.stats().direct;
+    f.bp(0xc0, 0x8f8a0); evicting.draw_direct(f.decoder.state(), draw, memory); evicting.wait_until_idle(); evicting.present(640, 480);
+    f.bp(0xc0, 0x8f8af);
+    instance_pair();
+    const auto again = evicting.stats().direct;
+    check(again.instanced_draws == first.instanced_draws + 1 && again.program_misses == first.program_misses + 2,
+          "an evicted instanced variant is planned again");
+}
+// A reader that reports write generations per byte range lets unchanged spans skip the
+// byte comparison; a new generation makes the next draw compare and reconvert.
+void direct_range_generations() {
+    struct Tracked : test::Memory {
+        std::vector<std::uint8_t> positions;
+        std::uint64_t generation = 1;
+        MemoryArrayView array_view(std::uint32_t address) override {
+            if (address != 0x9000) return {};
+            return {{positions.data(), positions.size()}, 0};
+        }
+        std::uint64_t range_generation(const MemoryArrayView&, std::uint32_t address, std::size_t size) override {
+            return address >= 0x9000 && address + size <= 0x9000 + positions.size() ? generation : 0;
+        }
+    };
+    Fixture f; Tracked memory; memory.bytes = f.memory.bytes;
+    for (unsigned i = 0; i < 8; ++i) for (float c : {100.0f + 25 * i, 100.0f + 10 * i, -0.5f}) append_float(memory.positions, c);
+    f.cp(0x50, (2u << 9) | (1u << 13)); f.cp(0xa0, 0x9000); f.cp(0xb0, 12);
+    std::vector<std::uint8_t> fifo;
+    for (unsigned i = 0; i < 8; ++i) {
+        fifo.push_back(static_cast<std::uint8_t>(i));
+        fifo.insert(fifo.end(), {255, 32, 64, 255});
+        append_float(fifo, .25f); append_float(fifo, .75f); append_float(fifo, i & 1 ? 1 : 0); append_float(fifo, i & 2 ? 1 : 0);
+    }
+    Draw draw; draw.primitive = 0x80; draw.vertex_count = 8;
+    std::string error; check(f.decoder.state().vertex_layout(0, draw.layout, error), error.c_str());
+    draw.vertices = {fifo.data(), fifo.size()};
+    GlesRenderer renderer;
+    renderer.draw_direct(f.decoder.state(), draw, memory); renderer.wait_until_idle();
+    const auto validated = renderer.stats().direct.geometry_validated_bytes;
+    for (unsigned frame = 0; frame < 8; ++frame) {
+        renderer.present(640, 480);
+        renderer.draw_direct(f.decoder.state(), draw, memory); renderer.wait_until_idle();
+    }
+    auto s = renderer.stats().direct;
+    check(s.geometry_misses == 1 && s.geometry_hits == 8, "geometry with unchanged range generations is reused");
+    // At most one periodic full comparison in eight frames.
+    check(s.geometry_validated_bytes - validated <= memory.positions.size(), "unchanged range generations skip comparing bytes");
+    memory.positions[0] ^= 1; ++memory.generation;
+    renderer.present(640, 480);
+    renderer.draw_direct(f.decoder.state(), draw, memory); renderer.wait_until_idle();
+    check(renderer.stats().direct.geometry_misses == 2, "a new range generation with changed bytes reconverts");
+    ++memory.generation;
+    renderer.present(640, 480);
+    renderer.draw_direct(f.decoder.state(), draw, memory); renderer.wait_until_idle();
+    s = renderer.stats().direct;
+    check(s.geometry_misses == 2 && s.geometry_hits == 9, "a new range generation with the same bytes compares and hits");
+}
 int main() {
     explicit_completion();
     try {
@@ -848,8 +1132,13 @@ int main() {
         direct_draw_path();
         rejected_program_skips_draws();
         program_reuse_across_tev_colours();
-        resident_copies();
+        resident_copies(); stamped_resident_copies();
+        z_texture_clear();
         direct_geometry_cache();
+        direct_instancing();
+        direct_range_generations();
+    format_after_depth_copy();
+    copy_clear_invalidation();
         direct_batched_draws();
         direct_clip_culling();
         direct_indexed_clip_culling();
@@ -859,6 +1148,7 @@ int main() {
         offscreen_pass();
         shared_depth_snapshots();
         snapshot_layout();
+        full_resolution_snapshots();
         std::cout << "GLES dispatch boundary tests passed (not GPU rendering proof)\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

@@ -64,7 +64,12 @@ struct TevPipeline {
     std::uint8_t stage_count = 1;
     std::array<TevCompare, 2> alpha_compare{{TevCompare::always, TevCompare::always}};
     TevAlphaLogic alpha_logic = TevAlphaLogic::and_;
+    // BP 0xF5 while its op is active (ZTexture): op 1 add, 2 replace; type 0 Z8, 1 Z16, 2 Z24X8.
+    // The last stage's lookup is the Z texel and is unavailable as a TEV input (GX manual 9.12).
+    std::uint8_t z_texture_op = 0, z_texture_type = 0;
 };
+// Whether stage i's texture lookup is consumed: by its TEV inputs, or as the Z texel.
+bool tev_stage_samples(const TevPipeline&, unsigned stage);
 
 using TevColor = std::array<std::uint8_t, 4>;
 using TevSignedColor = std::array<std::int16_t, 4>;
@@ -72,6 +77,7 @@ struct TevUniforms {
     std::array<TevSignedColor, 4> registers{};
     std::array<TevColor, 4> konst{};
     std::array<std::uint8_t, 2> alpha_reference{};
+    std::uint32_t z_texture_bias = 0; // BP 0xF4 while a Z texture is active, else 0.
 };
 
 struct TevMaterial {
@@ -94,11 +100,11 @@ struct TevCapture {
 
 // Call synchronously at draw capture. Owns TEV configuration and both register
 // banks; texture samples, rasterization, fog, depth and EFB operations are external.
-// Coordinate lookup operations belong to capture_indirect; bump/Z-texture paths
-// are rejected here. Capture/allocation failures propagate
+// Coordinate lookup operations belong to capture_indirect; bump paths are rejected here.
+// Capture/allocation failures propagate
 // as documented status or exceptions; callers bound aggregate retained materials.
 TevCapture capture_tev(const State& state);
-// capture_tev's register banks and alpha references, without pipeline validation.
+// capture_tev's register banks, alpha references and Z-texture bias, without pipeline validation.
 TevUniforms capture_tev_uniforms(const State& state);
 
 // Explicit provisional model, NOT proof of original-GX precision. The fixed8

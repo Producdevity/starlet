@@ -22,6 +22,9 @@ struct TransformTexGen {
     bool projected = false;
     bool normalize = false;
     std::uint8_t post_row = 0;
+    // Emboss (type 1): the earlier texgen offset and the light whose direction offsets it.
+    std::uint8_t emboss_source = 0;
+    std::uint8_t emboss_light = 0;
 };
 struct TransformPipeline {
     // RGB0, RGB1, A0, A1, matching XF 0x100e..0x1011.
@@ -37,6 +40,9 @@ struct TransformPipeline {
     bool orthographic = false;
     bool dual_texture = false;
     bool clipping_disabled = false;
+    // No normal attribute: lighting and texgens read the XF's latched vectors
+    // (TransformUniforms::latched_normal) instead.
+    bool latched_normal = false;
 };
 struct TransformLight {
     TransformVector color{}; // RGBA in 0..255.
@@ -56,6 +62,8 @@ struct alignas(16) TransformUniforms {
     std::array<TransformVector, 2> material{};
     std::array<TransformLight, 8> lights{};
     std::array<TransformVector, 2> viewport{}; // sx,sy,sz,ox / oy,oz,0,0.
+    // Normal, binormal and tangent last received by the XF; see latest_normal.
+    std::array<TransformVector, 3> latched_normal{};
 };
 struct TransformSnapshot {
     const TransformPipeline pipeline;
@@ -81,7 +89,7 @@ struct TransformCapture {
 // matrix bounds and finite live inputs without doing vertex math. Disabled
 // vertices are ignored. No GX state is borrowed. Caller bounds aggregate
 // retained snapshots. Allocation may throw.
-// Emboss texgens, reserved clip modes, matrix rows crossing memory end and
+// Reserved clip modes, matrix rows crossing memory end and
 // non-finite live inputs are explicit errors. Value-dependent arithmetic
 // validity and clip-disable equivalence require the diagnostic validator or
 // the renderer's input contract.
@@ -90,8 +98,10 @@ struct TransformCapture {
 TransformCapture capture_transform(const State&, const VertexSnapshot&, std::uint8_t raster_colors = 3);
 // The pipeline half of capture_transform: XF registers and layout presence only,
 // with the same rejection rules and no vertex, matrix or light value checks.
+// latched_components (3 or 9) says the XF holds vectors from an earlier vertex; a layout
+// without normals that needs them then reads those.
 TransformStatus capture_transform_pipeline(const State&, const VertexLayout&, std::uint8_t raster_colors,
-                                           TransformPipeline&);
+                                           TransformPipeline&, std::uint8_t latched_components = 0);
 // Every XF matrix row, light and register value in the uniform layout, unvalidated.
 // Rows a draw consumes equal capture_transform's; the GPU evaluates the values as given.
 // Every byte of the block is written, unused lanes as zero, so it may be reused unreset.
@@ -165,7 +175,14 @@ struct TransformShader {
 // the pipeline must not consume normals or position texgen sources.
 // affine: texgens whose q is 1 (2x4 or colour sources, no post transform but the
 // identity one) output vec2 gx_texN without it. compact: 16-bit colour outputs.
+// instanced: the draw's position matrix rows (pn..pn+2) and normal matrix rows come per
+// instance from GXInstances (binding 1), transform_instance_rows vec4s per instance:
+// three position rows, then three normal rows; everything else from GXTransform. Emboss
+// texgens (which read the normal matrix themselves) are rejected.
+inline constexpr unsigned transform_instance_limit = 128;
+inline constexpr unsigned transform_instance_rows = 6;
 TransformShader generate_transform_glsl(const TransformPipeline&, TransformArithmetic, bool include_source = true,
-                                        bool batched = false, std::uint8_t affine = 0, bool compact = false);
+                                        bool batched = false, std::uint8_t affine = 0, bool compact = false,
+                                        bool instanced = false);
 
 } // namespace starlet::gx

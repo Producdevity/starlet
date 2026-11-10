@@ -3,10 +3,12 @@
 #include "starlet/gx/gles/program_cache.hpp"
 #include "starlet/gx/gles/program_list.hpp"
 #include "starlet/gx/line_point.hpp"
+#include "starlet/gx/vertex.hpp"
 
 #include <GLES3/gl32.h>
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -20,6 +22,33 @@
 #include <unordered_set>
 
 namespace starlet::gx {
+namespace {
+// A block's stamp: its first eight bytes, unique per copy and block.
+std::uint64_t stamp_word(std::uint64_t stamp, std::size_t block) { return stamp * 0x9e3779b97f4a7c15ull + block; }
+// Up to 64 blocks spread over a copy, its first and last included: a game reusing the
+// memory overwrites far more than that, and stamping every block of full-screen copies
+// costs a cache miss per block on small CPUs.
+template<class F> bool sampled_blocks(std::size_t blocks, F f) {
+    const std::size_t step = std::max<std::size_t>(1, blocks / 63);
+    for (std::size_t block = 0; block < blocks; block += step)
+        if (!f(block)) return false;
+    return !blocks || f(blocks - 1);
+}
+} // namespace
+void GlesResidentCopy::write_stamps() const {
+    sampled_blocks(bytes / 32, [this](std::size_t block) {
+        const auto word = stamp_word(stamp, block);
+        std::memcpy(destination + block * 32, &word, sizeof word);
+        return true;
+    });
+}
+bool GlesResidentCopy::stamped(std::size_t block) const {
+    const auto word = stamp_word(stamp, block);
+    return std::memcmp(destination + block * 32, &word, sizeof word) == 0;
+}
+bool GlesResidentCopy::intact() const {
+    return !stamp || sampled_blocks(bytes / 32, [this](std::size_t block) { return stamped(block); });
+}
 namespace {
 // The array still holds its numbers in the encoding a span was converted from.
 bool same_encoding(const MemoryArrayView& view, std::uint8_t native_unit, bool host_order) {
@@ -158,10 +187,15 @@ struct GlesDirect::Impl {
         Cached<std::array<float, 3>> fog_color;
         Cached<std::array<float, 1>> fog_center;
         Cached<std::array<float, 10>> fog_table;
+        Cached<std::array<std::uint32_t, 1>> z_bias;
         std::uint64_t used = 0, segment = 0;
         // Small draws of a batchable program use its batched variant; see draw_batched.
         bool batchable = false;
         Program* batched = nullptr;
+        // Resident draws that differ only in their position and normal matrix share one
+        // instanced draw of this variant; see join_instances.
+        bool instanceable = false;
+        Program* instanced = nullptr;
         // GL thread: handed to the builder; the segment that last found it unbuilt; the driver
         // rejected it.
         bool requested = false, rejected = false;
@@ -259,6 +293,8 @@ struct GlesDirect::Impl {
         std::uint32_t state, uniform, run, first, count, low, high;
         std::array<GLuint, 8> textures, samplers;
         std::array<std::uint32_t, 3> latches;
+        // Instanced records: instance count and the offset of their rows in the segment's uniforms.
+        std::uint32_t instances = 0, instance_offset = 0;
     };
     // Everything one flush hands to the GL thread: GL work recorded since the last
     // flush runs first, then the draws, then deletions of objects they used.
@@ -306,6 +342,7 @@ struct GlesDirect::Impl {
     std::unordered_multimap<std::uint64_t, Texture*> texture_index;
     std::vector<std::pair<std::uint32_t, GLuint>> samplers;
     std::map<std::uint32_t, GlesResidentCopy> copies;
+    std::uint64_t stamps = 0;
     // Copy targets are reused only once the GPU has retired their last frame of use:
     // rendering into a texture that pending draws still sample makes the driver wait.
     struct SpareTarget { int width, height; GLuint texture, framebuffer; std::uint64_t frame; };
@@ -321,12 +358,38 @@ struct GlesDirect::Impl {
     // Keyed by the BP revision that ignores TEV colour writes, which most draws make, and
     // the CP revision that ignores array bindings, which most draws change.
     struct { bool valid = false; std::uint64_t bp = 0, cp = 0, xf = 0; std::uint32_t registers = 0; std::uint8_t vat = 0;
-             Program* program = nullptr; } last_program;
+             Program* program = nullptr; std::uint8_t latch = 0; } last_program;
     struct { bool valid = false; std::uint64_t bp = 0; std::uint32_t word = 0; } last_registers;
     struct { bool valid = false; std::uint64_t bp = 0, xf = 0, segment = 0; const Program* program = nullptr; std::uint32_t index = 0; } last_state;
-    struct { bool valid = false; std::uint64_t memory = 0, registers = 0, segment = 0; std::uint32_t offset = 0; } last_uniform;
+    struct { bool valid = false; std::uint64_t memory = 0, registers = 0, segment = 0, latch = 0; std::uint32_t offset = 0; } last_uniform;
+    // The XF's latched normal, binormal and tangent: components held (0, 3 or 9), values and
+    // a revision that changes with them.
+    std::uint8_t latch_components = 0;
+    std::array<float, 9> latch{};
+    std::uint64_t latch_revision = 0;
     struct { bool valid = false; std::uint64_t bp = 0, segment = 0, frame = 0; const Program* program = nullptr;
-             std::array<GLuint, 8> textures{}, samplers{}; } last_textures;
+             std::array<GLuint, 8> textures{}, samplers{}; std::array<std::uint64_t, 8> palettes{}; } last_textures;
+    // Palette contents a CI texture reads, as a generation; 0 for other formats.
+    static std::uint64_t palette_generation(const State& state, const TextureDescriptor& d) {
+        const auto bytes = palette_bytes(d.format);
+        std::uint64_t generation = 0;
+        if (bytes && !state.palette_generation(d.palette_offset, bytes, generation)) return ~std::uint64_t{0};
+        return generation;
+    }
+    // BP values at the last state plan. Games rewrite unchanged registers between draws:
+    // equal values keep the plan and the textures it resolved (CI palettes are checked
+    // by generation, since a TLUT load changes them without changing a register).
+    std::array<std::uint32_t, 256> planned_bp{};
+    bool same_bp_values(const State& state) const {
+        for (unsigned a = 0; a < 256; ++a) if (state.bp(static_cast<std::uint8_t>(a)) != planned_bp[a]) return false;
+        return true;
+    }
+    bool same_palettes(const State& state, const Program& p) const {
+        const auto& planned = states[last_state.index];
+        for (unsigned map = 0; map < 8; ++map) if (p.plan->maps & (1u << map))
+            if (palette_generation(state, planned.textures[map]) != last_textures.palettes[map]) return false;
+        return true;
+    }
     // Batched draws share state, textures and uniform block while only TEV color
     // registers and their own position matrix change between them.
     struct { bool valid = false; std::uint64_t bp = 0, xf = 0, segment = 0, frame = 0; const Program* program = nullptr;
@@ -439,23 +502,26 @@ struct GlesDirect::Impl {
             last_registers = {true, state.bp_revision(), direct_program_register_word(state, limits.shading)};
         const auto registers = last_registers.word;
         if (last_program.valid && last_program.bp == state.bp_state_revision() && last_program.cp == state.cp_layout_revision() &&
-            last_program.xf == state.xf_register_revision() && last_program.vat == draw.vat && last_program.registers == registers) {
+            last_program.xf == state.xf_register_revision() && last_program.vat == draw.vat && last_program.registers == registers &&
+            last_program.latch == latch_components) {
             last_program.program->used = ++sequence; last_program.program->segment = segment;
             return *last_program.program;
         }
-        direct_program_words(state, draw.layout, fetch, limits.shading, words);
+        direct_program_words(state, draw.layout, fetch, limits.shading, words, latch_components);
         const auto hash = hash_words(words);
         Program* found = nullptr;
         const auto range = program_index.equal_range(hash);
         for (auto it = range.first; it != range.second; ++it) if (it->second->words == words) { found = it->second; break; }
         if (!found) {
-            auto planned = plan_direct_program(state, draw.layout, fetch, limits.shading);
+            auto planned = plan_direct_program(state, draw.layout, fetch, limits.shading, false, latch_components);
             if (!planned) throw std::runtime_error(planned.status.message);
             found = &create_program(hash, std::move(planned.program));
             found->batchable = batchable(*found->plan);
+            found->instanceable = instanceable(*found->plan);
         }
         found->used = ++sequence; found->segment = segment;
-        last_program = {true, state.bp_state_revision(), state.cp_layout_revision(), state.xf_register_revision(), registers, draw.vat, found};
+        last_program = {true, state.bp_state_revision(), state.cp_layout_revision(), state.xf_register_revision(), registers, draw.vat, found,
+                        latch_components};
         return *found;
     }
     // Eye-space positions are exact for any pipeline that reads no object-space
@@ -483,6 +549,103 @@ struct GlesDirect::Impl {
         }
         base.batched->used = ++sequence; base.batched->segment = segment;
         return base.batched;
+    }
+    // Fast programs without emboss texgens, which read the normal matrix outside the
+    // instanced rows; see generate_transform_glsl.
+    static bool instanceable(const DirectProgram& p) {
+        if (!p.fast || p.batched) return false;
+        for (unsigned i = 0; i < p.transform.texgen_count; ++i)
+            if (p.transform.texgens[i].type == 1) return false;
+        return true;
+    }
+    Program* instanced_program(Program& base, const State& state, const Draw& draw) {
+        if (!base.instanced) {
+            words = base.words;
+            words.push_back(instanced_program_word);
+            const auto hash = hash_words(words);
+            Program* found = nullptr;
+            const auto range = program_index.equal_range(hash);
+            for (auto it = range.first; it != range.second; ++it) if (it->second->words == words) { found = it->second; break; }
+            if (!found) {
+                auto planned = plan_direct_program(state, draw.layout, fetch, limits.shading, false, latch_components, true);
+                if (!planned) { base.instanceable = false; return nullptr; }
+                found = &create_program(hash, std::move(planned.program));
+            }
+            base.instanced = found;
+        }
+        base.instanced->used = ++sequence; base.instanced->segment = segment;
+        return base.instanced;
+    }
+    // The block bytes outside the instanced rows: position rows pn..pn+2 and normal rows
+    // pn % 32 .. +2 (which the shader reads at those indices even past the normal array).
+    static bool same_outside_instance_rows(const std::uint8_t* a, const std::uint8_t* b, unsigned pn) {
+        const std::size_t position = std::size_t{pn} * 16, normal = offsetof(TransformUniforms, normal) + std::size_t{pn % 32} * 16;
+        const std::size_t first = std::min(position, normal), second = std::max(position, normal);
+        if (std::memcmp(a, b, first)) return false;
+        if (std::memcmp(a + first + 48, b + first + 48, second - first - 48)) return false;
+        return !std::memcmp(a + second + 48, b + second + 48, sizeof(TransformUniforms) - second - 48);
+    }
+    void append_instance_rows(const std::uint8_t* block, unsigned pn) {
+        const auto at = uniforms.size();
+        uniforms.resize(at + transform_instance_rows * 16);
+        std::memcpy(uniforms.data() + at, block + std::size_t{pn} * 16, 48);
+        std::memcpy(uniforms.data() + at + 48, block + offsetof(TransformUniforms, normal) + std::size_t{pn % 32} * 16, 48);
+    }
+    // Adds the draw as an instance of the previous record when both draw the same resident
+    // geometry with the same program, state, textures and latches, and their transform
+    // blocks differ only in the draw's position and normal matrix. The previous record
+    // becomes an instanced draw of the program's instanced variant on its first join.
+    struct { bool open = false; std::uint32_t record = 0, base = 0; unsigned pn = 0; } instance_group;
+    bool join_instances(Program& p, const State& state, const Draw& draw, const GeometryDraw& geometry, std::uint32_t count,
+                        std::uint32_t low, std::uint32_t high, const std::array<std::uint32_t, 3>& latches) {
+        if (!p.instanceable || records.empty() || geometry.format.matrices) return false;
+        const unsigned pn = state.matrix_index(0);
+        if (pn > 61) return false;
+        const auto& transform = p.plan->transform;
+        for (unsigned i = 0; i < transform.texgen_count; ++i) {
+            if (transform.texgens[i].type >= 2) continue;
+            const unsigned row = state.matrix_index(static_cast<std::uint8_t>(1 + i));
+            if (row + 3 > pn && row < pn + 3) return false;
+        }
+        auto& last = records.back();
+        const auto index = static_cast<std::uint32_t>(records.size() - 1);
+        const bool grouped = instance_group.open && instance_group.record == index;
+        // Games rewrite unchanged state between draws: a new plan with the same content is the same state.
+        const bool same_state = last.state == last_state.index ||
+            !std::memcmp(&states[last.state], &states[last_state.index], sizeof(DirectDrawState));
+        if (!last.resident || !(last.program == &p || (grouped && last.program == p.instanced)) || !same_state ||
+            last.textures != last_textures.textures || last.samplers != last_textures.samplers || last.latches != latches ||
+            last.geometry.buffer != geometry.buffer || last.geometry.base_vertex != geometry.base_vertex ||
+            last.geometry.index_offset != geometry.index_offset || last.geometry.short_indices != geometry.short_indices ||
+            last.geometry.format != geometry.format || last.count != count || last.low != low || last.high != high)
+            return false;
+        if (grouped && (instance_group.pn != pn || last.instances >= transform_instance_limit ||
+                        uniforms.size() != std::size_t{last.instance_offset} + std::size_t{last.instances} * transform_instance_rows * 16))
+            return false;
+        if (!grouped && (last.instances || last.uniform + sizeof(TransformUniforms) > uniforms.size())) return false;
+        const auto* base = uniforms.data() + (grouped ? instance_group.base : last.uniform);
+        const auto* block = reinterpret_cast<const std::uint8_t*>(&transform_block);
+        if (!same_outside_instance_rows(base, block, pn)) return false;
+        if (!grouped) {
+            Program* variant = instanced_program(p, state, draw);
+            if (!variant) return false;
+            // The first instance's rows come from its own block.
+            const auto first = (uniforms.size() + uniform_alignment - 1) / uniform_alignment * uniform_alignment;
+            uniforms.resize(first);
+            instance_group = {true, index, last.uniform, pn};
+            last.program = variant;
+            last.instance_offset = static_cast<std::uint32_t>(first);
+            last.instances = 1;
+            append_instance_rows(uniforms.data() + last.uniform, pn);
+        }
+        append_instance_rows(block, pn);
+        ++last.instances;
+        ++stats.draws; ++stats.instanced_draws;
+        if (last_state.index != last.state && last_state.index + 1 == states.size()) {
+            states.pop_back();
+            last_state.index = last.state;
+        }
+        return true;
     }
     // Registers a program for words; it is linked on the GL thread before its first draw.
     Program& create_program(std::uint64_t hash, std::shared_ptr<const DirectProgram> plan) {
@@ -526,6 +689,7 @@ struct GlesDirect::Impl {
         p.fog_table.location = location("uGxFogTable[0]");
         p.alpha.location = location("uGxTevAlphaRef");
         p.pixel.location = location("uGxPixel");
+        p.z_bias.location = location("uGxZBias");
         for (unsigned i = 0; i < 8; ++i) glUniform1i(location("uGxTexture" + std::to_string(i)), i);
         gl_check("direct GX program");
     }
@@ -564,7 +728,10 @@ struct GlesDirect::Impl {
             if (oldest == programs.end()) return;
             const auto range = program_index.equal_range((*oldest)->hash);
             for (auto it = range.first; it != range.second; ++it) if (it->second == oldest->get()) { program_index.erase(it); break; }
-            for (auto& other : programs) if (other->batched == oldest->get()) other->batched = nullptr;
+            for (auto& other : programs) {
+                if (other->batched == oldest->get()) other->batched = nullptr;
+                if (other->instanced == oldest->get()) other->instanced = nullptr;
+            }
             if (batch.program == oldest->get()) batch.valid = false;
             // Queued segments may still draw with it; the GL thread deletes it after them.
             std::shared_ptr<Program> retired(oldest->release());
@@ -620,6 +787,7 @@ struct GlesDirect::Impl {
         entry.source_bytes = last.source_offset + last.source_size;
     }
     GLuint texture(const State& state, unsigned map, const TextureDescriptor& d, MemoryReader& memory, TextureCmprModel cmpr) {
+        ++stats.texture_lookups;
         TextureKey key;
         key.address = d.address; key.image = d.bp_words[2];
         const auto filter = static_cast<unsigned>(d.sampler.min_filter);
@@ -719,7 +887,7 @@ struct GlesDirect::Impl {
             const unsigned tile_width = d.format == TextureFormat::i8 ? 8 : 4, tile_bytes = d.format == TextureFormat::rgba8 ? 64 : 32;
             if (found[0]->first == d.address && levels == 1 && static_cast<unsigned>(d.format) == texture_copy_sample_format(p) &&
                 d.width == p.destination_width() && d.height == p.destination_height() &&
-                p.stride == std::size_t{(d.width + tile_width - 1u) / tile_width} * tile_bytes) {
+                p.stride == std::size_t{(d.width + tile_width - 1u) / tile_width} * tile_bytes && c.intact()) {
                 ++stats.resident_hits;
                 return c.texture;
             }
@@ -770,6 +938,7 @@ struct GlesDirect::Impl {
         }
         auto& entry = copies[token];
         entry = {token, bytes, texture, framebuffer, p, destination, capacity};
+        if (limits.stamp_resident_copies) { entry.stamp = ++stamps; entry.write_stamps(); }
         invalidate_pointer(destination, bytes);
         textures_changed();
         ++stats.resident_copies;
@@ -793,8 +962,8 @@ struct GlesDirect::Impl {
             textures_changed();
         }
     }
-    static bool cacheable(const Draw& draw) {
-        if (draw.total_vertices() < 8) return false;
+    bool cacheable(const Draw& draw) const {
+        if (draw.total_vertices() < std::max(3u, limits.geometry_min_vertices)) return false;
         const auto& l = draw.layout;
         auto indexed = [](const Attribute& a) { return a.mode == AttributeMode::index8 || a.mode == AttributeMode::index16; };
         if (indexed(l.position) || indexed(l.normal)) return true;
@@ -824,13 +993,14 @@ struct GlesDirect::Impl {
         const auto view = memory.array_view(span.base);
         if (!view.bytes.data || !same_encoding(view, span.native_unit, span.host_order) || span.end > view.bytes.size)
             return false;
-        if (!full && view.generation && view.generation == span.generation) return true;
+        const auto generation = memory.range_generation(view, span.base + span.first, span.end - span.first);
+        if (!full && generation && generation == span.generation) return true;
         stats.geometry_validated_bytes += span.end - span.first;
         if (std::memcmp(view.bytes.data + span.first, span.bytes.data(), span.bytes.size())) {
-            if (view.generation == span.generation) volatile_bases.insert(span.base);
+            if (generation == span.generation) volatile_bases.insert(span.base);
             return false;
         }
-        span.generation = view.generation;
+        span.generation = generation;
         return true;
     }
     // Same display-list payload as a cached entry without hashing or comparing it.
@@ -1050,9 +1220,10 @@ struct GlesDirect::Impl {
             // Source memory is stable for the whole draw callback, so this is the content just converted.
             const auto view = memory.array_view(base);
             if (!view.bytes.data || !same_encoding(view, s.native_unit, s.host_order) || s.end > view.bytes.size) return nullptr;
+            const auto generation = memory.range_generation(view, base + s.first, s.end - s.first);
             g.spans.push_back({a, base, s.first, s.end, s.native_unit, s.host_order,
-                               std::vector<std::uint8_t>(view.bytes.data + s.first, view.bytes.data + s.end), view.generation});
-            g.volatile_data |= !view.generation || volatile_bases.count(base) != 0;
+                               std::vector<std::uint8_t>(view.bytes.data + s.first, view.bytes.data + s.end), generation});
+            g.volatile_data |= !generation || volatile_bases.count(base) != 0;
         }
         g.phase = static_cast<std::uint8_t>(hash & full_check_period);
         merge_identical_vertices(geometry_vertices, geometry_indices, format.stride);
@@ -1293,7 +1464,8 @@ struct GlesDirect::Impl {
               batch.xf == state.xf_register_revision() && batch.segment == segment && batch.frame == frame &&
               batch.expanded == expanded)) {
             states.emplace_back();
-            const auto status = plan_direct_state(state, *p->plan, cmpr, states.back(), limits.guard_band);
+            const auto status = plan_direct_state(state, *p->plan, cmpr, states.back(), limits.guard_band,
+                                                   limits.fractional_viewport);
             if (!status) { states.pop_back(); throw std::runtime_error(status.message); }
             // Culling applies to triangles only; the quads drawn for lines and points keep every face.
             if (expanded) states.back().raster.cull = 0;
@@ -1392,6 +1564,14 @@ struct GlesDirect::Impl {
         return true;
     }
     void draw(const State& state, const Draw& draw, MemoryReader& memory, TextureCmprModel cmpr) {
+        // The XF receives every vertex, including those of draws culled or skipped below.
+        if (draw.layout.normal.mode != AttributeMode::none) {
+            auto vectors = latch;
+            if (const auto count = latest_normal(state, draw, memory, vectors)) {
+                if (vectors != latch) { latch = vectors; ++latch_revision; }
+                latch_components = std::max<std::uint8_t>(latch_components, static_cast<std::uint8_t>(count));
+            }
+        }
         if (zero_area(draw)) { ++stats.zero_area; return; }
         if (!line_point(draw) && early_outside_clip(state, draw, memory)) { ++stats.culled_draws; return; }
         auto& p = program(state, draw);
@@ -1413,22 +1593,30 @@ struct GlesDirect::Impl {
             if (cache && !cached) cached = find_geometry(draw, memory, hash);
             if (cached && cached->boxed && outside_clip(state, state.matrix_index(0), cached->box)) { ++stats.culled_draws; warm(p); return; }
         }
+        if (last_state.valid && last_state.bp != state.bp_revision() && last_state.xf == state.xf_register_revision() &&
+            last_state.program == &p && last_state.segment == segment && !limits.verify_textures && same_bp_values(state)) {
+            if (last_textures.valid && last_textures.bp == last_state.bp && last_textures.program == &p && same_palettes(state, p))
+                last_textures.bp = state.bp_revision();
+            last_state.bp = state.bp_revision();
+        }
         if (!(last_state.valid && last_state.bp == state.bp_revision() && last_state.xf == state.xf_register_revision() &&
               last_state.program == &p && last_state.segment == segment)) {
             states.emplace_back();
-            const auto status = plan_direct_state(state, *p.plan, cmpr, states.back(), limits.guard_band);
+            const auto status = plan_direct_state(state, *p.plan, cmpr, states.back(), limits.guard_band,
+                                                   limits.fractional_viewport);
             if (!status) { states.pop_back(); throw std::runtime_error(status.message); }
             last_state = {true, state.bp_revision(), state.xf_register_revision(), segment, &p, static_cast<std::uint32_t>(states.size() - 1)};
+            for (unsigned a = 0; a < 256; ++a) planned_bp[a] = state.bp(static_cast<std::uint8_t>(a));
             ++stats.state_plans;
         }
-        if (!(last_uniform.valid && last_uniform.memory == state.xf_memory_revision() &&
-              last_uniform.registers == state.xf_register_revision() && last_uniform.segment == segment)) {
-            const auto offset = (uniforms.size() + uniform_alignment - 1) / uniform_alignment * uniform_alignment;
-            uniforms.resize(offset + sizeof(TransformUniforms));
+        const std::uint64_t latch_used = p.plan->transform.latched_normal ? latch_revision + 1 : 0;
+        const bool uniform_current = last_uniform.valid && last_uniform.memory == state.xf_memory_revision() &&
+                                     last_uniform.registers == state.xf_register_revision() && last_uniform.segment == segment &&
+                                     last_uniform.latch == latch_used;
+        if (!uniform_current) {
             direct_transform_uniforms(state, transform_block);
-            std::memcpy(uniforms.data() + offset, &transform_block, sizeof transform_block);
-            last_uniform = {true, state.xf_memory_revision(), state.xf_register_revision(), segment, static_cast<std::uint32_t>(offset)};
-            ++stats.uniform_blocks;
+            if (latch_used)
+                for (unsigned k = 0; k < 9; ++k) transform_block.latched_normal[k / 3][k % 3] = latch[k];
         }
         const auto& planned = states[last_state.index];
         if (limits.verify_textures || !(last_textures.valid && last_textures.bp == state.bp_revision() &&
@@ -1437,16 +1625,33 @@ struct GlesDirect::Impl {
             for (unsigned map = 0; map < 8; ++map) if (p.plan->maps & (1u << map)) {
                 last_textures.textures[map] = texture(state, map, planned.textures[map], memory, cmpr);
                 last_textures.samplers[map] = sampler(planned.textures[map].sampler);
+                last_textures.palettes[map] = palette_generation(state, planned.textures[map]);
             }
             last_textures.valid = true; last_textures.bp = state.bp_revision(); last_textures.segment = segment;
             last_textures.frame = frame; last_textures.program = &p;
+        }
+        const auto latches = format.matrices ? std::array<std::uint32_t, 3>{} : stream_matrix_latches(state);
+        // A matrix change alone on resident geometry: an instance of the previous draw.
+        if (!uniform_current && cached && cached->clusters.empty()) {
+            const GeometryDraw resident{cached->buffer, cached->format, cached->base_vertex, cached->index_offset, cached->short_indices};
+            if (join_instances(p, state, draw, resident, cached->index_count, 0, cached->vertex_count - 1, latches)) {
+                last_uniform.valid = false;
+                return check_segment();
+            }
+        }
+        if (!uniform_current) {
+            const auto offset = (uniforms.size() + uniform_alignment - 1) / uniform_alignment * uniform_alignment;
+            uniforms.resize(offset + sizeof(TransformUniforms));
+            std::memcpy(uniforms.data() + offset, &transform_block, sizeof transform_block);
+            last_uniform = {true, state.xf_memory_revision(), state.xf_register_revision(), segment, latch_used,
+                            static_cast<std::uint32_t>(offset)};
+            ++stats.uniform_blocks;
         }
         if (runs.empty() || runs.back().format != format) {
             const auto base = (vertices.size() + 15) & ~std::size_t{15};
             vertices.resize(base);
             runs.push_back({format, static_cast<std::uint32_t>(base), 0});
         }
-        const auto latches = format.matrices ? std::array<std::uint32_t, 3>{} : stream_matrix_latches(state);
         if (cache) {
             Geometry* g = cached;
             if (!g) {
@@ -1623,6 +1828,7 @@ struct GlesDirect::Impl {
             if (p.konst[i].update(k)) glUniform4f(p.konst[i].location, k[0] / 255.0f, k[1] / 255.0f, k[2] / 255.0f, k[3] / 255.0f);
         }
         if (p.alpha.update(s.tev.alpha_reference)) glUniform2i(p.alpha.location, s.tev.alpha_reference[0], s.tev.alpha_reference[1]);
+        if (p.plan->z_texture.op && p.z_bias.update({{s.tev.z_texture_bias}})) glUniform1ui(p.z_bias.location, s.tev.z_texture_bias);
         if (p.plan->constant_alpha && p.constant_alpha.update(s.constant_alpha))
             glUniform3f(p.constant_alpha.location, s.constant_alpha[0], s.constant_alpha[1], s.constant_alpha[2]);
         if (p.plan->fog & 7) {
@@ -1655,6 +1861,7 @@ struct GlesDirect::Impl {
         if (p.plan->rgba6 && p.pixel.update(s.pixel_controls))
             glUniform4ui(p.pixel.location, s.pixel_controls[0], s.pixel_controls[1], s.pixel_controls[2], s.pixel_controls[3]);
         if (p.alpha.update(s.tev.alpha_reference)) glUniform2i(p.alpha.location, s.tev.alpha_reference[0], s.tev.alpha_reference[1]);
+        if (p.plan->z_texture.op && p.z_bias.update({{s.tev.z_texture_bias}})) glUniform1ui(p.z_bias.location, s.tev.z_texture_bias);
         for (unsigned i = 0; i < 16; ++i) if (p.scales[i].update(s.coordinate_scale[i]))
             glUniform2f(p.scales[i].location, s.coordinate_scale[i][0], s.coordinate_scale[i][1]);
         if (p.plan->indirect.lookup_mask) {
@@ -1741,6 +1948,9 @@ struct GlesDirect::Impl {
             if (uniform != r.uniform) {
                 glBindBufferRange(GL_UNIFORM_BUFFER, 0, ubo, r.uniform, sizeof(TransformUniforms)); uniform = r.uniform;
             }
+            if (r.instances)
+                glBindBufferRange(GL_UNIFORM_BUFFER, 1, ubo, r.instance_offset,
+                                  static_cast<GLsizeiptr>(r.instances) * transform_instance_rows * 16);
             const auto& s = states[r.state];
             if (state != r.state) { apply_raster(s); state = r.state; }
             apply_uniforms(*r.program, s);
@@ -1752,7 +1962,12 @@ struct GlesDirect::Impl {
                 if (bound_samplers[map] != r.samplers[map]) { glBindSampler(map, r.samplers[map]); bound_samplers[map] = r.samplers[map]; }
             }
             // Explicit bounds spare drivers an index scan to find the vertex range.
-            if (r.resident) {
+            if (r.resident && r.instances) {
+                const auto& g = r.geometry;
+                glDrawElementsInstancedBaseVertex(GL_TRIANGLES, static_cast<GLsizei>(r.count),
+                    g.short_indices ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,
+                    reinterpret_cast<const void*>(std::uintptr_t{g.index_offset}), static_cast<GLsizei>(r.instances), g.base_vertex);
+            } else if (r.resident) {
                 const auto& g = r.geometry;
                 glDrawRangeElementsBaseVertex(GL_TRIANGLES, r.low, r.high, static_cast<GLsizei>(r.count),
                     g.short_indices ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,
@@ -1776,6 +1991,7 @@ struct GlesDirect::Impl {
         ++segment;
         evict_geometry();
         last_state.valid = last_uniform.valid = batch_uniform.valid = false;
+        instance_group.open = false;
         textures_changed();
         evict_textures();
         evict_programs(nullptr);

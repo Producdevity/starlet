@@ -28,6 +28,11 @@ GLuint framebuffer = 0;
 std::map<GLuint, GLuint> color_attachments;
 std::map<GLuint, GLuint> depth_attachments;
 unsigned uniform_ranges = 0, read_pixels = 0;
+// Instanced draws: count, last instance count, the binding-1 range and the uniform buffer's bytes.
+unsigned instanced_draws = 0, instance_count = 0;
+GLintptr instance_offset = 0;
+GLsizeiptr instance_size = 0;
+std::vector<unsigned char> uniform_bytes;
 GLsizeiptr element_bytes = 0;
 unsigned uploads = 0, draws = 0, draw_first = 0, sampler_seen = 0, pack_seen = 0, unpack_seen = 0, pack_pbo_seen = 0,
          unpack_pbo_seen = 0;
@@ -38,6 +43,11 @@ GLenum binary_format = 0x1234;
 std::vector<unsigned char> program_binary{1, 2, 3, 4, 5}, loaded_binary;
 unsigned retrievable_hints = 0;
 const char* renderer_name = "private dispatch fixture";
+// Shader sources in compile order; depth state as last set.
+std::vector<std::string> shader_sources;
+std::vector<GLenum> invalidated;
+GLenum depth_func = GL_LESS;
+GLboolean depth_mask = GL_TRUE, depth_test = GL_FALSE;
 } // namespace fake
 namespace {
 std::size_t transfer_bytes(GLsizei width, GLsizei height, bool pack) {
@@ -74,7 +84,10 @@ void* glMapBufferRange(GLenum, GLintptr, GLsizeiptr length, GLbitfield) {
 }
 GLboolean glUnmapBuffer(GLenum) { return GL_TRUE; }
 void glFlush() {}
-void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) { ++fake::uniform_ranges; }
+void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
+    ++fake::uniform_ranges;
+    if (index == 1) { fake::instance_offset = offset; fake::instance_size = size; }
+}
 void glDisableVertexAttribArray(GLuint index) {}
 void glVertexAttrib4f(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {}
 void glVertexAttribI4ui(GLuint index, GLuint x, GLuint y, GLuint z, GLuint w) {}
@@ -86,7 +99,7 @@ void glBindVertexArray(GLuint array) {}
 void glBlendEquation(GLenum mode) {}
 void glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha) {}
 void glFrontFace(GLenum) {}
-void glDepthFunc(GLenum) {}
+void glDepthFunc(GLenum func) { fake::depth_func = func; }
 void glDepthRangef(GLfloat,GLfloat) {}
 void glCullFace(GLenum) {}
 void glBlendFuncSeparate(GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha) {}
@@ -98,13 +111,16 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
     if(data && target==GL_ARRAY_BUFFER) fake::submitted_vertices.assign(static_cast<const unsigned char*>(data),static_cast<const unsigned char*>(data)+size);
     if(target==GL_ELEMENT_ARRAY_BUFFER) fake::element_bytes=size;
     if(data && target==GL_ELEMENT_ARRAY_BUFFER) fake::submitted_indices.assign(static_cast<const std::uint16_t*>(data),static_cast<const std::uint16_t*>(data)+size/2);
+    if(data && target==GL_UNIFORM_BUFFER) fake::uniform_bytes.assign(static_cast<const unsigned char*>(data),static_cast<const unsigned char*>(data)+size);
     if(target==GL_UNIFORM_BUFFER && size==sizeof(fake::uploaded_transform)){
         ++fake::transform_uploads;std::memcpy(&fake::uploaded_transform,data,size);
     }
 }
 GLenum glCheckFramebufferStatus(GLenum target) { return GL_FRAMEBUFFER_COMPLETE; }
 void glClear(GLbitfield mask) { ++fake::clears; }
-void glInvalidateFramebuffer(GLenum, GLsizei, const GLenum*) {}
+void glInvalidateFramebuffer(GLenum, GLsizei count, const GLenum* attachments) {
+    for (GLsizei i = 0; i < count; ++i) fake::invalidated.push_back(attachments[i]);
+}
 void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {}
 void glClearDepthf(GLfloat d) {}
 GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) { return fake::wait_result; }
@@ -120,8 +136,8 @@ void glDeleteShader(GLuint shader) {}
 void glDeleteSync(GLsync sync) {}
 void glDeleteTextures(GLsizei n, const GLuint *textures) {}
 void glDeleteVertexArrays(GLsizei n, const GLuint *arrays) {}
-void glDepthMask(GLboolean flag) {}
-void glDisable(GLenum cap) {}
+void glDepthMask(GLboolean flag) { fake::depth_mask = flag; }
+void glDisable(GLenum cap) { if (cap == GL_DEPTH_TEST) fake::depth_test = GL_FALSE; }
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
     ++fake::draws;fake::submitted_index_count=count;
     fake::draw_first = fake::first[fake::bound[3]];
@@ -130,7 +146,10 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices
 void glDrawArrays(GLenum, GLint, GLsizei) { ++fake::draws; }
 void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices) { glDrawElements(mode, count, type, indices); }
 void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices, GLint) { glDrawElements(mode, count, type, indices); }
-void glEnable(GLenum cap) {}
+void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instances, GLint) {
+    ++fake::instanced_draws; fake::instance_count = static_cast<unsigned>(instances); glDrawElements(mode, count, type, indices);
+}
+void glEnable(GLenum cap) { if (cap == GL_DEPTH_TEST) fake::depth_test = GL_TRUE; }
 void glEnableVertexAttribArray(GLuint index) {}
 GLsync glFenceSync(GLenum condition, GLbitfield flags) { return reinterpret_cast<GLsync>(++fake::next); }
 void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {}
@@ -250,7 +269,11 @@ void glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, 
 void glSamplerParameteri(GLuint sampler, GLenum pname, GLint param) {}
 void glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param) {}
 void glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {}
-void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) {}
+void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) {
+    std::string source;
+    for (GLsizei i = 0; i < count; ++i) source += length && length[i] >= 0 ? std::string(string[i], length[i]) : std::string(string[i]);
+    fake::shader_sources.push_back(std::move(source));
+}
 void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border,
                   GLenum format, GLenum type, const void *pixels) {
     ++fake::uploads;
@@ -280,6 +303,7 @@ void glUniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2) { uniform(l
 void glUniform2i(GLint location, GLint v0, GLint v1) { uniform(location,{double(v0),double(v1),0,0}); }
 void glUniform4i(GLint location, GLint v0, GLint v1, GLint v2, GLint v3) { uniform(location,{double(v0),double(v1),double(v2),double(v3)}); }
 void glUniform4ui(GLint l,GLuint a,GLuint b,GLuint c,GLuint d) { uniform(l,{double(a),double(b),double(c),double(d)}); }
+void glUniform1ui(GLint l,GLuint a) { uniform(l,{double(a),0,0,0}); }
 void glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding) {}
 void glUseProgram(GLuint program) { fake::current_program=program; }
 void glVertexAttribIPointer(GLuint index, GLint size, GLenum type, GLsizei stride, const void *pointer) {}

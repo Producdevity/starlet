@@ -1,5 +1,7 @@
 #include "starlet/gx/tev.hpp"
 
+#include "starlet/gx/depth.hpp"
+
 #include <algorithm>
 #include <sstream>
 #include <utility>
@@ -64,6 +66,15 @@ TevStatus validate(const TevPipeline& pipeline, TevArithmeticModel model) {
             return failure(TevError::invalid_pipeline, "invalid TEV stage field");
         if (uses_texture(stage) && !stage.texture_enabled)
             return failure(TevError::unsupported_state, "TEV texture input with disabled lookup is unsupported");
+    }
+    if (pipeline.z_texture_op > 2 || pipeline.z_texture_type > 2 || (!pipeline.z_texture_op && pipeline.z_texture_type))
+        return failure(TevError::invalid_pipeline, "invalid Z-texture op or type");
+    if (pipeline.z_texture_op) {
+        const auto& last = pipeline.stages[pipeline.stage_count - 1];
+        if (!last.texture_enabled)
+            return failure(TevError::unsupported_state, "a Z texture needs a lookup in the last TEV stage");
+        if (uses_texture(last))
+            return failure(TevError::unsupported_state, "the Z texture occupies the last TEV stage's texture input");
     }
     return {};
 }
@@ -212,6 +223,7 @@ std::vector<std::uint8_t> pipeline_key(const TevPipeline& pipeline, TevArithmeti
         for (auto swap : stage.raster_swap) put(swap);
         put(code(stage.raster)); put(stage.texture_enabled); put(stage.texture_map); put(stage.texture_coord);
     }
+    if (pipeline.z_texture_op) { put('Z'); put(pipeline.z_texture_op); put(pipeline.z_texture_type); }
     return key;
 }
 std::string swizzle(const std::array<std::uint8_t, 4>& swap) {
@@ -282,6 +294,11 @@ TevInputUse tev_input_use(const TevStage& stage) {
         ? 1u << static_cast<unsigned>(stage.raster) : 0)};
 }
 
+bool tev_stage_samples(const TevPipeline& pipeline, unsigned stage) {
+    return stage < pipeline.stage_count &&
+           (uses_texture(pipeline.stages[stage]) || (pipeline.z_texture_op && stage + 1u == pipeline.stage_count));
+}
+
 TevUniforms capture_tev_uniforms(const State& state) {
     TevUniforms uniforms;
     for (unsigned i = 0; i < 4; ++i) {
@@ -292,6 +309,8 @@ TevUniforms capture_tev_uniforms(const State& state) {
     }
     const auto test = state.bp(0xf3);
     uniforms.alpha_reference = {{field(test, 0, 8), field(test, 8, 8)}};
+    ZTexture z;
+    if (decode_z_texture(state.bp(0xf4), state.bp(0xf5), z)) uniforms.z_texture_bias = z.bias;
     return uniforms;
 }
 
@@ -299,8 +318,10 @@ TevCapture capture_tev(const State& state) {
     TevPipeline pipeline;
     auto uniforms = capture_tev_uniforms(state);
     pipeline.stage_count = field(state.bp(0x00), 10, 4) + 1;
-    if (field(state.bp(0xf5), 2, 2) != 0)
-        return {failure(TevError::unsupported_state, "Z-texture stages are not supported"), {}};
+    ZTexture z;
+    if (!decode_z_texture(state.bp(0xf4), state.bp(0xf5), z))
+        return {failure(TevError::unsupported_state, "reserved Z-texture state"), {}};
+    pipeline.z_texture_op = z.op; pipeline.z_texture_type = z.type;
     for (unsigned i = 0; i < pipeline.stage_count; ++i) {
         auto& stage = pipeline.stages[i];
         const auto color = state.bp(0xc0 + i * 2), alpha = state.bp(0xc1 + i * 2);

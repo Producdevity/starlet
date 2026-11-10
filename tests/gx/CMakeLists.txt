@@ -5,7 +5,7 @@ function(starlet_gx_test name)
 endfunction()
 
 foreach(name core vertex vertex_stream line_point transform tev texture texture_copy_resident raster pixel
-             efb_format depth draw)
+             efb_format depth draw z_texture)
     starlet_gx_test(${name})
 endforeach()
 set_tests_properties(starlet_gx_pixel starlet_gx_efb_format PROPERTIES TIMEOUT 60)

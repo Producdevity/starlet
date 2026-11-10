@@ -472,6 +472,21 @@ void fast_program_rebuilds() {
     { Fixture f; fast_program_rebuild(f, "fast program rebuilds from its words"); }
     { Fixture f; f.bp(0xe2, 0x7ffu | (300u << 12)); fast_program_rebuild(f, "fast program with wide registers rebuilds"); }
     { Fixture f; f.bp(0xf1, 4u << 21); f.bp(0xe8, 1u << 10); fast_program_rebuild(f, "fast program with fog rebuilds"); }
+    {
+        // Fog off with projection and range adjustment left set: they are not program identity,
+        // and the state plan accepts the program.
+        Fixture plain, f; f.bp(0xf1, 1u << 20); f.bp(0xe8, 1u << 10);
+        const auto command = f.command();
+        std::vector<std::uint32_t> a, b;
+        direct_program_words(plain.decoder.state(), plain.command().layout, FramebufferFetch::none, DirectShading::fast, a);
+        direct_program_words(f.decoder.state(), command.layout, FramebufferFetch::none, DirectShading::fast, b);
+        check(a == b, "fog projection and range adjustment are ignored while fog is off");
+        const auto program = plan_direct_program(f.decoder.state(), command.layout, FramebufferFetch::none, DirectShading::fast);
+        check(bool(program), program.status.message.c_str());
+        DirectDrawState state;
+        const auto status = plan_direct_state(f.decoder.state(), *program.program, TextureCmprModel::reject_unverified, state);
+        check(bool(status), status.message.c_str());
+    }
     { Fixture f; f.bp(0,0x10012); f.bp(0x10,0x270); f.bp(0x27,1); f.bp(6,0xc00200); f.bp(7,0xd00000); f.bp(8,0);
       f.bp(0x81,0); f.bp(0x85,0); f.bp(0x89,0x100c07); f.bp(0x95,0x8000>>5);
       fast_program_rebuild(f, "fast indirect program rebuilds"); }

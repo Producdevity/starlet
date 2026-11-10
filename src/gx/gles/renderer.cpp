@@ -137,7 +137,8 @@ bool batch_compatible(const DrawPacket& a,const GlesDrawPipeline& x,const DrawPa
         std::memcmp(x.sampler_lod.data(),y.sampler_lod.data(),sizeof(x.sampler_lod)) ||
         std::memcmp(&a.transform->uniforms,&b.transform->uniforms,sizeof(TransformUniforms)) ||
         a.tev->uniforms.registers!=b.tev->uniforms.registers || a.tev->uniforms.konst!=b.tev->uniforms.konst ||
-        a.tev->uniforms.alpha_reference!=b.tev->uniforms.alpha_reference) return false;
+        a.tev->uniforms.alpha_reference!=b.tev->uniforms.alpha_reference ||
+        a.tev->uniforms.z_texture_bias!=b.tev->uniforms.z_texture_bias) return false;
     for (unsigned i=0;i<3;++i) if(a.indirect->matrices[i].rows!=b.indirect->matrices[i].rows) return false;
     for (unsigned i=0;i<8;++i) {
         if(bool(a.textures[i])!=bool(b.textures[i])) return false;
@@ -240,6 +241,7 @@ struct GlesRenderer::Impl {
         std::array<UniformValue<std::array<float,4>>, 8> sampler_lod{};
         UniformValue<std::array<std::uint8_t,2>> alpha;
         UniformValue<std::array<std::uint32_t,4>> pixel;
+        UniformValue<std::array<std::uint32_t,1>> z_bias;
         std::uint64_t used = 0;
     };
     std::thread::id owner = std::this_thread::get_id();
@@ -524,6 +526,8 @@ struct GlesRenderer::Impl {
             throw std::invalid_argument("invalid GLES cache budget");
         if (limits.aspect_width < 1 || limits.aspect_height < 1 || limits.aspect_width > 10000 || limits.aspect_height > 10000)
             throw std::invalid_argument("invalid GLES presentation shape");
+        if (const int s = limits.direct.snapshot_scale; s && s != 1 && s != 2 && s != 4)
+            throw std::invalid_argument("invalid EFB snapshot scale");
         if (!glGetString(GL_VERSION)) throw std::runtime_error("GLES context is not current");
         context_valid = true;
         GLint major = 0, minor = 0, attributes = 0, block_bytes = 0;
@@ -608,6 +612,7 @@ struct GlesRenderer::Impl {
             for (unsigned i = 0; i < 8; ++i) p.sampler_lod[i].location = location("uGxSamplerLod[" + std::to_string(i) + "]");
             p.alpha.location = location("uGxTevAlphaRef");
             p.pixel.location = location("uGxPixel");
+            p.z_bias.location = location("uGxZBias");
             for (unsigned i = 0; i < 8; ++i) glUniform1i(location("uGxTexture" + std::to_string(i)), i);
             gl_check("GX program uniforms");
             p.used = ++sequence;
@@ -700,9 +705,12 @@ struct GlesRenderer::Impl {
     // Packs D24 depth as RGB8 into target; with_color appends the EFB colour as a
     // second block of width columns.
     void pack_efb(GLuint target, int x, int y, int width, int height, int scale = 1, bool with_color = false);
-    // Fast shading keeps draw-sync snapshots at quarter resolution; the deferred
-    // callbacks peek single pixels and read the nearest retained sample.
-    int snapshot_scale() const { return limits.direct.shading == DirectShading::fast ? 4 : 1; }
+    // Fast shading keeps draw-sync snapshots at quarter resolution unless the limits ask
+    // for another; the deferred callbacks peek single pixels and read the nearest sample.
+    int snapshot_scale() const {
+        if (limits.direct.snapshot_scale) return limits.direct.snapshot_scale;
+        return limits.direct.shading == DirectShading::fast ? 4 : 1;
+    }
     GLsizeiptr snapshot_bytes() const {
         const int scale = snapshot_scale();
         return GLsizeiptr(2 * (efb_width / scale)) * (efb_height / scale) * 4;
@@ -748,6 +756,9 @@ struct GlesRenderer::Impl {
     }
     void reinterpret_format(bool target_rgba6) {
         if (rgba6 == target_rgba6) return;
+        // Fast direct shading keeps RGBA6 as plain RGBA8 values (direct.md): copies and
+        // clears after a format change must not reinterpret what fast programs drew.
+        if (direct && limits.direct.shading == DirectShading::fast) { rgba6 = target_rgba6; return; }
         ++stats.format_conversions;
         copy_surface();
         if (!format_program) {
@@ -929,6 +940,21 @@ void main(){
                            " highp vec2 p=vec2(uRect.x+uRect.z*gl_FragCoord.x,uEfb.y-uRect.y-uRect.z*gl_FragCoord.y)/uEfb;\n"
                            " vec4 c=texture(uImage,p);\n" + (p.rgba6 ? "" : " c.a=1.0;\n") + " color=" + value + ";\n}\n";
     }
+    // A copy whose clear rewrites a whole attachment the copy does not read leaves that
+    // attachment's contents dead: invalidating it spares the GPU writing it back when the
+    // copy ends the pass. Colour invalidation needs alpha cleared too (RGB8 keeps it opaque).
+    void invalidate_cleared(const TextureCopy& p) {
+        const auto& c = *p.clear;
+        if (p.strip || c.rectangle.x || c.rectangle.y || c.rectangle.width != efb_width || c.rectangle.height != efb_height) return;
+        GLenum attachments[1];
+        GLsizei count = 0;
+        if (!p.depth && c.depth_write) attachments[count++] = GL_DEPTH_ATTACHMENT;
+        if (p.depth && c.color_write && c.alpha_write) attachments[count++] = GL_COLOR_ATTACHMENT0;
+        if (!count) return;
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        glInvalidateFramebuffer(GL_FRAMEBUFFER, count, attachments);
+        ++stats.invalidations;
+    }
     void resident_pass(const TextureCopy& p, GlesDirect::ResidentTarget target) {
         const bool fast = fast_copy(p);
         // Fast copies other than luminance are blits: the EFB colour already holds the
@@ -1049,6 +1075,8 @@ void main(){
         gl_check("resident EFB texture copy");
     }
     void materialize(const GlesResidentCopy& c) {
+        // A broken stamp means the game reused the memory: the copy no longer exists there.
+        if (!c.intact()) return;
         const auto width = c.plan.destination_width(), height = c.plan.destination_height();
         std::vector<std::uint8_t> pixels(std::size_t(width) * height * 4);
         glBindFramebuffer(GL_FRAMEBUFFER, c.framebuffer);
@@ -1388,6 +1416,8 @@ void GlesRenderer::Impl::submit(const DrawPacket& packet,const GlesDrawPipeline&
         if (p.rgba6_copy && program.pixel.update(p.pixel_controls)) glUniform4ui(program.pixel.location,p.pixel_controls[0],p.pixel_controls[1],p.pixel_controls[2],p.pixel_controls[3]);
         if (program.alpha.update(packet.tev->uniforms.alpha_reference))
             glUniform2i(program.alpha.location, packet.tev->uniforms.alpha_reference[0], packet.tev->uniforms.alpha_reference[1]);
+        if (packet.tev->pipeline.z_texture_op && program.z_bias.update({{packet.tev->uniforms.z_texture_bias}}))
+            glUniform1ui(program.z_bias.location, packet.tev->uniforms.z_texture_bias);
         for (unsigned i = 0; i < 16; ++i) if (program.scales[i].update(p.coordinate_scale[i]))
             glUniform2f(program.scales[i].location, p.coordinate_scale[i][0], p.coordinate_scale[i][1]);
         if (packet.indirect->lookup_mask) {
@@ -1650,6 +1680,7 @@ void GlesRenderer::copy_texture_resident(const TextureCopy& p, std::uint8_t* des
         g.execute([&g, p, target] {
             try {
                 if (!p.depth) g.reinterpret_format(p.rgba6);
+                if (p.clear) g.invalidate_cleared(p);
                 g.resident_pass(p, target);
                 if (p.clear) g.clear_efb_gl(*p.clear);
                 ++g.stats.texture_copies;
@@ -2007,6 +2038,7 @@ void GlesRenderer::build_programs_in_background() {
     if (impl_->direct) impl_->direct->build_programs_in_background();
 }
 
+bool GlesRenderer::failed() const { return impl_->failed; }
 GlesStats GlesRenderer::stats() const {
     auto result = impl_->stats;
     result.capture_cache = impl_->capture_cache.stats();

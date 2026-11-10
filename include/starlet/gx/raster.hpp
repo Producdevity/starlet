@@ -91,11 +91,16 @@ struct GlesRasterResult {
 // clips at the viewport. reject refuses a scissor reaching outside the viewport;
 // clip_to_viewport draws such primitives clipped at the viewport, dropping those pixels.
 enum class GuardBand { reject, clip_to_viewport };
-GlesRasterResult plan_gles_raster(const RasterSnapshot&, bool rgba6_copy = false, GuardBand = GuardBand::reject);
+// GL viewports are whole pixels. reject refuses a fractional GX viewport; round moves each
+// edge to the nearest pixel, at most half a pixel from where GX maps it.
+enum class FractionalViewport { reject, round };
+GlesRasterResult plan_gles_raster(const RasterSnapshot&, bool rgba6_copy = false, GuardBand = GuardBand::reject,
+                                  FractionalViewport = FractionalViewport::reject);
 // Visual-fidelity domain: RGB8 or RGBA6 stored as RGBA8 and blended by GL. RGBA6
 // blends all four channels with the GX factors, including destination alpha;
 // subtraction is reverse subtraction; dither is not reproduced. Logic operations
 // admit copy, no-op and clear only. Constant alpha is written by the fragment stage; see premultiply.
-GlesRasterResult plan_gles_raster_fast(const RasterSnapshot&, GuardBand = GuardBand::reject);
+GlesRasterResult plan_gles_raster_fast(const RasterSnapshot&, GuardBand = GuardBand::reject,
+                                       FractionalViewport = FractionalViewport::reject);
 
 } // namespace starlet::gx

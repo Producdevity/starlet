@@ -90,6 +90,28 @@ void z16_plan() {
     bool refused = false;
     try { plan_texture_copy(decoder.state(), r, false); } catch (const std::exception&) { refused = true; }
     require(refused, "depth copy to RGB565 is refused");
+    // The SDK switches the PE to Z24 for a depth copy and back afterwards.
+    require(decoder.write_u8(0x61) && decoder.write_u32(0x43000043u), "Z24 pixel format");
+    r.command = 0x52010238u;
+    const auto z = plan_texture_copy(decoder.state(), r, false);
+    require(z.depth && !z.rgba6 && z.format == 11, "depth copy plans under the SDK's Z24 pixel format");
+    r.depth = false; r.command = 0x52010260u; refused = false;
+    try { plan_texture_copy(decoder.state(), r, false); } catch (const std::exception&) { refused = true; }
+    require(refused, "color copy under Z24 is refused");
+}
+// Pikmin 2's ShadowCylinder2 passes its bottom-right corner as the size: in the lower
+// split-screen view that is 608x448 from row 224. The rectangle is cut to the frame.
+void clipped_plan() {
+    Memory memory; Sink sink; Decoder decoder(memory, sink);
+    TextureCopyRegisters r{};
+    r.source = 0x49000000u | (224u << 10); r.size = 0x4a000000u | (447u << 10) | 607u; r.stride = 0x4d000000u | 38u;
+    r.command = 0x52010270u; // R8, half scale.
+    const auto p = plan_texture_copy(decoder.state(), r, false);
+    require(p.y == 224 && p.width == 608 && p.height == p.efb.height - 224 && !p.strip, "rectangle cut to the frame's bottom");
+    require(p.destination_width() == 304 && p.destination_height() == (p.efb.height - 224) / 2, "destination keeps the covered rows");
+    r.source = 0x49000000u | 400u; r.size = 0x4a000000u | (99u << 10) | 399u; r.command = 0x52010070u;
+    const auto wide = plan_texture_copy(decoder.state(), r, false);
+    require(wide.x == 400 && wide.width == EfbLayout::width - 400 && wide.height == 100, "rectangle cut to the frame's right edge");
 }
 // GX_TF_Z16 copies use PE format 11 (RG8): each texel stores Z's middle byte, then its high byte,
 // so sampling the copy as IA8 gives the high byte as intensity.
@@ -109,7 +131,7 @@ void z16_layout() {
 }
 
 int main() {
-    try { formats(); z16_plan(); z16_layout(); }
+    try { formats(); z16_plan(); clipped_plan(); z16_layout(); }
     catch (const std::exception& error) { std::cerr << "texture_copy_resident_tests: " << error.what() << '\n'; return 1; }
     std::cout << "resident texture-copy model matches encoder and sampler\n";
 }

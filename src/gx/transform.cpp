@@ -51,6 +51,10 @@ bool uses_lighting_normal(const TransformPipeline& p) {
     }
     return false;
 }
+bool uses_emboss(const TransformPipeline& p) {
+    for (unsigned i = 0; i < p.texgen_count; ++i) if (p.texgens[i].type == 1) return true;
+    return false;
+}
 TransformStatus validate(const TransformPipeline& p) {
     if (p.color_count > 2 || p.texgen_count > 8 || p.computed_colors > 3 || p.raster_colors > 3 || p.vertex_colors > 3 ||
         (p.normal_components != 0 && p.normal_components != 3 && p.normal_components != 9))
@@ -59,7 +63,12 @@ TransformStatus validate(const TransformPipeline& p) {
     unsigned color_texgens = 0;
     for (unsigned i = 0; i < p.texgen_count; ++i) {
         const auto& t = p.texgens[i];
-        if (t.type == 1) return fail(TransformError::unsupported_state, "emboss texgen is not implemented");
+        if (t.type == 1) {
+            if (t.emboss_source >= i || p.texgens[t.emboss_source].type != 0)
+                return fail(TransformError::unsupported_state, "emboss texgen needs an earlier regular texgen as its source");
+            if (p.normal_components != 9) return fail(TransformError::missing_input, "emboss texgen requires NBT");
+            continue;
+        }
         if (t.type > 3) return fail(TransformError::unsupported_state, "reserved texgen type");
         if (t.type >= 2) {
             if (color_texgens >= 2 || t.type != 2 + color_texgens++)
@@ -74,8 +83,7 @@ TransformStatus validate(const TransformPipeline& p) {
             if ((row == 3 || row == 4) && p.normal_components != 9)
                 return fail(TransformError::missing_input, "binormal/tangent texgen requires NBT");
             if (row >= 5 && row <= 12) {
-                if (!(p.vertex_texcoords & (1u << (row-5))))
-                    return fail(TransformError::missing_input, "texgen requires an absent ST attribute");
+                // An absent ST attribute reads (0, 0, 1, 1); see draw.md.
                 if (t.input_abc1) return fail(TransformError::unsupported_state, "ST texgen cannot supply ABC input");
             } else if (row != 0 && row != 1 && row != 3 && row != 4) {
                 return fail(TransformError::unsupported_state, "reserved regular texgen source row");
@@ -152,7 +160,7 @@ std::string vertex_color_glsl(const TransformPipeline& p, unsigned channel) {
 }
 } // namespace
 
-static_assert(sizeof(TransformLight) == 80 && sizeof(TransformUniforms) == 3328, "std140 uniform layout");
+static_assert(sizeof(TransformLight) == 80 && sizeof(TransformUniforms) == 3376, "std140 uniform layout");
 static_assert(std::is_standard_layout<TransformUniforms>::value, "uniforms must be standard layout");
 
 namespace {
@@ -167,10 +175,14 @@ TransformEvaluation evaluate_prepared(const TransformPipeline& p, const Transfor
         r.status = fail(TransformError::invalid_matrix, "position/normal matrix crosses memory end"); return r;
     }
     const TransformVector source{v.position[0], v.position[1], v.position[2], 1};
+    std::array<float, 9> latched{};
+    if (p.latched_normal)
+        for (unsigned k = 0; k < 9; ++k) latched[k] = u.latched_normal[k/3][k%3];
+    const auto& vn = p.latched_normal ? latched : v.normal;
     auto& o = r.output;
     for (unsigned k = 0; k < 3; ++k) o.eye_position[k] = dot(u.position[row+k], source);
     if (transform_normal) {
-        const V3 n{v.normal[0], v.normal[1], v.normal[2]};
+        const V3 n{vn[0], vn[1], vn[2]};
         for (unsigned k = 0; k < 3; ++k) o.normal[k] = dot(xyz(u.normal[row%32+k]), n);
         if (!normalize(o.normal)) {
             r.status = fail(TransformError::unsupported_arithmetic, "degenerate transformed normal"); return r;
@@ -222,13 +234,34 @@ TransformEvaluation evaluate_prepared(const TransformPipeline& p, const Transfor
         const auto& t = p.texgens[i];
         auto& out = o.texcoords[i];
         if (t.type >= 2) { out = {o.colors[t.type-2][0], o.colors[t.type-2][1], 1}; continue; }
+        if (t.type == 1) {
+            // The light direction projected on the row-3 and row-4 NBT vectors in eye space
+            // offsets s and t of the source texgen (US 6,980,218); q passes through.
+            const unsigned nr = row % 32;
+            if (nr > 29) { r.status = fail(TransformError::invalid_matrix, "normal matrix crosses memory end"); return r; }
+            V3 ray = xyz(u.lights[t.emboss_light].position);
+            for (unsigned k = 0; k < 3; ++k) ray[k] -= e[k];
+            if (!normalize(ray)) { r.status = fail(TransformError::unsupported_arithmetic, "degenerate emboss light direction"); return r; }
+            const V3 b{vn[3], vn[4], vn[5]}, tangent{vn[6], vn[7], vn[8]};
+            V3 s_axis, t_axis;
+            for (unsigned k = 0; k < 3; ++k) {
+                s_axis[k] = dot(xyz(u.normal[nr+k]), b);
+                t_axis[k] = dot(xyz(u.normal[nr+k]), tangent);
+            }
+            out = o.texcoords[t.emboss_source];
+            out[0] += dot(s_axis, ray); out[1] += dot(t_axis, ray);
+            if (!finite(out)) { r.status = fail(TransformError::unsupported_arithmetic, "non-finite texture coordinate"); return r; }
+            continue;
+        }
         TransformVector input{};
         if (t.source_row == 0) input = source;
         else if (t.source_row == 1 || t.source_row == 3 || t.source_row == 4) {
             const unsigned n = t.source_row == 1 ? 0 : (t.source_row == 3 ? 3 : 6);
-            input = {v.normal[n], v.normal[n+1], v.normal[n+2], 1};
-        } else {
+            input = {vn[n], vn[n+1], vn[n+2], 1};
+        } else if (p.vertex_texcoords & (1u << (t.source_row-5))) {
             const auto& st = v.texcoords[t.source_row-5]; input = {st[0], st[1], 1, 1};
+        } else {
+            input = {0, 0, 1, 1};
         }
         const unsigned texture_row = v.matrix_indices[i+1];
         if (texture_row > (t.projected ? 61u : 62u)) {
@@ -275,7 +308,7 @@ TransformEvaluation evaluate_transform(const TransformPipeline& p, const Transfo
 }
 
 TransformStatus capture_transform_pipeline(const State& s, const VertexLayout& layout, std::uint8_t raster_colors,
-                                           TransformPipeline& p) {
+                                           TransformPipeline& p, std::uint8_t latched_components) {
     p = {};
     if (s.xf(0x1005) > 1 || s.xf(0x1009) > 2 || s.xf(0x103f) > 8 || s.xf(0x1026) > 1 || s.xf(0x1012) > 1)
         return fail(TransformError::unsupported_state, "unsupported clipping/projection/channel/texgen state");
@@ -298,6 +331,7 @@ TransformStatus capture_transform_pipeline(const State& s, const VertexLayout& l
             return fail(TransformError::unsupported_state, "reserved texgen bits");
         p.texgens[i] = {t.type, t.source_row, t.input_abc1, t.projected,
                        (post & 256u) != 0, static_cast<std::uint8_t>(post & 63u)};
+        if (t.type == 1) { p.texgens[i].emboss_source = t.bump_source; p.texgens[i].emboss_light = t.bump_light; }
         if (t.type == 2 || t.type == 3) p.computed_colors |= 1u << (t.type-2);
     }
     for (unsigned i = 0; i < 4; ++i) {
@@ -311,6 +345,12 @@ TransformStatus capture_transform_pipeline(const State& s, const VertexLayout& l
         c.attenuation = !(bits & 512) ? TransformAttenuation::none :
             (bits & 1024 ? TransformAttenuation::spot : TransformAttenuation::specular);
     }
+    if (!p.normal_components && (latched_components == 3 || latched_components == 9)) {
+        bool needs = uses_lighting_normal(p) || uses_emboss(p);
+        for (unsigned i = 0; i < p.texgen_count; ++i)
+            needs |= p.texgens[i].type == 0 && (p.texgens[i].source_row == 1 || p.texgens[i].source_row == 3 || p.texgens[i].source_row == 4);
+        if (needs) { p.normal_components = latched_components; p.latched_normal = true; }
+    }
     return validate(p);
 }
 
@@ -320,7 +360,8 @@ void direct_transform_uniforms(const State& s, TransformUniforms& u) {
         std::memcpy(v.data(), xf + base, width * 4);
         std::fill(v.begin() + width, v.end(), 0.0f);
     };
-    static_assert(sizeof(TransformUniforms) == 208 * sizeof(TransformVector), "every uniform field is written");
+    static_assert(sizeof(TransformUniforms) == 211 * sizeof(TransformVector), "every uniform field is written");
+    u.latched_normal = {};   // The XF latch is not State; the direct renderer fills it.
     static_assert(sizeof(u.position) == 256 * 4 && sizeof(u.post) == 256 * 4, "XF matrix memory layout");
     std::memcpy(u.position.data(), xf, sizeof u.position);
     std::memcpy(u.post.data(), xf + 0x500, sizeof u.post);
@@ -360,6 +401,8 @@ TransformCapture capture_transform(const State& s, const VertexSnapshot& vertice
         if (c.attenuation != TransformAttenuation::none) light_attenuation |= c.light_mask;
         if (c.attenuation == TransformAttenuation::specular) light_specular |= c.light_mask;
     }
+    for (unsigned i = 0; i < p.texgen_count; ++i)
+        if (p.texgens[i].type == 1) { lights |= 1u << p.texgens[i].emboss_light; light_positions |= 1u << p.texgens[i].emboss_light; }
     auto read_row = [&s](std::uint16_t base, unsigned row, unsigned width) {
         TransformVector v{};
         for (unsigned k = 0; k < width; ++k) v[k] = as_float(s.xf(static_cast<std::uint16_t>(base+row*width+k)));
@@ -379,12 +422,19 @@ TransformCapture capture_transform(const State& s, const VertexSnapshot& vertice
         }
         for (unsigned k = 0; k < 3; ++k) { pos[row+k] = true; if (transform_normal) normal[row%32+k] = true; }
         for (unsigned i = 0; i < p.texgen_count; ++i) {
-            const auto& t = p.texgens[i]; if (t.type != 0) continue;
+            const auto& t = p.texgens[i];
+            if (t.type == 1) {
+                if (!finite(v.normal)) { r.status = fail(TransformError::invalid_input, "non-finite live texgen input"); return r; }
+                if (row%32 > 29) { r.status = fail(TransformError::invalid_matrix, "position/normal matrix crosses memory end"); return r; }
+                for (unsigned k = 0; k < 3; ++k) normal[row%32+k] = true;
+                continue;
+            }
+            if (t.type != 0) continue;
             bool source_finite = true;
             if (t.source_row == 1 || t.source_row == 3 || t.source_row == 4) {
                 const unsigned n = t.source_row == 1 ? 0 : (t.source_row == 3 ? 3 : 6);
                 source_finite = finite(V3{v.normal[n],v.normal[n+1],v.normal[n+2]});
-            } else if (t.source_row >= 5) source_finite = finite(v.texcoords[t.source_row-5]);
+            } else if (t.source_row >= 5 && (p.vertex_texcoords & (1u << (t.source_row-5)))) source_finite = finite(v.texcoords[t.source_row-5]);
             if (!source_finite) {
                 r.status = fail(TransformError::invalid_input, "non-finite live texgen input"); return r;
             }
@@ -469,7 +519,7 @@ TransformStatus validate_transform_vertices(const TransformSnapshot& snapshot, c
 }
 
 TransformShader generate_transform_glsl(const TransformPipeline& p, TransformArithmetic model, bool include_source, bool batched,
-                                        std::uint8_t affine, bool compact) {
+                                        std::uint8_t affine, bool compact, bool instanced) {
     TransformShader r;
     if (model != TransformArithmetic::float32_candidate_v1) {
         r.status = fail(TransformError::unsupported_arithmetic, "unsupported transform arithmetic model"); return r;
@@ -477,10 +527,15 @@ TransformShader generate_transform_glsl(const TransformPipeline& p, TransformAri
     r.status = validate(p); if (!r.status) return r;
     r.key = {'G','X','X','F',1,static_cast<std::uint8_t>(model),p.color_count,p.texgen_count,
              p.computed_colors,p.normal_components,static_cast<std::uint8_t>(p.orthographic),
-             static_cast<std::uint8_t>(p.dual_texture), static_cast<std::uint8_t>(batched), affine, static_cast<std::uint8_t>(compact)};
+             static_cast<std::uint8_t>(p.dual_texture), static_cast<std::uint8_t>(batched), affine, static_cast<std::uint8_t>(compact),
+             static_cast<std::uint8_t>(p.latched_normal), static_cast<std::uint8_t>(instanced)};
+    if (batched && instanced) { r.status = fail(TransformError::unsupported_state, "a transform is batched or instanced"); return r; }
+    if (instanced)
+        for (unsigned i = 0; i < p.texgen_count; ++i)
+            if (p.texgens[i].type == 1) { r.status = fail(TransformError::unsupported_state, "instanced transform with an emboss texgen"); return r; }
     if (batched) {
         bool object_space = uses_lighting_normal(p);
-        for (unsigned i = 0; i < p.texgen_count; ++i) object_space |= p.texgens[i].type < 2 && p.texgens[i].source_row < 5;
+        for (unsigned i = 0; i < p.texgen_count; ++i) object_space |= p.texgens[i].type == 1 || (p.texgens[i].type == 0 && p.texgens[i].source_row < 5);
         if (object_space) { r.status = fail(TransformError::unsupported_state, "batched transform consumes object-space inputs"); return r; }
     }
     for (unsigned i = 0; i < 4; ++i) {
@@ -497,8 +552,10 @@ TransformShader generate_transform_glsl(const TransformPipeline& p, TransformAri
     for (unsigned i = 0; i < p.texgen_count; ++i) {
         const auto& t = p.texgens[i];
         r.key.push_back(t.type);
+        if (t.type == 1) { r.key.insert(r.key.end(), {t.emboss_source, t.emboss_light}); continue; }
         if (t.type >= 2) continue;
         r.key.insert(r.key.end(), {t.source_row, std::uint8_t(t.projected)});
+        if (t.source_row >= 5 && !(p.vertex_texcoords & (1u << (t.source_row-5)))) r.key.push_back(0xff); // Absent ST.
         if (p.dual_texture) r.key.insert(r.key.end(), {std::uint8_t(t.normalize), t.post_row});
     }
     if (!include_source) return r;
@@ -528,12 +585,16 @@ layout(std140, binding=0) uniform GXTransform {
     vec4 u_material[2];
     Light u_light[8];
     vec4 u_viewport[2];
+    vec4 u_latched_normal[3];
 };
 out vec3 gx_eye;
 out vec3 gx_normal;
 out vec4 gx_clip;
 out vec4 gx_gles_clip;
 )GLSL";
+    if (instanced)
+        g << "layout(std140, binding=1) uniform GXInstances {\n    vec4 u_instance[" << transform_instance_limit * transform_instance_rows
+          << "];\n};\n";
     g << (compact ? "out mediump vec4 gx_color0;\nout mediump vec4 gx_color1;\n" : "out vec4 gx_color0;\nout vec4 gx_color1;\n");
     for (unsigned i = 0; i < 8; ++i) g << "out " << ((affine >> i) & 1 ? "vec2" : "vec3") << " gx_tex" << i << ";\n";
     g << R"GLSL(int matrixIndex(int indexSlot) {
@@ -571,14 +632,26 @@ void main() {
 )GLSL";
     if (batched) g << "    gx_eye = a_position;\n    gx_register0 = a_register0/255.0;\n    gx_register1 = a_register1/255.0;\n"
                       "    gx_register2 = a_register2/255.0;\n    gx_register3 = a_register3/255.0;\n";
-    else g << "    gx_eye = vec3(dot(u_position[pn],position),dot(u_position[pn+1],position),dot(u_position[pn+2],position));\n";
+    else if (instanced) {
+        g << "    int ib = gl_InstanceID*" << transform_instance_rows << ";\n"
+             "    gx_eye = vec3(dot(u_instance[ib],position),dot(u_instance[ib+1],position),dot(u_instance[ib+2],position));\n";
+    } else {
+        g << "    gx_eye = vec3(dot(u_position[pn],position),dot(u_position[pn+1],position),dot(u_position[pn+2],position));\n";
+    }
+    if (!batched) {
+        if (p.latched_normal) g << "    vec3 normalIn = u_latched_normal[0].xyz;\n    vec3 binormalIn = u_latched_normal[1].xyz;\n"
+                                   "    vec3 tangentIn = u_latched_normal[2].xyz;\n";
+        else g << "    vec3 normalIn = a_normal;\n    vec3 binormalIn = a_binormal;\n    vec3 tangentIn = a_tangent;\n";
+    }
     g << R"GLSL(    gx_normal = vec3(0.0);
     gx_color0 = vec4(0.0);
     gx_color1 = vec4(0.0);
 )GLSL";
     for (unsigned i = 0; i < 8; ++i) g << "    gx_tex" << i << " = " << ((affine >> i) & 1 ? "vec2" : "vec3") << "(0.0);\n";
-    if (uses_lighting_normal(p)) g << R"GLSL(    int nr = pn % 32;
-    gx_normal = unitVector(vec3(dot(u_normal[nr].xyz,a_normal),dot(u_normal[nr+1].xyz,a_normal),dot(u_normal[nr+2].xyz,a_normal)));
+    if (uses_lighting_normal(p) && instanced) g << R"GLSL(    gx_normal = unitVector(vec3(dot(u_instance[ib+3].xyz,normalIn),dot(u_instance[ib+4].xyz,normalIn),dot(u_instance[ib+5].xyz,normalIn)));
+)GLSL";
+    else if (uses_lighting_normal(p)) g << R"GLSL(    int nr = pn % 32;
+    gx_normal = unitVector(vec3(dot(u_normal[nr].xyz,normalIn),dot(u_normal[nr+1].xyz,normalIn),dot(u_normal[nr+2].xyz,normalIn)));
 )GLSL";
     g << "    gx_clip = vec4(gx_eye.x*u_projection[0].x+";
     g << (p.orthographic ? "u_projection[0].y" : "gx_eye.z*u_projection[0].y");
@@ -609,13 +682,28 @@ void main() {
             g << "    gx_tex" << i << " = " << (flat ? "" : "vec3(") << "gx_color" << unsigned(t.type-2) << ".rg" << (flat ? "" : ",1.0)") << ";\n";
             continue;
         }
+        if (t.type == 1) {
+            const unsigned source = t.emboss_source;
+            const bool source_flat = (affine >> source) & 1;
+            g << "    {\n        int er = pn % 32;\n        vec3 ray = unitVector(u_light[" << unsigned(t.emboss_light) << "].position.xyz - gx_eye);\n"
+                 "        vec3 sAxis = vec3(dot(u_normal[er].xyz,binormalIn),dot(u_normal[er+1].xyz,binormalIn),dot(u_normal[er+2].xyz,binormalIn));\n"
+                 "        vec3 tAxis = vec3(dot(u_normal[er].xyz,tangentIn),dot(u_normal[er+1].xyz,tangentIn),dot(u_normal[er+2].xyz,tangentIn));\n"
+                 "        vec2 offset = vec2(dot(sAxis,ray),dot(tAxis,ray));\n";
+            if (flat) g << "        gx_tex" << i << " = gx_tex" << source << ".xy + offset;\n    }\n";
+            else if (source_flat) g << "        gx_tex" << i << " = vec3(gx_tex" << source << " + offset,1.0);\n    }\n";
+            else g << "        gx_tex" << i << " = gx_tex" << source << " + vec3(offset,0.0);\n    }\n";
+            continue;
+        }
         g << "    {\n        vec4 source = ";
         switch (t.source_row) {
         case 0: g << "position"; break;
-        case 1: g << "vec4(a_normal,1.0)"; break;
-        case 3: g << "vec4(a_binormal,1.0)"; break;
-        case 4: g << "vec4(a_tangent,1.0)"; break;
-        default: g << "vec4(a_tex" << unsigned(t.source_row-5) << ",1.0,1.0)"; break;
+        case 1: g << "vec4(normalIn,1.0)"; break;
+        case 3: g << "vec4(binormalIn,1.0)"; break;
+        case 4: g << "vec4(tangentIn,1.0)"; break;
+        default:
+            if (p.vertex_texcoords & (1u << (t.source_row-5))) g << "vec4(a_tex" << unsigned(t.source_row-5) << ",1.0,1.0)";
+            else g << "vec4(0.0,0.0,1.0,1.0)";
+            break;
         }
         g << ";\n        int tr = matrixIndex(" << i+1 << ");\n";
         if (flat) { g << "        gx_tex" << i << " = vec2(dot(u_position[tr],source),dot(u_position[tr+1],source));\n    }\n"; continue; }

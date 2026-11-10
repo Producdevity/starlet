@@ -53,6 +53,12 @@ Decoder lifetime. When replacing a decoder, a renderer retaining texture caches
 must clear those caches or include its own decoder epoch in every palette cache
 key; a new decoder may reuse the same numeric generations.
 
+Indexed XF loads (CP opcodes 0x20, 0x28, 0x30 and 0x38) read through
+`MemoryReader::copy_indexed_xf`, which names the array (12 to 15) and defaults to
+`copy`. Games compute those matrices and lights on the CPU every frame, so a port
+whose CPU writes host-order numbers converts them there without describing every
+matrix buffer; the words it returns are canonical like any other read.
+
 ## Frame layout
 
 `Decoder` takes the `EfbLayout` its state reports: the frame a game's render mode
@@ -87,6 +93,18 @@ image register holds the extent's low ten bits in each dimension; any other regi
 value ignores the extent. Texture coordinates keep scaling against the register
 size, so they stay normalized to the whole texture. An extent change counts as a
 BP change.
+
+## Fast commands
+
+NOP runs, plain BP writes (both TEV banks), plain CP writes and XF matrix-memory writes of
+up to 16 words are most commands. `fast_command` applies them directly, with the general
+path's state, revisions and `bp_write` callbacks, at the stream's top level and inside
+display lists; games such as Pikmin 2 send most of their material and shape state through
+lists (about 590 KB of list bytes per title frame). A list's bytes are charged when the
+list is called, so commands inside it charge only their count. Anything else (TLUT loads,
+texture-cache invalidation, masked writes, XF registers, indexed loads, primitives, host
+opcodes) or a limit takes the general path. `Decoder::counts()` reports how many commands
+each path took, by opcode for the general path.
 
 ## Host commands
 

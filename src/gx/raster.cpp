@@ -1,5 +1,7 @@
 #include "starlet/gx/raster.hpp"
 
+#include "starlet/gx/depth.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -83,11 +85,23 @@ RasterCapture capture_raster(const State& state) {
     return {{}, std::move(result)};
 }
 
-GlesRasterResult plan_gles_raster(const RasterSnapshot& r, bool rgba6_copy, GuardBand guard_band) {
+GlesRasterResult plan_gles_raster(const RasterSnapshot& r, bool rgba6_copy, GuardBand guard_band,
+                                  FractionalViewport fractional) {
     auto reject = [](const char* message) {
         return GlesRasterResult{{RasterError::unsupported_state, message}, {}};
     };
     const double gl_y = (r.strip ? r.efb.strip_height() : r.efb.height) - r.viewport.top - r.viewport.height;
+    if (fractional == FractionalViewport::round &&
+        !(integral_int(r.viewport.left) && integral_int(gl_y) && integral_int(r.viewport.width) &&
+          integral_int(r.viewport.height))) {
+        auto rounded = r;
+        const double left = std::round(r.viewport.left), top = std::round(r.viewport.top);
+        rounded.viewport.left = left;
+        rounded.viewport.top = top;
+        rounded.viewport.width = std::round(r.viewport.left + r.viewport.width) - left;
+        rounded.viewport.height = std::round(r.viewport.top + r.viewport.height) - top;
+        return plan_gles_raster(rounded, rgba6_copy, guard_band, FractionalViewport::reject);
+    }
     if (guard_band == GuardBand::clip_to_viewport && r.scissor.width && r.scissor.height &&
         integral_int(r.viewport.left) && integral_int(gl_y) && integral_int(r.viewport.width) &&
         integral_int(r.viewport.height)) {
@@ -139,13 +153,13 @@ GlesRasterResult plan_gles_raster(const RasterSnapshot& r, bool rgba6_copy, Guar
     p.blend = !rgba6_copy && (r.color_mode & 1) != 0;
     p.color_write = (r.color_mode & 8) != 0;
     p.cull = (r.gen_mode >> 14) & 3;
+    ZTexture z_texture;
+    if (!decode_z_texture(r.z_texture[0], r.z_texture[1], z_texture)) return reject("reserved GX Z-texture state");
     p.depth_test = r.z_mode & 1; p.depth_write = r.z_mode & 16;
     p.depth_compare = (r.z_mode >> 1) & 7;
-    p.early_depth = p.depth_test && (r.pixel_control & 64);
+    // Z textures require the depth test after texturing (GX manual 11.2).
+    p.early_depth = p.depth_test && (r.pixel_control & 64) && !z_texture.active();
     p.depth_range = {{near_depth,far_depth}};
-    if ((r.z_texture[1] & 12) && p.depth_test &&
-        (p.depth_write || (p.depth_compare!=0 && p.depth_compare!=7)))
-        return reject("depth from texture is not implemented");
     p.source_factor = (r.color_mode >> 8) & 7;
     p.destination_factor = (r.color_mode >> 5) & 7;
     if (p.blend && (p.source_factor >= 6 || p.destination_factor >= 6))
@@ -153,7 +167,7 @@ GlesRasterResult plan_gles_raster(const RasterSnapshot& r, bool rgba6_copy, Guar
     return {{}, p};
 }
 
-GlesRasterResult plan_gles_raster_fast(const RasterSnapshot& r, GuardBand guard_band) {
+GlesRasterResult plan_gles_raster_fast(const RasterSnapshot& r, GuardBand guard_band, FractionalViewport fractional) {
     auto reject = [](const char* message) {
         return GlesRasterResult{{RasterError::unsupported_state, message}, {}};
     };
@@ -168,7 +182,7 @@ GlesRasterResult plan_gles_raster_fast(const RasterSnapshot& r, GuardBand guard_
     if ((r.pixel_control & 7) > 1) return reject("fast GLES domain requires RGB8 or RGBA6");
     if (r.destination_alpha & 0x600) return reject("YUV destination state is not implemented");
     if ((r.destination_alpha & 0x100) && !rgba6) return reject("constant alpha requires an alpha EFB");
-    auto planned = plan_gles_raster(base, false, guard_band);
+    auto planned = plan_gles_raster(base, false, guard_band, fractional);
     if (!planned) return planned;
     auto& p = planned.plan;
     p.source_factor = (r.color_mode >> 8) & 7;

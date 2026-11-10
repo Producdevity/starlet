@@ -18,13 +18,17 @@ enum class DirectShading : std::uint8_t { exact, fast };
 
 // Registers and layout presence that define the program. Equal words always
 // plan to the same program; other registers reach the GPU as uniforms/state.
-void direct_program_words(const State&, const VertexLayout&, FramebufferFetch, DirectShading, std::vector<std::uint32_t>&);
+// latched_normal: components of the vectors the XF holds from an earlier vertex (0, 3 or 9);
+// see capture_transform_pipeline.
+void direct_program_words(const State&, const VertexLayout&, FramebufferFetch, DirectShading, std::vector<std::uint32_t>&,
+                          std::uint8_t latched_normal = 0);
 // The program word that regular-bank TEV colour registers decide, which
 // State::bp_state_revision does not track: equal revisions and equal register words
 // mean equal program words.
 std::uint32_t direct_program_register_word(const State&, DirectShading);
-// Appended to a program's words for its batched variant.
+// Appended to a program's words for its batched or instanced variant.
 inline constexpr std::uint32_t batched_program_word = 0xba7c4ed1u;
+inline constexpr std::uint32_t instanced_program_word = 0x1a57a2c1u;
 // Fast-shading words only: a State and layout whose words equal words, so the program
 // can be planned before a draw needs it. False for any other words.
 bool direct_program_state(const std::vector<std::uint32_t>& words, State&, VertexLayout&);
@@ -37,8 +41,11 @@ struct DirectProgram {
     bool rgba6 = false, needs_fetch = false, early_depth = false, fast = false, constant_alpha = false;
     // Fast program for eye-space positions and per-vertex TEV registers; see generate_transform_glsl.
     bool batched = false;
+    // Fast program whose position and normal matrices come per instance; see generate_transform_glsl.
+    bool instanced = false;
     std::uint8_t affine = 0; // Fast coordinates with q == 1.
     std::uint8_t fog = 0; // Fast only: fog type | orthographic << 3 | range adjustment << 4.
+    ZTextureProgram z_texture; // Op and type of an active Z texture; depth: the draw depth-tests.
     PixelPlan pixel; // RGBA6 only.
     std::string vertex, fragment;
 };
@@ -48,7 +55,7 @@ struct DirectProgramResult {
     explicit operator bool() const { return static_cast<bool>(status); }
 };
 DirectProgramResult plan_direct_program(const State&, const VertexLayout&, FramebufferFetch, DirectShading = DirectShading::exact,
-                                        bool batched = false);
+                                        bool batched = false, std::uint8_t latched_normal = 0, bool instanced = false);
 
 struct DirectDrawState {
     GlesRasterPlan raster;
@@ -63,6 +70,6 @@ struct DirectDrawState {
     std::array<float, 3> constant_alpha{}; // Fast programs with constant_alpha: uGxConstantAlpha.
 };
 DrawStatus plan_direct_state(const State&, const DirectProgram&, TextureCmprModel, DirectDrawState&,
-                             GuardBand = GuardBand::reject);
+                             GuardBand = GuardBand::reject, FractionalViewport = FractionalViewport::reject);
 
 } // namespace starlet::gx

@@ -46,7 +46,7 @@ public:
 
 private:
     struct Context;
-    struct Entry { std::vector<std::uint32_t> words; bool batched = false; };
+    struct Entry { std::vector<std::uint32_t> words; bool batched = false, instanced = false; };
     void work(unsigned index);
     void plan();
     bool serve_request();

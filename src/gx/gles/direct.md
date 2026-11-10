@@ -20,6 +20,11 @@ objects. Each entry's source bytes are content-hashed once per frame, or on
 every use with `verify_textures`, and after `invalidate` reports overlapping CPU
 writes.
 
+Draws without normals that light or generate coordinates from them read the
+normal, binormal and tangent the XF latched from the last vertex that carried
+them (`latest_normal`), as the hardware does; the latch travels in the transform
+uniform block and its presence is program identity.
+
 Converted indexed geometry stays resident on the GPU. It is reused only while the
 FIFO bytes match exactly and every consumed array span is unchanged. A draw's FIFO
 bytes match without reading them when `MemoryReader::source_identity` names the same
@@ -48,13 +53,21 @@ handled. `GuardBand::reject` refuses them, as GX clips at its guard band and GL 
 the viewport. `GuardBand::clip_to_viewport` intersects the scissor with the
 viewport, which matches a port whose renderer clips at the viewport too (Aurora's).
 
+`GlesDirectLimits::fractional_viewport` selects how a viewport off the pixel grid is
+handled. `FractionalViewport::reject` refuses it, since `glViewport` takes whole
+pixels. `FractionalViewport::round` moves each edge to the nearest pixel, at most half
+a pixel from where GX maps it (Dolphin's GLES backend also rounds); Pikmin 2's pod
+collection movie shifts its 608x448 viewport by 47.2 rows.
+
 `DirectShading::fast` replaces the candidate TEV and pixel arithmetic with the
 mediump fragment model of fast_shader.hpp and GL blending: RGBA6 is stored as
 RGBA8, blended in all four channels with GX factors (destination alpha included)
-and never reinterpreted on pixel-format changes; samplers carry the GX LOD
+and never reinterpreted on pixel-format changes, by draws, copies or clears
+alike (an SDK depth copy selects Z24 inside RGBA6 frames); samplers carry the GX LOD
 range. Constant alpha replaces only the stored alpha; colour still blends with
-the TEV alpha (raster.hpp, premultiply). It targets visual fidelity, not GX
-bit equality.
+the TEV alpha (raster.hpp, premultiply). The fog type is program identity, and so
+are its projection and range adjustment while fog is on; with fog off they are
+ignored, as games leave them set. It targets visual fidelity, not GX bit equality.
 
 In fast mode, draws of at most 64 vertices whose program reads no normals and
 no position-sourced texgens are batched: their positions are transformed to eye
@@ -64,6 +77,25 @@ batched draws whose other BP state (`State::bp_state_revision`), XF registers,
 textures and remaining XF matrix memory are unchanged share one state plan and
 uniform block, and merge into one GL draw; particles and layout panes otherwise
 cost a driver draw each.
+
+In fast mode, consecutive draws of the same resident geometry with the same program,
+state plan, textures and matrix latches, whose transform blocks differ only in the
+position matrix rows pn..pn+2 and normal matrix rows pn % 32..+2 of the draw's PN index,
+are one instanced draw (`glDrawElementsInstancedBaseVertex`) of the program's instanced
+variant: it reads those two matrices per instance from `GXInstances` (binding 1, six
+vec4 rows per instance, at most 128 instances) and everything else from the first
+draw's block, so each instance computes exactly what its own draw would. Programs with
+emboss texgens, texgens reading rows that overlap the PN rows, per-vertex matrices and
+clustered geometry draw separately. A scene of repeated models (a title made of
+hundreds of flowers) then costs one driver draw per run of identical shapes.
+
+Games often write BP registers again with unchanged values between draws (a material
+loaded per model). A draw whose BP values equal those of the last state plan keeps that
+plan and the textures it resolved, without planning or texture lookups; CI textures also
+need their palette generation unchanged, since a TLUT load changes the palette without
+changing a register. Such draws then also qualify for instancing.
+`GlesDirectLimits::geometry_min_vertices` (default 8) sets the smallest indexed draw kept
+as resident geometry; smaller ones stream and are never instanced.
 
 Lines and points go through the batched path at any vertex count: GX's setup
 unit draws them as screen-aligned quads, so after the eye transform each point
@@ -94,9 +126,16 @@ the decoded channels, without the 4/5/6-bit quantization. A later lookup at the 
 address with that format, size, one level and natural tile stride samples the
 copy directly; any other overlapping lookup first materializes it with a
 readback and `store_texture_copy`, reproducing the CPU encoder's bytes.
-Unregistered writable ranges release their copies. Display copies render YUYV
-into a per-XFB texture that VI presentation samples, so XFB memory is not
-written. Because no CPU-visible GX result remains pending, `wait_until_idle`
+Unregistered writable ranges release their copies. Where nobody reports CPU
+writes, as in a recompiled game, `stamp_resident_copies` writes a per-copy stamp
+into the first eight bytes of up to 64 destination blocks spread over the copy,
+its first and last included. The copy is sampled or materialized only while
+every stamp is intact; a game reusing the memory overwrites it wholesale and
+breaks one, and the memory then keeps the game's bytes. Stamping every block
+cost a cache miss per block, several milliseconds per frame on the H700.
+
+Display copies render YUYV into a per-XFB texture that VI presentation samples,
+so XFB memory is not written. Because no CPU-visible GX result remains pending, `wait_until_idle`
 only submits records; presentation still waits for the previous frame.
 
 Recording makes no GL calls. Texture uploads, program links (lazily, before a
@@ -108,7 +147,9 @@ parameters, since packing moves entries while earlier segments are queued.
 `Target::execute` decides where segments run: inline, or on the renderer's
 submission thread (`GlesRenderer::start_submission`), which also runs EFB
 clears, copies, display copies and presentation in call order. EFB
-snapshots are read back asynchronously there, so draw-sync peeks read CPU
+snapshots (quarter resolution under fast shading unless `snapshot_scale` sets
+another; callbacks that test single pixels need 1) are read back
+asynchronously there, so draw-sync peeks read CPU
 memory; live peeks and materialization wait for the queue.
 
 These are recording-thread budgets (textures, programs, geometry) of GL objects,

@@ -79,7 +79,7 @@ std::string alpha_test(TevCompare op, unsigned index) {
 
 std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot& indirect, std::uint8_t maps,
                                  bool early_depth, bool constant_alpha, bool batched, std::uint8_t affine,
-                                 std::uint8_t fog, std::uint8_t wide_registers) {
+                                 std::uint8_t fog, std::uint8_t wide_registers, const ZTextureProgram& z_texture) {
     std::ostringstream f;
     f << "#version 310 es\n";
     if (early_depth) f << "layout(early_fragment_tests) in;\n";
@@ -87,7 +87,7 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
       << "in mediump vec4 gx_color0;\nin mediump vec4 gx_color1;\n";
     std::uint8_t coordinates = 0;
     for (unsigned i = 0; i < tev.stage_count; ++i)
-        if (tev_input_use(tev.stages[i]).texture) coordinates |= 1u << tev.stages[i].texture_coord;
+        if (tev_stage_samples(tev, i)) coordinates |= 1u << tev.stages[i].texture_coord;
     for (unsigned i = 0; i < 4; ++i) if (indirect.lookup_mask & (1u << i)) coordinates |= 1u << indirect.lookups[i].coordinate;
     for (unsigned i = 0; i < 8; ++i)
         if (coordinates & (1u << i)) f << "in highp " << ((affine >> i) & 1 ? "vec2" : "vec3") << " gx_tex" << i << ";\n";
@@ -104,6 +104,10 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
     // x: the constant, y: keep TEV alpha, z: blend source factor applied here (1: a, 2: 1-a).
     if (constant_alpha) f << "uniform vec3 uGxConstantAlpha;\n";
     const unsigned fog_type = fog & 7;
+    // The Z texture's Z feeds the depth test and fog. Its texel is the last stage's raw lookup.
+    const bool z_code = z_texture.op && (z_texture.depth || fog_type);
+    const auto z_glsl = z_code ? z_texture_glsl(z_texture, "gxZLookup") : ZTextureGlsl{};
+    f << z_glsl.globals;
     if (fog_type) f << "uniform highp vec4 uGxFog;\nuniform mediump vec3 uGxFogColor;\n";
     if (fog_type && (fog & 16)) f << "uniform highp float uGxFogCenter;\nuniform highp float uGxFogTable[10];\n";
     if (indirect_coordinates(indirect)) f << "uniform highp vec2 uGxImageSize[16];\n";
@@ -114,6 +118,8 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
     // [0,1]; the offset absorbs mediump rounding of k/255.
     f << "layout(location=0) out vec4 gxFragmentColor;\n"
          "vec4 gxLow8(vec4 v) { return v-floor(v*(255.0/256.0)+(0.5/256.0))*(256.0/255.0); }\nvoid main() {\n";
+    f << z_glsl.reference;
+    if (z_code) f << "    highp ivec4 gxZLookup;\n";
     auto sample = [&](unsigned map, const std::string& uv) {
         return "texture(uGxTexture" + std::to_string(map) + "," + uv + ",uGxSamplerBias[" + std::to_string(map) + "])";
     };
@@ -140,7 +146,8 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
     for (unsigned i = 0; i < tev.stage_count; ++i) {
         const auto& stage = tev.stages[i];
         f << "    { // stage " << i << "\n";
-        if (tev_input_use(stage).texture) {
+        const bool z_lookup = z_code && i + 1u == tev.stage_count;
+        if (tev_input_use(stage).texture || z_lookup) {
             const auto c = std::to_string(unsigned(stage.texture_coord));
             const auto& s = indirect.stages[i];
             std::string uv;
@@ -155,7 +162,8 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
                   << "        fixedUV=(fixedUV&ivec2(0x7fffff))-(fixedUV&ivec2(0x800000));\n";
                 uv = "vec2(fixedUV)/(128.0*uGxImageSize[" + std::to_string(i) + "])";
             } else uv = uv_of(stage.texture_coord) + "*uGxCoordinateScale[" + std::to_string(i) + "]";
-            f << "        vec4 tex=" << sample(stage.texture_map, uv) << "." << swizzle(stage.texture_swap) << ";\n";
+            if (z_lookup) f << "        gxZLookup=ivec4(" << sample(stage.texture_map, uv) << "*255.0+0.5);\n        vec4 tex=vec4(0.0);\n";
+            else f << "        vec4 tex=" << sample(stage.texture_map, uv) << "." << swizzle(stage.texture_swap) << ";\n";
         } else f << "        vec4 tex=vec4(0.0);\n";
         f << "        vec4 ras=" << (stage.raster == TevRaster::zero ? std::string("vec4(0.0)")
                                      : "gx_color" + std::to_string(code(stage.raster)) + "." + swizzle(stage.raster_swap)) << ";\n"
@@ -219,10 +227,13 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
         f << "    int alpha=int(color.a*255.0+0.5);\n    if (!(" << alpha_test(tev.alpha_compare[0], 0) << logic[code(tev.alpha_logic)]
           << alpha_test(tev.alpha_compare[1], 1) << ")) discard;\n";
     if (constant_alpha) f << "    float blendAlpha=color.a;\n    color.a=uGxConstantAlpha.y>0.5?blendAlpha:uGxConstantAlpha.x;\n";
+    f << z_glsl.depth;
     if (fog_type) {
+        const std::string z = z_code ? "gxDepth" : "gl_FragCoord.z";
+        if (z_code) f << "    highp float gxDepth=float(gxZ)/16777216.0;\n";
         // Depths behind the B plane are fully fogged, as the hardware's divide saturates.
-        f << "    highp float fogDepth=" << (fog & 8 ? "uGxFog.x*gl_FragCoord.z"
-                                               : "uGxFog.x/max(uGxFog.y-gl_FragCoord.z*uGxFog.z,1e-9)") << ";\n";
+        f << "    highp float fogDepth=" << (fog & 8 ? "uGxFog.x*" + z
+                                               : "uGxFog.x/max(uGxFog.y-" + z + "*uGxFog.z,1e-9)") << ";\n";
         // Range adjustment: sample i is the factor (i+1)*32 pixels from the center (GXInitFogAdjTable);
         // the hardware interpolates two samples, and the factor is 1 at the center itself.
         if (fog & 16)

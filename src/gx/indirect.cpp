@@ -33,7 +33,7 @@ IndirectCapture capture_indirect(const State& state, const TevPipeline& tev) {
         // A lookup beyond the enabled indirect stages is undefined on the console; it
         // adds no offset here, while the wrap modes still apply.
         if (lookup >= count) matrix = 0;
-        if (!tev_input_use(tev.stages[i]).texture || (!matrix && !wrap_s && !wrap_t)) continue;
+        if (!tev_stage_samples(tev, i) || (!matrix && !wrap_s && !wrap_t)) continue;
         result->stages[i] = {static_cast<std::uint8_t>(matrix ? lookup : 0), static_cast<std::uint8_t>(matrix),
                              static_cast<std::uint8_t>(matrix ? (word >> 4) & 7 : 0), static_cast<std::uint8_t>(wrap_s),
                              static_cast<std::uint8_t>(wrap_t)};

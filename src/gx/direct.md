@@ -11,8 +11,9 @@ konst-selection and swap words, indirect commands/routing/scales, gen mode
 without cull, alpha-test functions without references, Z-texture, pixel format
 and Z-compare location, depth enable, RGBA6 blend/logic/subtract selection and
 the min filters of all eight maps. Equal words always plan the same program.
-Cull, scissor, viewport, blend factors, TEV registers, alpha references, matrix
-values and texture images reach the GPU as raster state or uniforms.
+Cull, scissor, viewport, blend factors, TEV registers, alpha references, the
+Z-texture bias, matrix values and texture images reach the GPU as raster state or
+uniforms.
 
 `plan_direct_program` runs the existing `capture_tev`, `capture_indirect`,
 `capture_transform_pipeline` and `capture_pixel` rejection rules and emits the

@@ -133,6 +133,10 @@ samples the 160x114 one rather than its box-filtered half; on SP the
 consecutive-frame comparison against the GX passes differed by a mean of 0.1-0.4
 in static regions.
 
+A resident texture copy whose clear covers the whole EFB and rewrites an attachment the
+copy does not read (depth for colour copies; colour, alpha included, for depth copies)
+invalidates that attachment first, so the pass the copy ends does not write it back.
+
 Offscreen passes (`begin_offscreen`/`end_offscreen`) swap both EFB attachments for
 an EFB-sized colour and depth pair cleared to transparent black and the far plane.
 Draws, clears and texture copies in between use the pair; ending reattaches the EFB

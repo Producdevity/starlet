@@ -156,6 +156,8 @@ bool Decoder::charge_list(std::size_t size, unsigned depth, Budget& budget) {
 
 bool Decoder::execute_list(std::uint32_t address, std::size_t size, unsigned depth, Budget& budget) {
     if (!charge_list(size, depth, budget)) return false;
+    ++counts_.lists;
+    counts_.list_bytes += size;
     // A list's commands are stream commands, also when an injected call runs it.
     struct Stream { bool& injecting; bool was = injecting; ~Stream() { injecting = was; } } stream{injecting_};
     injecting_ = false;
@@ -171,9 +173,104 @@ bool Decoder::execute_list(std::uint32_t address, std::size_t size, unsigned dep
     return parse_list({bytes.data(), bytes.size()}, depth, budget);
 }
 
+// NOP runs, plain BP and CP writes and XF matrix-memory writes, applied with the general
+// path's effects. A stream command (depth 0) also charges its bytes; a list's bytes were
+// charged when the list was called. Anything else, or a limit, is left to the general path.
+Decoder::Fast Decoder::fast_command(const std::uint8_t* p, std::size_t remaining, unsigned depth, Budget& budget,
+                                    std::size_t& consumed) {
+    const bool stream = depth == 0;
+    const bool room = budget.commands < limits_.max_commands && (!stream || limits_.max_expanded_bytes - budget.bytes >= 6);
+    const auto charge = [&](std::size_t size) { ++budget.commands; if (stream) budget.bytes += size; };
+    if (p[0] == 0x61 && room && remaining >= 5 && dropped_bp_[p[1]]) {
+        ++counts_.fast_bp;
+        charge(5);
+        consumed = 5;
+        return Fast::applied;
+    }
+    if (p[0] == 0x61 && room && remaining >= 5 && plain_bp_[p[1]] && state_.bp_mask_ == 0xffffff) {
+        const auto address = p[1];
+        const auto value = std::uint32_t{p[2]} << 16 | std::uint32_t{p[3]} << 8 | p[4];
+        charge(5);
+        ++counts_.fast_bp;
+        // TEV registers E0-E7 hold two banks: the selector bit picks color or konstant.
+        const bool tev = address >= 0xe0 && address <= 0xe7;
+        if (tev) state_.tev_registers_[(value >> 23) & 1][address - 0xe0] = value & 0x7fffff;
+        if (state_.bp_[address] != value) {
+            state_.bp_[address] = value;
+            ++state_.revision_;
+            ++state_.bp_revision_;
+            if (!tev || (value & 0x800000)) ++state_.bp_state_revision_;
+        }
+        if (!sink_.bp_write(state_, address, value)) {
+            fail(Error::sink_rejected, "GX sink rejected BP operation");
+            return Fast::failed;
+        }
+        if (!status_) return Fast::failed;
+        consumed = 5;
+        return Fast::applied;
+    }
+    if (p[0] == 0 && fast_nop_) {
+        std::size_t run = 1;
+        while (run < remaining && p[run] == 0) ++run;
+        run = std::min(run, limits_.max_commands - budget.commands);
+        if (stream) run = std::min(run, limits_.max_expanded_bytes - budget.bytes);
+        if (run) {
+            counts_.nops += run;
+            budget.commands += run;
+            if (stream) budget.bytes += run;
+            consumed = run;
+            return Fast::applied;
+        }
+    }
+    if (p[0] == 0x10 && room && fast_xf_ && remaining >= 5 && p[1] == 0 && p[2] < 16) {
+        const std::size_t count = std::size_t{p[2]} + 1, size = 5 + count * 4;
+        const auto address = be16(p + 3);
+        if (remaining >= size && address + count <= 0x1000 && (!stream || limits_.max_expanded_bytes - budget.bytes >= size)) {
+            auto* xf = state_.xf_.data() + address;
+            bool changed = false;
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto word = be32(p + 5 + i * 4);
+                changed |= xf[i] != word;
+                xf[i] = word;
+            }
+            charge(size);
+            ++counts_.fast_xf;
+            if (changed) {
+                ++state_.revision_;
+                ++state_.xf_memory_revision_;
+                state_.last_xf_memory_write_ = {state_.xf_memory_revision_, address, static_cast<std::uint16_t>(address + count)};
+                // Programs key on the GX_PTIDENTITY rows.
+                if (address < 0x600 && address + count > 0x5f4) ++state_.xf_register_revision_;
+            }
+            consumed = size;
+            return Fast::applied;
+        }
+    }
+    if (p[0] == 0x08 && room && remaining >= 6 && plain_cp_[p[1]]) {
+        const auto address = p[1];
+        const auto value = be32(p + 2);
+        charge(6);
+        ++counts_.fast_cp;
+        if (state_.cp_[address] != value) {
+            state_.cp_[address] = value;
+            ++state_.revision_;
+            ++state_.cp_revision_;
+            if (address < 0xa0) ++state_.cp_layout_revision_;
+        }
+        consumed = 6;
+        return Fast::applied;
+    }
+    return Fast::none;
+}
+
 bool Decoder::parse_list(ByteView bytes, unsigned depth, Budget& budget) {
     std::size_t offset = 0;
     while (offset < bytes.size) {
+        // Material and shape lists are mostly the same plain writes as the stream.
+        std::size_t fast = 0;
+        const auto applied = fast_command(bytes.data + offset, bytes.size - offset, depth, budget, fast);
+        if (applied == Fast::failed) return false;
+        if (applied == Fast::applied) { offset += fast; continue; }
         std::size_t consumed = 5;
         Parse result;
         if (!bp_command(bytes.data + offset, bytes.size - offset, depth, budget, result))
@@ -197,6 +294,7 @@ bool Decoder::bp_command(const std::uint8_t* input, std::size_t size, unsigned d
         return true;
     }
     if (depth == 0) budget.bytes += 5;
+    ++counts_.general[0x61];
     result = stream_bp(be32(input + 1)) && status_ ? Parse::complete : Parse::failed;
     return true;
 }
@@ -346,6 +444,7 @@ Decoder::Parse Decoder::command(ByteView input, std::size_t& consumed, unsigned 
     if (depth == 0) {
         budget.bytes += consumed;
     }
+    ++counts_.general[primitive(opcode) ? opcode & 0xf8 : opcode];
     bool ok = true;
     if (opcode == 0x08) {
         const auto address = input.data[1];
@@ -418,7 +517,10 @@ Decoder::Parse Decoder::command(ByteView input, std::size_t& consumed, unsigned 
             ok = fail(Error::invalid_xf_range, "GX indexed XF transfer exceeds matrix memory");
         } else if (source > std::numeric_limits<std::uint32_t>::max()) {
             ok = fail(Error::memory_read, "GX indexed XF address overflow");
-        } else if ((ok = read_memory(static_cast<std::uint32_t>(source), bytes.data(), count * 4))) {
+        } else if (!memory_.copy_indexed_xf(static_cast<std::uint8_t>(array), static_cast<std::uint32_t>(source), bytes.data(),
+                                            count * 4)) {
+            ok = fail(Error::memory_read, "GX memory range is unavailable");
+        } else {
             bool changed = false;
             for (std::size_t i = 0; i < count; ++i) {
                 const auto word = be32(bytes.data() + i * 4);
@@ -514,90 +616,12 @@ Status Decoder::feed(ByteView bytes) try {
             break;
         }
         // NOP runs, plain BP and CP writes and XF matrix-memory writes are most of a frame's
-        // commands; they apply here with the general path's effects. Anything else, or a
-        // limit, takes the general path.
+        // commands; fast_command applies them with the general path's effects.
         if (pending_.empty()) {
-            const auto* p = bytes.data + offset;
-            const auto remaining = bytes.size - offset;
-            const bool room = budget.commands < limits_.max_commands && limits_.max_expanded_bytes - budget.bytes >= 6;
-            if (p[0] == 0x61 && room && remaining >= 5 && dropped_bp_[p[1]]) {
-                ++budget.commands;
-                budget.bytes += 5;
-                offset += 5;
-                continue;
-            }
-            if (p[0] == 0x61 && room && remaining >= 5 && plain_bp_[p[1]] && state_.bp_mask_ == 0xffffff) {
-                const auto address = p[1];
-                const auto value = std::uint32_t{p[2]} << 16 | std::uint32_t{p[3]} << 8 | p[4];
-                ++budget.commands;
-                budget.bytes += 5;
-                // TEV registers E0-E7 hold two banks: the selector bit picks color or konstant.
-                const bool tev = address >= 0xe0 && address <= 0xe7;
-                if (tev) state_.tev_registers_[(value >> 23) & 1][address - 0xe0] = value & 0x7fffff;
-                if (state_.bp_[address] != value) {
-                    state_.bp_[address] = value;
-                    ++state_.revision_;
-                    ++state_.bp_revision_;
-                    if (!tev || (value & 0x800000)) ++state_.bp_state_revision_;
-                }
-                if (!sink_.bp_write(state_, address, value)) {
-                    fail(Error::sink_rejected, "GX sink rejected BP operation");
-                    break;
-                }
-                if (!status_) break;
-                offset += 5;
-                continue;
-            }
-            if (p[0] == 0 && fast_nop_) {
-                std::size_t run = 1;
-                while (run < remaining && p[run] == 0) ++run;
-                run = std::min({run, limits_.max_commands - budget.commands, limits_.max_expanded_bytes - budget.bytes});
-                if (run) {
-                    budget.commands += run;
-                    budget.bytes += run;
-                    offset += run;
-                    continue;
-                }
-            }
-            if (p[0] == 0x10 && room && fast_xf_ && remaining >= 5 && p[1] == 0 && p[2] < 16) {
-                const std::size_t count = std::size_t{p[2]} + 1, size = 5 + count * 4;
-                const auto address = be16(p + 3);
-                if (remaining >= size && address + count <= 0x1000 && limits_.max_expanded_bytes - budget.bytes >= size) {
-                    auto* xf = state_.xf_.data() + address;
-                    bool changed = false;
-                    for (std::size_t i = 0; i < count; ++i) {
-                        const auto word = be32(p + 5 + i * 4);
-                        changed |= xf[i] != word;
-                        xf[i] = word;
-                    }
-                    ++budget.commands;
-                    budget.bytes += size;
-                    if (changed) {
-                        ++state_.revision_;
-                        ++state_.xf_memory_revision_;
-                        state_.last_xf_memory_write_ = {state_.xf_memory_revision_, address,
-                                                        static_cast<std::uint16_t>(address + count)};
-                        // Programs key on the GX_PTIDENTITY rows.
-                        if (address < 0x600 && address + count > 0x5f4) ++state_.xf_register_revision_;
-                    }
-                    offset += size;
-                    continue;
-                }
-            }
-            if (p[0] == 0x08 && room && remaining >= 6 && plain_cp_[p[1]]) {
-                const auto address = p[1];
-                const auto value = be32(p + 2);
-                ++budget.commands;
-                budget.bytes += 6;
-                if (state_.cp_[address] != value) {
-                    state_.cp_[address] = value;
-                    ++state_.revision_;
-                    ++state_.cp_revision_;
-                    if (address < 0xa0) ++state_.cp_layout_revision_;
-                }
-                offset += 6;
-                continue;
-            }
+            std::size_t fast = 0;
+            const auto applied = fast_command(bytes.data + offset, bytes.size - offset, 0, budget, fast);
+            if (applied == Fast::failed) break;
+            if (applied == Fast::applied) { offset += fast; continue; }
         }
         std::size_t consumed = 5;
         const bool buffered = !pending_.empty();

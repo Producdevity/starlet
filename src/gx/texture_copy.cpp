@@ -40,7 +40,8 @@ TextureCopy plan_texture_copy(const State& state, TextureCopyRegisters r, bool c
         (r.source & 0x00f00000) || (r.size & 0x00f00000) || (r.stride & 0x00fffc00) ||
         (r.command & ~allowed) || (id && id != 0x52) ||
         (conversion != 2 && conversion != 3) || (conversion == 3 && (r.depth || format != 1)) ||
-        (r.depth && !depth_format(format)) || (state.bp(0) & (1u<<9)) || (state.bp(0x43) & 7) > 1 || (state.bp(0x43) & 0x38))
+        (r.depth && !depth_format(format)) || (state.bp(0) & (1u<<9)) || (state.bp(0x43) & 0x38) ||
+        ((state.bp(0x43) & 7) > 1 && !(r.depth && (state.bp(0x43) & 7) == 3)))
         throw std::runtime_error("unsupported native texture-copy AA/depth/scale/field/conversion");
     TextureCopy p;
     p.efb = state.efb();
@@ -58,6 +59,15 @@ TextureCopy plan_texture_copy(const State& state, TextureCopyRegisters r, bool c
     p.clamp_top = r.command & 1;
     p.clamp_bottom = r.command & 2;
     p.strip = p.y >= p.efb.height;
+    // A rectangle reaching past the frame's right or bottom edge (or past the strip rows) is
+    // cut to it, as Dolphin does; the destination keeps only the rows the cut rectangle covers.
+    // Pikmin 2's ShadowCylinder2 passes its bottom-right corner as the size.
+    {
+        const int end_row = p.strip ? EfbLayout::rows : p.efb.height;
+        if (p.x < EfbLayout::width && p.x + p.width > EfbLayout::width) p.width = EfbLayout::width - p.x;
+        if (p.y < end_row && p.y + p.height > end_row) p.height = end_row - p.y;
+        if (p.half_scale) { p.width &= ~1; p.height &= ~1; }
+    }
     // Rows below the frame take no filter: the blur's strips are written with it off, and the
     // screen-wobble loops only copy one strip past the frame's last rows without reading it.
     if (p.strip) p.filter = {{0, 64, 0}};

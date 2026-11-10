@@ -1,5 +1,6 @@
 #pragma once
 
+#include "starlet/gx/depth.hpp"
 #include "starlet/gx/raster.hpp"
 #include "starlet/gx/pixel.hpp"
 #include "starlet/gx/tev.hpp"
@@ -68,7 +69,7 @@ struct GlesDrawResult {
 };
 // GPU integration domain: orthographic/perspective triangles, RGB8 fixed-function blending
 // or explicit candidate RGBA6 arithmetic with coherent framebuffer fetch for
-// blending/subtraction, linear depth comparisons/writes and GX early/late Z;
+// blending/subtraction, linear depth comparisons/writes, Z textures and GX early/late Z;
 // automatic power-of-two repeat bias only, no cylindrical modifiers,
 // matching min/mag spatial filters, isotropic edge/diagonal LOD, mip nearest
 // or trilinear filtering, and no anisotropy or bias clamp.
@@ -79,9 +80,10 @@ GlesDrawResult plan_gles_draw(const DrawPacket&, FramebufferFetch = FramebufferF
 // The fragment stage both planners emit: TEV, regular/indirect lookups, alpha
 // test and RGB8 or RGBA6 pixel output, consuming the transform stage outputs.
 // RGBA6 output uses the compile-time pixel stage of the given plan, dithering by EFB rows
-// counted from the top of an efb_height frame.
+// counted from the top of an efb_height frame. A Z texture with depth writes gl_FragDepth
+// (z_texture_glsl) and reads uniform uGxZBias.
 std::string gles_fragment_source(const TevPipeline&, const std::string& tev_functions, const IndirectSnapshot&,
                                  std::uint8_t maps, std::uint8_t mip_maps, const PixelPlan* rgba6, bool needs_fetch,
-                                 FramebufferFetch, bool early_depth, int efb_height);
+                                 FramebufferFetch, bool early_depth, int efb_height, const ZTextureProgram& = {});
 
 } // namespace starlet::gx

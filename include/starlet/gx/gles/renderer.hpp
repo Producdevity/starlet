@@ -31,6 +31,8 @@ struct GlesStats {
     // EFB peeks, those against the live EFB or waiting for a snapshot (both wait for
     // queued GL work), and snapshot requests refused for want of a slot.
     std::uint64_t peeks = 0, live_peeks = 0, peek_waits = 0, refused_snapshots = 0;
+    // EFB attachments invalidated before a copy whose clear rewrites them (see renderer.md).
+    std::uint64_t invalidations = 0;
     TextureCacheStats capture_cache;
     VertexCacheStats geometry_cache;
     GlesDirectStats direct;
@@ -127,6 +129,8 @@ public:
     // RGBA8 rows from the lower-left, for bounded development validation.
     std::vector<std::uint8_t> readback();
     GlesStats stats() const;
+    // A GL failure made the renderer unusable; draws rejected before submission do not.
+    bool failed() const;
     // Direct path: see GlesDirect::program_builder and build_programs_in_background. Owner
     // thread; starts the direct path, and so its program builder, if no draw has yet.
     GlesProgramBuilderStats program_builder();

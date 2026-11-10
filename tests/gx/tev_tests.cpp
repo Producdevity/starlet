@@ -253,12 +253,43 @@ void alpha_tests_and_errors() {
     p=blank();p.stages[0].color.operation=TevOperation::r8_eq;p.stages[0].color.scale=TevScale::two;
     require(!generate_tev_shader(p,model),"compare with arithmetic scaling rejected");
     Memory memory;Sink sink;Decoder d(memory,sink);
-    bp(d,0xf5,4);require(!capture_tev(d.state()),"Z texture explicit");bp(d,0xf5,0);
+    bp(d,0xf5,4);require(capture_tev(d.state()).status.message=="a Z texture needs a lookup in the last TEV stage","Z texture without its lookup");bp(d,0xf5,0);
     bp(d,0x00,1u<<16);require(bool(capture_tev(d.state())),"coordinate lookup is external to TEV arithmetic");
     bp(d,0x00,0);bp(d,0x10,0x200);require(bool(capture_tev(d.state())),"indirect lookup is external to TEV arithmetic");
     bp(d,0x10,0);bp(d,0x28,5u<<7);require(!capture_tev(d.state()),"bump raster explicit");
     bp(d,0x28,7u<<7);bp(d,0xc0,0x8fffe);bp(d,0xf6,8u<<4);require(!capture_tev(d.state()),"reserved active konst selector");
     bp(d,0xc0,0x8ffff);require(static_cast<bool>(capture_tev(d.state())),"unused reserved konst field is irrelevant");
+}
+
+void z_texture_stages() {
+    Memory memory;Sink sink;Decoder d(memory,sink);
+    bp(d,0x28,(1u<<6)|(7u<<7)); // Stage0 looks up map0/coord0 and reads no raster colour.
+    bp(d,0xf4,0x123456);
+    auto base=capture_tev(d.state());require(static_cast<bool>(base),"base capture");
+    require(base.material->uniforms.z_texture_bias==0 && !tev_stage_samples(base.material->pipeline,0),"inactive Z texture: no bias, no lookup");
+    std::vector<std::vector<std::uint8_t>> keys{generate_tev_shader(base.material->pipeline,model,false).key};
+    for(unsigned op=1;op<3;++op)for(unsigned type=0;type<3;++type) {
+        bp(d,0xf5,(op<<2)|type);
+        const auto c=capture_tev(d.state());require(static_cast<bool>(c),c.status.message.c_str());
+        const auto& p=c.material->pipeline;
+        require(p.z_texture_op==op && p.z_texture_type==type && c.material->uniforms.z_texture_bias==0x123456,"Z-texture op, type and bias");
+        require(tev_stage_samples(p,0) && !tev_input_use(p.stages[0]).texture,"the Z texel is the last stage's lookup");
+        const auto key=generate_tev_shader(p,model,false).key;
+        require(std::find(keys.begin(),keys.end(),key)==keys.end(),"op and type are shader identity");
+        keys.push_back(key);
+    }
+    bp(d,0xf5,2);
+    require(capture_tev(d.state()).material->pipeline.z_texture_type==0,"type of an inactive Z texture is ignored");
+    for(unsigned word:{12u,4u|3u,8u|16u}) {bp(d,0xf5,word);require(!capture_tev(d.state()),"reserved Z-texture state");}
+    bp(d,0xf5,10);bp(d,0xc0,0x8fff8); // Stage0 colour D reads the texture.
+    require(capture_tev(d.state()).status.message=="the Z texture occupies the last TEV stage's texture input","Z texel is no TEV input");
+    // Two stages: stage0 colours with its texture; the last stage's lookup is the Z texel.
+    bp(d,0x00,1u<<10);bp(d,0x28,(1u<<6)|(7u<<7)|(((1u<<6)|(7u<<7)|1u)<<12));bp(d,0xc2,0x8fff0);
+    auto two=capture_tev(d.state());require(static_cast<bool>(two),two.status.message.c_str());
+    require(tev_stage_samples(two.material->pipeline,0) && tev_stage_samples(two.material->pipeline,1) &&
+            !tev_stage_samples(two.material->pipeline,2),"TEV and Z lookups");
+    auto p=two.material->pipeline;p.z_texture_op=3;require(generate_tev_shader(p,model).status.error==TevError::invalid_pipeline,"invalid op");
+    p.z_texture_op=0;p.z_texture_type=2;require(!generate_tev_shader(p,model),"type without op");
 }
 
 struct ShaderCase { std::string name;TevPipeline pipeline;TevUniforms uniforms;TevInputs inputs; };
@@ -321,7 +352,7 @@ void generated_shader_contract() {
 }
 int main(int argc,char** argv) {
     try {
-        decode_capture_and_keys();konst_selector_decode();every_selector_and_swaps();arithmetic_candidate();comparisons_and_stage_order();alpha_tests_and_errors();generated_shader_contract();
+        decode_capture_and_keys();z_texture_stages();konst_selector_decode();every_selector_and_swaps();arithmetic_candidate();comparisons_and_stage_order();alpha_tests_and_errors();generated_shader_contract();
         if(argc==3 && std::string(argv[1])=="--emit-shaders")emit_cases(argv[2]);
         else require(argc==1,"usage: starlet_gx_tev_tests [--emit-shaders directory]");
         std::cout<<"GX TEV tests passed (fixed8_candidate_v1; original-GX precision unverified)\n";

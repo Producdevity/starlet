@@ -3,8 +3,8 @@
 The current domain is orthographic/perspective triangles, RGB8 fixed-function
 blending, and RGBA6 copy/blend/subtract arithmetic, with linear D24 depth.
 Capture validates owned vertex, transform, TEV, texture, raster and pixel
-snapshots at the same state revision. Unsupported texture-derived depth, fog,
-sampling and logic cases fail with an error.
+snapshots at the same state revision. Unsupported fog, sampling and logic cases
+fail with an error.
 
 The renderer's bounded vertex cache shares immutable geometry across captures.
 Hits compare current command and array bytes, including source encoding and
@@ -15,7 +15,9 @@ eviction, so cache payload and queued-packet retention have separate budgets.
 Lighting channels read vertex colors in the order the vertex supplies them: XF
 channel 0 takes CP color 1 when color 0 is absent, and channel 1 takes color 1
 only beside color 0. A channel with no vertex color reads white (Deep Dark's
-star select draws one), following Dolphin's default for this case.
+star select draws one), following Dolphin's default for this case. A texgen whose
+TEXn source is absent from the vertex reads (0, 0, 1, 1) (Pikmin 2's Day 1 draws
+one); hardware behaviour is unverified, and Dolphin is the reference.
 
 GX front faces are clockwise on screen. The SDK swaps its public cull-mode
 bits into BP hardware encoding; the renderer maps that encoding to GLES face
@@ -43,9 +45,16 @@ runtime exercises ARM fetch.
 Depth comparison and update masks map to the corresponding GLES state. Native
 viewport Z units convert to a normalized near/far range. Early Z uses a fragment-test qualifier, so alpha rejection preserves the configured depth-write
 ordering. The shader identity includes that ordering; depth-tested draws cannot
-use the full EFB replacement shortcut. Active Z-texture effects remain rejected
-when they could change comparisons or writes; read-only ALWAYS/NEVER tests do
-not depend on the incoming Z value.
+use the full EFB replacement shortcut.
+
+A Z texture (depth.md) captures the last TEV stage's lookup as the Z texel, even
+though no TEV input reads it, and tests depth late. With the depth test enabled
+the fragment program writes the Z-texture depth to `gl_FragDepth` after the alpha
+test, and GL compares and stores it with the GX function and update mask. Op,
+type and the depth-test enable are shader identity; the bias is the `uGxZBias`
+uniform (`TevUniforms::z_texture_bias`). JSystem's `JFWDisplay::clearEfb` draws
+this way: a C0-coloured screen quad whose 4x4 Z24X8 texture replaces Z with
+0xffffff under an ALWAYS test with writes.
 
 The GX manual sections9.9/9.10/12.2 define the ordering and disabled-write
 contracts. Mali validation covers all eight comparisons, depth-write masks,

@@ -290,6 +290,25 @@ VertexCache::VertexCache(VertexCacheLimits limits):impl_(std::make_unique<Impl>(
 VertexCache::~VertexCache() = default;
 VertexCacheStats VertexCache::stats() const { return impl_->stats; }
 
+unsigned latest_normal(const State& state, const Draw& draw, MemoryReader& memory, std::array<float, 9>& normal) {
+    const auto& layout = draw.layout;
+    if (layout.normal.mode == AttributeMode::none || !layout.stride || !draw.vertices.data) return 0;
+    ArrayReader arrays{state, memory, 64};
+    for (std::size_t i = draw.vertices.size / layout.stride; i-- > 0;) {
+        const auto* cursor = draw.vertices.data + i * layout.stride;
+        for (bool present : layout.matrix_indices) cursor += present ? 1 : 0;
+        if (indexed(layout.position) &&
+            index(layout.position, cursor) == (layout.position.mode == AttributeMode::index8 ? 255 : 65535)) continue;
+        cursor += layout.position.fifo_bytes;
+        std::array<float, 9> read{};
+        if (!numbers(arrays, layout.normal, 1, cursor, layout.byte_dequant, true, read.data())) return 0;
+        const unsigned count = layout.normal.components == 9 ? 9 : 3;
+        std::copy_n(read.begin(), count, normal.begin());
+        return count;
+    }
+    return 0;
+}
+
 VertexResult capture_vertices(const State& state, const Draw& draw, MemoryReader& memory, VertexLimits limits) {
     return capture_vertices(state,draw,memory,limits,nullptr);
 }

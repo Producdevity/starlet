@@ -104,10 +104,23 @@ void depth() {
     f.xf(0x101c,16777200);f.xf(0x101f,16777400);captured=f.capture();plan=plan_gles_raster(*captured.snapshot);
     check(bool(plan) && plan.plan.depth_range[1]==1.0f && plan.plan.depth_range[0]>0 && plan.plan.depth_range[0]<1e-4f,
           "a depth range within 1/256 of [0,1] is clamped");
-    Fixture texture;texture.bp(0xf5,10);texture.bp(0x40,15);captured=texture.capture();
-    check(bool(plan_gles_raster(*captured.snapshot)),"always-pass read-only depth is independent of Z texture");
-    texture.bp(0x40,7);captured=texture.capture();check(!plan_gles_raster(*captured.snapshot),"Z-texture comparison explicitly unsupported");
-    texture.bp(0x40,31);captured=texture.capture();check(!plan_gles_raster(*captured.snapshot),"Z-texture writes explicitly unsupported");
+    // Z textures: every op, type and bias plans with the configured depth state, tested late.
+    for (unsigned op = 1; op < 3; ++op) for (unsigned type = 0; type < 3; ++type) for (unsigned mode : {7u, 15u, 31u}) {
+        Fixture texture; texture.bp(0xf4, 0x123456); texture.bp(0xf5, (op << 2) | type); texture.bp(0x40, mode); texture.bp(0x43, 64);
+        captured = texture.capture();
+        check(captured.snapshot->z_texture == std::array<std::uint32_t, 2>{{0x123456, (op << 2) | type}}, "Z-texture words captured");
+        for (const auto& planned : {plan_gles_raster(*captured.snapshot), plan_gles_raster_fast(*captured.snapshot)}) {
+            check(bool(planned) && planned.plan.depth_test && planned.plan.depth_compare == ((mode >> 1) & 7) &&
+                  planned.plan.depth_write == bool(mode & 16), "Z texture keeps the depth comparison and update");
+            check(!planned.plan.early_depth, "a Z texture tests depth after texturing");
+        }
+    }
+    Fixture texture; texture.bp(0xf5, 2); texture.bp(0x40, 7); texture.bp(0x43, 64); captured = texture.capture();
+    check(plan_gles_raster(*captured.snapshot).plan.early_depth, "an inactive Z texture keeps early depth");
+    for (unsigned word : {12u, 4u | 3u, 8u | 16u}) {
+        texture.bp(0xf5, word); captured = texture.capture();
+        check(!plan_gles_raster(*captured.snapshot) && !plan_gles_raster_fast(*captured.snapshot), "reserved Z-texture state rejected");
+    }
 }
 void viewport_and_scissor() {
     Fixture f;
@@ -280,10 +293,35 @@ void guard_band() {
     check(bool(plan_gles_raster_fast(*c.snapshot, GuardBand::clip_to_viewport)), "fast planning clips the same way");
 }
 
+// Pikmin 2's pod collection movie: the 608x448 viewport moved up by 47.2 rows.
+void fractional_viewport() {
+    Fixture f;
+    const float viewport[] = {304, -224, 16777216, 646, 518.8f, 16777216};
+    for (unsigned i = 0; i < 6; ++i) f.xf(0x101a + i, viewport[i]);
+    f.bp(0x20, (342u << 12) | 342u); f.bp(0x21, ((342u + 607) << 12) | (342u + 399));
+    auto c = f.capture(); check(bool(c), "fractional viewport capture");
+    check(!plan_gles_raster(*c.snapshot) && !plan_gles_raster_fast(*c.snapshot), "a fractional viewport is refused by default");
+    auto p = plan_gles_raster(*c.snapshot, false, GuardBand::reject, FractionalViewport::round);
+    check(bool(p), "round plans the draw");
+    // Rows -47.2..400.8 become -47..401: GL rows 55..503 of the 456-row frame.
+    rect(p.plan.viewport, 0, 55, 608, 448); rect(p.plan.scissor, 0, 56, 608, 400);
+    p = plan_gles_raster_fast(*c.snapshot, GuardBand::reject, FractionalViewport::round);
+    check(bool(p), "fast planning rounds the same way"); rect(p.plan.viewport, 0, 55, 608, 448);
+    // Edges .25 and .5 past a pixel: the left edge stays, the right one moves out.
+    f.bp(0x21, ((342u + 199) << 12) | (342u + 399));
+    f.xf(0x101a, 100.125f); f.xf(0x101d, 442.375f); c = f.capture();
+    p = plan_gles_raster(*c.snapshot, false, GuardBand::reject, FractionalViewport::round);
+    check(bool(p), "quarter-pixel edges round"); rect(p.plan.viewport, 0, 55, 201, 448);
+    f.xf(0x101a, 0.2f); f.xf(0x101d, 442.1f); c = f.capture();
+    check(!plan_gles_raster(*c.snapshot, false, GuardBand::reject, FractionalViewport::round),
+          "a viewport rounding to no width stays refused");
+}
+
 int main() {
     try {
         frame_layouts();
         guard_band();
+        fractional_viewport();
         baseline(); culling(); depth(); viewport_and_scissor(); coverage_oracle(); preserved_state_and_gates(); fast_fog();
         fast_constant_alpha();
         std::cout << "GX raster tests passed: 128000 original-coordinate pixel membership checks\n";

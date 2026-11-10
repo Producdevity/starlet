@@ -213,6 +213,35 @@ void layout_revision_ignores_arrays() {
             sink.draws[2].layout.position.components == 3, "draws decode with the current VAT layout");
 }
 
+// A reader that keeps matrix arrays in host order converts them in copy_indexed_xf.
+void indexed_xf_reader_hook() {
+    struct HostMatrices final : MemoryReader {
+        Memory canonical;
+        std::uint8_t last_array = 0;
+        unsigned indexed = 0;
+        bool copy(std::uint32_t address, std::uint8_t* output, std::size_t size) override {
+            return canonical.copy(address, output, size);
+        }
+        bool copy_indexed_xf(std::uint8_t array, std::uint32_t address, std::uint8_t* output, std::size_t size) override {
+            ++indexed;
+            last_array = array;
+            if (!canonical.copy(address, output, size)) return false;
+            for (std::size_t i = 0; i + 4 <= size; i += 4) std::reverse(output + i, output + i + 4);
+            return true;
+        }
+    } memory;
+    Sink sink; Decoder d(memory, sink);
+    memory.canonical.regions[0x2000] = {0, 0, 0x80, 0x3f, 0, 0, 0, 0xc0};  // 1.0f, -2.0f stored little-endian
+    cp(d, 0xac, 0x2000); cp(d, 0xbc, 8);
+    const std::uint8_t indexed[] = {0x20, 0,0, 0x10,0x40};
+    ok(d.feed({indexed, sizeof(indexed)}));
+    require(memory.indexed == 1 && memory.last_array == 12, "indexed XF loads read through copy_indexed_xf with their array");
+    require(d.state().xf(0x40) == 0x3f800000 && d.state().xf(0x41) == 0xc0000000, "copy_indexed_xf returns canonical words");
+    const std::uint8_t vertex[] = {0x61, 0x12, 0x12, 0x34, 0x56};
+    ok(d.feed({vertex, sizeof(vertex)}));
+    require(memory.indexed == 1, "other reads do not use copy_indexed_xf");
+}
+
 void indexed_xf_and_bounds() {
     Memory memory; Sink sink; Decoder d(memory, sink);
     memory.regions[0x1000] = {0,0,0,0, 0,0,0,0, 0x3f,0x80,0,0, 0xc0,0,0,0};
@@ -558,13 +587,55 @@ void every_split_boundary() {
 }
 }
 
+void list_fast_path_matches_general_path() {
+    // The same commands applied by inject (always the general path) and from a display list
+    // (fast_command) leave identical state, revisions and BP callbacks.
+    struct Recorder final : Sink {
+        std::vector<std::pair<std::uint8_t, std::uint32_t>> writes;
+        bool bp_write(const State& s, std::uint8_t address, std::uint32_t value) override {
+            writes.push_back({address, value});
+            return Sink::bp_write(s, address, value);
+        }
+    };
+    std::vector<std::uint8_t> commands = {
+        0x61,0x28,0x00,0x00,0x4b, 0x61,0xe2,0x80,0x01,0x02, 0x61,0xe2,0x00,0x03,0x04, 0x61,0x28,0x00,0x00,0x4b,
+        0x00,0x00,0x00,
+        0x08,0x50,0x00,0x00,0x02,0x00, 0x08,0xa0,0x00,0x00,0x90,0x00,
+        0x10,0x00,0x02,0x00,0x00, 0x3f,0x80,0,0, 0,0,0,0, 0x41,0x20,0,0,
+        0x10,0x00,0x02,0x00,0x00, 0x3f,0x80,0,0, 0,0,0,0, 0x41,0x20,0,0,
+        0x10,0x00,0x00,0x05,0xf4, 0x3f,0x80,0,0,
+        0x61,0xe3,0x00,0x05,0x06, 0x61,0x30,0x12,0x34,0x56};
+    while (commands.size() % 32) commands.push_back(0);
+    Memory general_memory, list_memory;
+    list_memory.regions[0x8000] = commands;
+    Recorder general_sink, list_sink;
+    Decoder general(general_memory, general_sink), listed(list_memory, list_sink);
+    ok(general.inject({commands.data(), commands.size()}));
+    const std::uint8_t call[] = {0x40, 0,0,0x80,0, 0,0,0,static_cast<std::uint8_t>(commands.size())};
+    ok(listed.feed({call, sizeof call}));
+    const auto& a = general.state();
+    const auto& b = listed.state();
+    bool same = true;
+    for (unsigned r = 0; r < 256; ++r) same = same && a.bp(std::uint8_t(r)) == b.bp(std::uint8_t(r)) && a.cp(std::uint8_t(r)) == b.cp(std::uint8_t(r));
+    for (std::uint16_t x = 0; x < 0x1000; ++x) same = same && a.xf(x) == b.xf(x);
+    for (bool konst : {false, true}) for (std::uint8_t h = 0; h < 8; ++h) same = same && a.tev_register(konst, h) == b.tev_register(konst, h);
+    require(same, "a list's plain writes leave the state the general path leaves");
+    require(a.bp_revision() == b.bp_revision() && a.bp_state_revision() == b.bp_state_revision() && a.cp_revision() == b.cp_revision() &&
+            a.cp_layout_revision() == b.cp_layout_revision() && a.xf_memory_revision() == b.xf_memory_revision() &&
+            a.xf_register_revision() == b.xf_register_revision() &&
+            a.last_xf_memory_write().first == b.last_xf_memory_write().first && a.last_xf_memory_write().end == b.last_xf_memory_write().end,
+            "and the same revisions");
+    require(general_sink.writes == list_sink.writes, "and the same BP callbacks in order");
+    require(b.bp(0x30) == 0x123456 && b.tev_register(true, 2) == 0x000102 && b.tev_register(false, 2) == 0x000304, "the list was applied");
+}
+
 int main() {
     try {
-        bp_mask_and_order(); tev_register_banks(); texgen_fields(); layouts_and_streaming(); layout_revision_ignores_arrays(); indexed_xf_and_bounds();
+        bp_mask_and_order(); tev_register_banks(); texgen_fields(); layouts_and_streaming(); layout_revision_ignores_arrays(); indexed_xf_and_bounds(); indexed_xf_reader_hook();
         palettes_snapshot_and_reload(); lists_mutation_and_shared_state(); rejected_inputs_and_limits(); failed_memory_is_not_applied(); immutable_list_during_execution();
         callback_reentry_is_rejected(); processing_exceptions_latch(); merged_primitives(); every_split_boundary();
-        host_commands_and_filtered_bp(); tev_banks_in_fed_writes();
-        std::cout << "GX core: 17 test groups passed\n";
+        host_commands_and_filtered_bp(); tev_banks_in_fed_writes(); list_fast_path_matches_general_path();
+        std::cout << "GX core: 19 test groups passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "GX core failure: " << error.what() << '\n';
