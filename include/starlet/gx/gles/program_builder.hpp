@@ -23,16 +23,36 @@ struct GlesProgramBuilderStats {
     std::size_t listed = 0, to_build = 0, finished = 0, built = 0, rejected = 0, failed = 0, requested = 0;
 };
 
+// How requested programs are built once background() ends the start-up phase.
+struct GlesProgramBuilderPolicy {
+    // Workers that keep serving the renderer's requests (at most the start-up workers):
+    // more build at once, each beside the running game.
+    unsigned request_workers = 1;
+    // Request workers keep normal priority instead of dropping to nice 10.
+    bool normal_priority = false;
+    // The newest request first: what the game draws now before what it drew earlier.
+    bool newest_first = false;
+};
+// The request a worker takes next from the queue's front (oldest) or back (newest).
+template <typename Queue>
+typename Queue::value_type take_request(Queue& queue, bool newest_first) {
+    auto job = std::move(newest_first ? queue.back() : queue.front());
+    if (newest_first) queue.pop_back(); else queue.pop_front();
+    return job;
+}
+
 // Builds programs into a program cache on threads with their own EGL contexts sharing
 // the current one, so draws load binaries instead of compiling: first the fast programs
 // of program lists (see ProgramList) missing from the cache, then whatever the renderer
 // requests. Until background(), every worker builds at normal priority, for a start-up
 // phase in which nothing else runs: beside a running game, builds stall its GL thread
-// on Mali drivers. After it, one low-priority thread continues. Construct with the
-// renderer's context current; without EGL or a shareable context, running() is false.
+// on Mali drivers. After it, request_workers threads continue (see GlesProgramBuilderPolicy).
+// Construct with the renderer's context current; without EGL or a shareable context,
+// running() is false.
 class GlesProgramBuilder {
 public:
-    GlesProgramBuilder(GlesProgramCache&, std::vector<std::string> lists, FramebufferFetch, unsigned workers = 2);
+    GlesProgramBuilder(GlesProgramCache&, std::vector<std::string> lists, FramebufferFetch, unsigned workers = 2,
+                       GlesProgramBuilderPolicy policy = {});
     // Stops after the programs in progress.
     ~GlesProgramBuilder();
     GlesProgramBuilder(const GlesProgramBuilder&) = delete;
@@ -54,6 +74,7 @@ private:
     GlesProgramCache& cache_;
     std::vector<std::string> lists_;
     FramebufferFetch fetch_;
+    GlesProgramBuilderPolicy policy_;
     std::vector<std::unique_ptr<Context>> contexts_;
     mutable std::mutex mutex_;
     std::condition_variable wake_;

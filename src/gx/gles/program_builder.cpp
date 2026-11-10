@@ -101,8 +101,9 @@ void lower_priority() {
 }
 } // namespace
 
-GlesProgramBuilder::GlesProgramBuilder(GlesProgramCache& cache, std::vector<std::string> lists, FramebufferFetch fetch, unsigned workers)
-    : cache_(cache), lists_(std::move(lists)), fetch_(fetch), start_(std::chrono::steady_clock::now()) {
+GlesProgramBuilder::GlesProgramBuilder(GlesProgramCache& cache, std::vector<std::string> lists, FramebufferFetch fetch, unsigned workers,
+                                       GlesProgramBuilderPolicy policy)
+    : cache_(cache), lists_(std::move(lists)), fetch_(fetch), policy_(policy), start_(std::chrono::steady_clock::now()) {
     if (!cache_.enabled()) return;
     for (unsigned i = 0; i < std::max(workers, 1u); ++i) {
         auto context = std::make_unique<Context>();
@@ -170,8 +171,7 @@ bool GlesProgramBuilder::serve_request() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (requests_.empty()) return false;
-        job = std::move(requests_.front());
-        requests_.pop_front();
+        job = take_request(requests_, policy_.newest_first);
     }
     build(job.first, job.second, requested_);
     std::lock_guard<std::mutex> lock(mutex_);
@@ -238,8 +238,8 @@ void GlesProgramBuilder::work(unsigned index) {
     bool lowered = false;
     while (current && !stop_) {
         if (background_ && !lowered) {
-            if (index > 0) break;
-            lower_priority();
+            if (index >= std::max(policy_.request_workers, 1u)) break;
+            if (!policy_.normal_priority) lower_priority();
             lowered = true;
         }
         if (serve_request()) continue;
@@ -264,9 +264,9 @@ void GlesProgramBuilder::work(unsigned index) {
             std::fflush(stdout);
         }
     }
-    // Worker 0 stays for the renderer's requests.
-    if (index == 0 && current) {
-        if (!lowered) lower_priority();
+    // Request workers stay for the renderer's requests.
+    if (index < std::max(policy_.request_workers, 1u) && current) {
+        if (!lowered && !policy_.normal_priority) lower_priority();
         for (;;) {
             {
                 std::unique_lock<std::mutex> lock(mutex_);
@@ -275,7 +275,7 @@ void GlesProgramBuilder::work(unsigned index) {
             }
             while (!stop_ && serve_request()) {}
         }
-        if (requested_) {
+        if (index == 0 && requested_) {
             std::printf("Shaders built during play: %zu\n", requested_.load());
             std::fflush(stdout);
         }

@@ -119,6 +119,22 @@ never culled. A culled draw's program is still handed to the builder after its
 segment's draws, so a model entering the view at a screen edge has its program
 ready instead of staying missing while it builds.
 
+A draw whose program the builder has not delivered is skipped. Once its program
+has waited `GlesDirectLimits::unready_link_ms` (default 67) since its request, the
+GL thread links it itself: one frame lengthened by the link instead of a longer
+gap. The GL thread does that again only `unready_link_interval_ms` (default 500)
+after its previous such link ended, because a scene that needs many new programs
+at once would otherwise stall for all their links; those draws wait for the builder.
+On muos_35-h (H700, Mali-G31 r20) a GL-thread link takes 76–422 ms beside a busy
+game. Pikmin 2 from an empty cache without a program list, landing in Awakening
+Wood (200 s): 48,484 draws skipped without the GL-thread link, 33,054 with 67/500,
+28,085 with 50/250, and 10,805 with 50/250 plus `builder_policy.request_workers`
+2 at `normal_priority`; the longest frame stayed within 469–544 ms. Without the
+interval (50/0) only 996 were skipped, but the landing linked 43 programs back to
+back in one 5.5 s frame. Program lists remove these builds; this bounds what lists miss.
+`GlesDirectStats::program_waits`, `program_wait_max_ms`, `fallback_links` and
+`fallback_link_max_ms` report the waits and links.
+
 EFB texture copies stay GPU-resident: a shader writes the texels the copy's
 sample format decodes (`decode_texture_copy`); in fast shading, copies other
 than luminance and RGB5A3 are framebuffer blits whose target swizzle selects

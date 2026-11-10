@@ -434,6 +434,26 @@ void program_reuse_across_tev_colours() {
     f.bp(0xe2,0x010020);
     check(misses()==wide,"back in range reuses the first program");
 }
+// Unready programs: a draw waits for the builder only up to unready_link_ms, and request
+// workers take the oldest or the newest request.
+void unready_program_policy() {
+    using std::chrono::milliseconds;
+    check(!link_unready_program(false, milliseconds(1000), 50), "a program is requested before the GL thread links it");
+    check(!link_unready_program(true, milliseconds(49), 50), "draws wait while the builder has time left");
+    check(link_unready_program(true, milliseconds(50), 50), "after unready_link_ms the GL thread links the program");
+    check(!link_unready_program(true, milliseconds(100000), 0), "unready_link_ms 0 always waits for the builder");
+    check(!link_unready_program(true, milliseconds(80), 50, milliseconds(100), 250) &&
+          link_unready_program(true, milliseconds(80), 50, milliseconds(250), 250),
+          "the GL thread links again only unready_link_interval_ms after its last link");
+    std::deque<int> queue{1, 2, 3};
+    check(take_request(queue, false) == 1 && take_request(queue, true) == 3 && queue.size() == 1 && queue.front() == 2,
+          "requests are taken oldest or newest first");
+    GlesRenderer renderer; Fixture f;
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+    const auto stats = renderer.stats().direct;
+    check(stats.fallback_links == 0 && stats.program_waits[0] + stats.program_waits[4] == 0,
+          "programs linked without a builder never waited");
+}
 void rejected_program_skips_draws() {
     GlesRenderer renderer; Fixture f; const auto command=f.command();
     fake::links=GL_FALSE;
@@ -826,7 +846,9 @@ void host_thread_submission() {
         renderer->end_frame();
     }
     bool presented = false;
-    host.post([&] { renderer->present_into(0, 608, 448, 0, 0, 640, 480); presented = std::this_thread::get_id() == gl_thread; });
+    // Waited for: stop_submission waits only for submitted frame work, and present_into
+    // throws on the host thread once submission has stopped.
+    host.run([&] { renderer->present_into(0, 608, 448, 0, 0, 640, 480); presented = std::this_thread::get_id() == gl_thread; });
     rejects([&] { renderer->present_into(0, 640, 456, 0, 0, 640, 480); }, "present_into refuses the recording thread");
     renderer->stop_submission();
     host.run([] {});
@@ -1131,6 +1153,7 @@ int main() {
         display_copy_boundary(); repeated_presentation();
         direct_draw_path();
         rejected_program_skips_draws();
+        unready_program_policy();
         program_reuse_across_tev_colours();
         resident_copies(); stamped_resident_copies();
         z_texture_clear();

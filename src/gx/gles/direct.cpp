@@ -200,6 +200,7 @@ struct GlesDirect::Impl {
         // rejected it.
         bool requested = false, rejected = false;
         std::uint64_t unbuilt = 0;
+        std::chrono::steady_clock::time_point requested_at{};
         // Recording thread: the segment that last queued it for warm-up.
         std::uint64_t warmed = 0;
     };
@@ -336,6 +337,9 @@ struct GlesDirect::Impl {
     std::unique_ptr<GlesProgramBuilder> builder;
     std::unique_ptr<ProgramList> program_list; // GL thread.
     std::atomic<std::uint64_t> link_us{0}, unready_draws{0};
+    std::array<std::atomic<std::uint64_t>, 5> program_waits{};
+    std::atomic<std::uint64_t> program_wait_max_ms{0}, fallback_links{0}, fallback_link_max_ms{0};
+    std::chrono::steady_clock::time_point last_fallback{}; // GL thread: end of its last link of an unready program.
     std::uint64_t gl_segments = 0, rejected_programs = 0; // GL thread.
     std::unordered_multimap<std::uint64_t, Program*> program_index;
     std::vector<std::unique_ptr<Texture>> textures;
@@ -415,7 +419,7 @@ struct GlesDirect::Impl {
             program_cache = std::make_unique<GlesProgramCache>(limits.program_cache);
             gl_check("direct renderer initialization");
             if (limits.shading == DirectShading::fast && program_cache->enabled() && limits.background_programs)
-                builder = std::make_unique<GlesProgramBuilder>(*program_cache, limits.program_lists, fetch);
+                builder = std::make_unique<GlesProgramBuilder>(*program_cache, limits.program_lists, fetch, 2u, limits.builder_policy);
         }, true);
     }
     ~Impl() {
@@ -698,20 +702,51 @@ struct GlesDirect::Impl {
     bool ready(Program& p) {
         if (p.unbuilt == gl_segments || p.rejected) return false;
         const auto& v = p.plan->vertex; const auto& f = p.plan->fragment;
-        if (!builder || !builder->running() || program_cache->contains(v, f) || (p.requested && !builder->building(v, f))) {
-            try {
-                link_program(p);
-            } catch (const std::exception& e) {
-                // A driver that rejects one generated program costs that program's draws, not the game.
-                p.rejected = true;
-                if (++rejected_programs <= 8) std::fprintf(stderr, "Shader rejected by the driver, its draws are skipped: %s\n", e.what());
+        const auto now = std::chrono::steady_clock::now();
+        bool fallback = false;
+        if (builder && builder->running() && !program_cache->contains(v, f) && !(p.requested && !builder->building(v, f))) {
+            const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(now - p.requested_at);
+            const auto since_link = last_fallback == std::chrono::steady_clock::time_point{} ? std::chrono::milliseconds::max()
+                                  : std::chrono::duration_cast<std::chrono::milliseconds>(now - last_fallback);
+            if (!link_unready_program(p.requested, waited, limits.unready_link_ms, since_link, limits.unready_link_interval_ms)) {
+                if (!p.requested) { p.requested = true; p.requested_at = now; builder->request(v, f); }
+                p.unbuilt = gl_segments;
                 return false;
             }
-            return true;
+            fallback = true;
         }
-        if (!p.requested) { p.requested = true; builder->request(v, f); }
-        p.unbuilt = gl_segments;
-        return false;
+        try {
+            link_program(p);
+        } catch (const std::exception& e) {
+            // A driver that rejects one generated program costs that program's draws, not the game.
+            p.rejected = true;
+            if (++rejected_programs <= 8) std::fprintf(stderr, "Shader rejected by the driver, its draws are skipped: %s\n", e.what());
+            return false;
+        }
+        if (p.requested) note_wait(p, now, fallback);
+        if (fallback) last_fallback = std::chrono::steady_clock::now();
+        return true;
+    }
+    // A program its draws waited for is ready: how long they waited, and the GL thread's link
+    // when it linked the program itself.
+    void note_wait(const Program& p, std::chrono::steady_clock::time_point link_start, bool fallback) {
+        using std::chrono::duration_cast; using std::chrono::milliseconds;
+        const auto end = std::chrono::steady_clock::now();
+        const auto waited = std::uint64_t(duration_cast<milliseconds>(end - p.requested_at).count());
+        const std::uint64_t bounds[] = {33, 67, 133, 267};
+        unsigned bucket = 0;
+        while (bucket < 4 && waited > bounds[bucket]) ++bucket;
+        ++program_waits[bucket];
+        auto raise = [](std::atomic<std::uint64_t>& max, std::uint64_t value) {
+            for (auto old = max.load(); value > old && !max.compare_exchange_weak(old, value);) {}
+        };
+        raise(program_wait_max_ms, waited);
+        if (!fallback) return;
+        const auto link = std::uint64_t(duration_cast<milliseconds>(end - link_start).count());
+        raise(fallback_link_max_ms, link);
+        if (++fallback_links <= 16)
+            std::fprintf(stderr, "Shader linked on the GL thread after its draws waited %llu ms (link %llu ms)\n",
+                         (unsigned long long)(waited - link), (unsigned long long)link);
     }
     // Draws culled before the GPU still start their program's build, so geometry that moves into
     // view, such as a model entering at a screen edge, does not stay missing while it builds.
@@ -2017,6 +2052,12 @@ GlesProgramBuilderStats GlesDirect::program_builder() const {
     return impl_->builder ? impl_->builder->stats() : GlesProgramBuilderStats{};
 }
 
+bool link_unready_program(bool requested, std::chrono::milliseconds waited, unsigned link_ms, std::chrono::milliseconds since_link,
+                          unsigned interval_ms) {
+    return requested && link_ms && waited.count() >= std::chrono::milliseconds::rep(link_ms) &&
+           since_link.count() >= std::chrono::milliseconds::rep(interval_ms);
+}
+
 void GlesDirect::build_programs_in_background() {
     if (impl_->builder) impl_->builder->background();
 }
@@ -2028,6 +2069,10 @@ GlesDirectStats GlesDirect::stats() const {
     result.programs = impl_->programs.size();
     result.program_link_us = impl_->link_us.load();
     result.unready_draws = impl_->unready_draws.load();
+    for (unsigned i = 0; i < 5; ++i) result.program_waits[i] = impl_->program_waits[i].load();
+    result.program_wait_max_ms = impl_->program_wait_max_ms.load();
+    result.fallback_links = impl_->fallback_links.load();
+    result.fallback_link_max_ms = impl_->fallback_link_max_ms.load();
     if (impl_->program_cache) result.program_cache = impl_->program_cache->stats();
     return result;
 }

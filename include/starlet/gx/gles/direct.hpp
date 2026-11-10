@@ -5,6 +5,8 @@
 #include "starlet/gx/direct.hpp"
 #include "starlet/gx/texture_copy.hpp"
 
+#include <array>
+#include <chrono>
 #include <functional>
 #include <string>
 #include <vector>
@@ -42,6 +44,13 @@ struct GlesDirectLimits {
     // Fast shading with a cache: programs missing from it are built in the background while
     // their draws are skipped. Otherwise the GL thread compiles them before the draw.
     bool background_programs = true;
+    // A program its draws have waited for unready_link_ms since its request is linked by the
+    // GL thread itself: one frame as long as the link instead of a longer gap. 0 always waits.
+    // A scene that needs many new programs at once would stall for all their links (seconds
+    // on Mali), so the GL thread links again only unready_link_interval_ms after its last
+    // link ended; meanwhile those draws wait for the builder.
+    unsigned unready_link_ms = 67, unready_link_interval_ms = 500;
+    GlesProgramBuilderPolicy builder_policy;
     // For destination memory whose writes nobody reports, such as a recompiled game's RAM:
     // resident copies stamp up to 64 32-byte blocks spread over their destination (first
     // and last included) and are sampled or materialized only while every stamp is
@@ -78,12 +87,24 @@ struct GlesDirectStats {
     std::uint64_t program_link_us = 0;
     // Draws skipped while the program builder compiled their program.
     std::uint64_t unready_draws = 0;
+    // Programs whose draws were skipped, once ready, by how long they waited since the
+    // request: within 33, 67, 133 and 267 ms, and longer; the longest wait. Those the GL
+    // thread linked itself after unready_link_ms, and its longest such link.
+    std::array<std::uint64_t, 5> program_waits{};
+    std::uint64_t program_wait_max_ms = 0, fallback_links = 0, fallback_link_max_ms = 0;
     // Draws added as instances to the previous resident draw; see the instancing notes in direct.md.
     std::uint64_t instanced_draws = 0;
     // Texture resolutions (cache lookups, validation, decoding) the draws needed.
     std::uint64_t texture_lookups = 0;
     GlesProgramCacheStats program_cache;
 };
+
+// Whether the GL thread links a program the builder has not delivered yet: once its draws
+// have waited link_ms since the request, when link_ms is set, and no sooner than interval_ms
+// after its previous such link. Otherwise they are skipped.
+// since_link: time since the GL thread's last such link ended, against interval_ms.
+bool link_unready_program(bool requested, std::chrono::milliseconds waited, unsigned link_ms,
+                          std::chrono::milliseconds since_link = std::chrono::milliseconds::max(), unsigned interval_ms = 0);
 
 // Owner-thread direct draw path. Each draw is fully read from State and source
 // memory before returning, without GL calls: texture uploads, program links and
