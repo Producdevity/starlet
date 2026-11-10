@@ -39,7 +39,7 @@ primitive assembly, conversion/quantization and all rendering semantics.
 A future asynchronous renderer must own all referenced data,
 retain immutable palette blocks, and separately retire CPU and GPU resources.
 No packet queue, GL resource lifetime or rendering implementation is supplied.
-All BP writes reach the sink, which must reject operations it cannot
+Every applied BP write reaches the sink, which must reject operations it cannot
 implement. CP state, XF writes, four indexed XF arrays, VCD/VAT vertex sizing,
 TLUT loads and vertex-cache invalidation are decoded here. Unsupported opcodes,
 CP addresses, formats and out-of-range transfers fail with an error.
@@ -87,6 +87,31 @@ image register holds the extent's low ten bits in each dimension; any other regi
 value ignores the extent. Texture coordinates keep scaling against the register
 size, so they stay normalized to the whole texture. An extent change counts as a
 BP change.
+
+## Host commands
+
+A PC port's FIFO can carry the port's own commands: Aurora's opcode 0x50 names host
+pointers and stands for the register writes a console made. Set their opcodes in
+`Limits::host_opcodes`; `CommandSink::host_command` then receives each one at its first
+byte with the rest of the fed bytes, sets `consumed` to its size and may apply the
+commands it stands for with `Decoder::inject`. A host command must arrive whole in one
+feed: give the decoder a drained FIFO buffer in one `feed`, starting at a command
+boundary.
+
+`Limits::filtered_bp` names BP addresses whose stream writes pass through
+`CommandSink::filter_bp` before they apply. The sink may rewrite the value, drop the
+write, or run the operation itself and inject the writes it stands for. `Limits::dropped_bp`
+names addresses whose stream writes are ignored without a callback, for registers the host
+always supplies itself.
+
+Injected commands are hardware commands: they skip `host_opcodes` and `filter_bp`. A
+display list an injected `CALL_DL` runs decodes as stream commands, so a host can turn
+its own list call into a real one.
+
+`inject` applies whole commands at the current stream position, under the running
+feed's work limits. It works between feeds and from `host_command` and `filter_bp`;
+from any other callback, or while a partial command is buffered, it fails with
+`reentrant_call`.
 
 ## Sources
 

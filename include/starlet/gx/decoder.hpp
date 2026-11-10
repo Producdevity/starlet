@@ -2,6 +2,7 @@
 
 #include "starlet/gx/state.hpp"
 
+#include <bitset>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,14 @@ public:
     // Write generation of the registered source containing native bytes, such as a
     // draw's display-list payload; zero when unknown. See MemoryArrayView::generation.
     virtual std::uint64_t source_generation(const void*) { return 0; }
+    // A stable name for size native bytes a draw reads, with its write generation: the source
+    // they were copied from when the host copies display lists into its FIFO, otherwise the
+    // bytes themselves. Equal names and nonzero generations promise equal bytes.
+    struct SourceIdentity {
+        const void* key = nullptr;
+        std::uint64_t generation = 0;
+    };
+    virtual SourceIdentity source_identity(const void* bytes, std::size_t) { return {bytes, source_generation(bytes)}; }
     // Optional exact canonical span that stays valid across reader calls until the
     // matching end_borrow; an empty result takes no borrow.
     virtual ByteView begin_borrow(std::uint32_t, std::size_t) { return {}; }
@@ -72,6 +81,13 @@ public:
     virtual bool draw(const State& state, const Draw& command, MemoryReader& memory) = 0;
     virtual bool bp_write(const State& state, std::uint8_t address, std::uint32_t value) = 0;
     virtual bool invalidate_vertices() = 0;
+    // A command whose opcode is in Limits::host_opcodes, starting at input: sets consumed to
+    // its size, which must lie within input, and may apply the commands it stands for with
+    // Decoder::inject. False rejects the stream.
+    virtual bool host_command(const State&, ByteView, std::size_t&) { return false; }
+    // A stream BP write to an address in Limits::filtered_bp, before it applies: may rewrite
+    // value; false drops the write.
+    virtual bool filter_bp(const State&, std::uint8_t, std::uint32_t&) { return true; }
 };
 
 enum class Error {
@@ -95,6 +111,12 @@ struct Limits {
     // Hands back-to-back triangle primitives to the sink as one Draw (see Draw::runs).
     // Enable only for sinks that read runs.
     bool merge_primitives = false;
+    // Opcodes of a host's own commands, each handed whole to CommandSink::host_command.
+    std::bitset<256> host_opcodes;
+    // BP addresses whose stream writes pass through CommandSink::filter_bp first.
+    std::bitset<256> filtered_bp;
+    // BP addresses whose stream writes are ignored, as filter_bp dropping them would.
+    std::bitset<256> dropped_bp;
 };
 
 class Decoder {
@@ -118,6 +140,10 @@ public:
     Status write_u16(std::uint16_t value);
     Status write_u32(std::uint32_t value);
     Status write_f32(float value);
+    // Applies whole hardware commands at the current stream position: between feeds, or
+    // from host_command and filter_bp. They skip host_opcodes and filter_bp; a display list
+    // they call decodes as stream commands.
+    Status inject(ByteView bytes);
     // Host extension: see TextureExtent. Up to 8192 texels per side; {} clears it. Counts
     // as a BP change, as the image register it widens is one.
     void set_texture_extent(std::uint8_t map, TextureExtent extent);
@@ -128,6 +154,9 @@ private:
     Parse command(ByteView input, std::size_t& consumed, unsigned depth, Budget& budget);
     // command() for a complete BP write; false leaves anything else to command().
     bool bp_command(const std::uint8_t* input, std::size_t size, unsigned depth, Budget& budget, Parse& result);
+    Parse host_command(ByteView input, std::size_t& consumed, unsigned depth, Budget& budget);
+    // apply_bp for a write from the stream: filtered addresses go through the sink first.
+    bool stream_bp(std::uint32_t word);
     bool execute_list(std::uint32_t address, std::size_t size, unsigned depth, Budget& budget);
     bool charge_list(std::size_t size, unsigned depth, Budget& budget);
     bool parse_list(ByteView bytes, unsigned depth, Budget& budget);
@@ -148,6 +177,12 @@ private:
     std::vector<std::uint8_t> pending_;
     std::size_t pending_required_ = 0; // Lower bound on the buffered command size.
     bool feeding_ = false;
+    bool injecting_ = false;
+    bool host_callback_ = false; // Inside host_command or filter_bp, where inject may run.
+    // The feed loop applies NOP runs, these BP and CP writes and XF matrix-memory writes itself.
+    bool fast_nop_ = false, fast_xf_ = false;
+    std::bitset<256> plain_bp_, dropped_bp_, plain_cp_;
+    Budget* budget_ = nullptr; // The running feed's budget, which injected commands share.
 };
 
 } // namespace starlet::gx

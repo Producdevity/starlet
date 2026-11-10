@@ -40,6 +40,16 @@ Decoder::Decoder(MemoryReader& memory, CommandSink& sink, Limits limits, EfbLayo
         limits_.max_commands == 0 || limits_.max_display_list_depth > 64) {
         fail(Error::invalid_input, "invalid GX decoder limits");
     }
+    fast_nop_ = !limits_.host_opcodes.test(0x00);
+    fast_xf_ = !limits_.host_opcodes.test(0x10) && limits_.max_command_bytes >= 69;
+    for (unsigned a = 0; a < 256; ++a) {
+        // TLUT loads, texture-cache invalidation and the mask need apply_bp.
+        const bool special = a == 0x65 || a == 0x66 || a == 0xfe;
+        const bool stream = !limits_.host_opcodes.test(0x61);
+        plain_bp_[a] = stream && !limits_.filtered_bp.test(a) && !limits_.dropped_bp.test(a) && !special;
+        dropped_bp_[a] = stream && limits_.dropped_bp.test(a);
+        plain_cp_[a] = !limits_.host_opcodes.test(0x08) && supported_cp(static_cast<std::uint8_t>(a));
+    }
 }
 
 bool Decoder::fail(Error error, const char* message) {
@@ -146,6 +156,9 @@ bool Decoder::charge_list(std::size_t size, unsigned depth, Budget& budget) {
 
 bool Decoder::execute_list(std::uint32_t address, std::size_t size, unsigned depth, Budget& budget) {
     if (!charge_list(size, depth, budget)) return false;
+    // A list's commands are stream commands, also when an injected call runs it.
+    struct Stream { bool& injecting; bool was = injecting; ~Stream() { injecting = was; } } stream{injecting_};
+    injecting_ = false;
     // Canonical list memory is parsed in place, so draws name the source bytes.
     if (size) if (const auto borrowed = memory_.begin_borrow(address, size); borrowed.data) {
         struct End { MemoryReader& memory; ~End() { memory.end_borrow(); } } end{memory_};
@@ -184,8 +197,57 @@ bool Decoder::bp_command(const std::uint8_t* input, std::size_t size, unsigned d
         return true;
     }
     if (depth == 0) budget.bytes += 5;
-    result = apply_bp(be32(input + 1)) && status_ ? Parse::complete : Parse::failed;
+    result = stream_bp(be32(input + 1)) && status_ ? Parse::complete : Parse::failed;
     return true;
+}
+
+namespace {
+struct HostCallback {
+    bool& active;
+    bool was = active;
+    explicit HostCallback(bool& flag) : active(flag) { active = true; }
+    ~HostCallback() { active = was; }
+};
+} // namespace
+
+bool Decoder::stream_bp(std::uint32_t word) {
+    const auto address = static_cast<std::uint8_t>(word >> 24);
+    if (!injecting_ && limits_.dropped_bp.test(address)) return true;
+    if (!injecting_ && limits_.filtered_bp.test(address)) {
+        std::uint32_t value = word & 0xffffff;
+        bool keep;
+        {
+            const HostCallback callback{host_callback_};
+            keep = sink_.filter_bp(state_, address, value);
+        }
+        if (!keep) return status_.error == Error::none;
+        word = std::uint32_t{address} << 24 | (value & 0xffffff);
+    }
+    return apply_bp(word);
+}
+
+Decoder::Parse Decoder::host_command(ByteView input, std::size_t& consumed, unsigned depth, Budget& budget) {
+    consumed = 0;
+    bool handled;
+    {
+        const HostCallback callback{host_callback_};
+        handled = sink_.host_command(state_, input, consumed);
+    }
+    if (!handled) {
+        fail(Error::sink_rejected, "GX sink rejected a host command");
+        return Parse::failed;
+    }
+    if (!status_) return Parse::failed;
+    if (!consumed || consumed > input.size) {
+        fail(Error::truncated_command, "GX host command extends past its feed");
+        return Parse::failed;
+    }
+    if (++budget.commands > limits_.max_commands || (depth == 0 && consumed > limits_.max_expanded_bytes - budget.bytes)) {
+        fail(Error::work_limit, "GX command work limit exceeded");
+        return Parse::failed;
+    }
+    if (depth == 0) budget.bytes += consumed;
+    return Parse::complete;
 }
 
 void Decoder::set_texture_extent(std::uint8_t map, TextureExtent extent) {
@@ -213,6 +275,7 @@ Decoder::Parse Decoder::command(ByteView input, std::size_t& consumed, unsigned 
         return Parse::incomplete;
     }
     const auto opcode = input.data[0];
+    if (!injecting_ && limits_.host_opcodes.test(opcode)) return host_command(input, consumed, depth, budget);
     const VertexLayout* layout = nullptr;
     std::uint16_t vertex_count = 0;
     if (opcode == 0 || opcode == 0x48) {
@@ -371,7 +434,7 @@ Decoder::Parse Decoder::command(ByteView input, std::size_t& consumed, unsigned 
             }
         }
     } else if (opcode == 0x61) {
-        ok = apply_bp(be32(input.data + 1));
+        ok = stream_bp(be32(input.data + 1));
     } else if (opcode == 0x40) {
         ok = execute_list(be32(input.data + 1), be32(input.data + 5), depth + 1, budget);
     } else if (opcode == 0x48) {
@@ -440,14 +503,101 @@ Status Decoder::feed(ByteView bytes) try {
         return status_;
     }
     feeding_ = true;
-    struct Guard { bool& active; ~Guard() { active = false; } } guard{feeding_};
     Budget budget;
+    budget_ = &budget;
+    struct Guard { bool& active; Budget*& budget; ~Guard() { active = false; budget = nullptr; } } guard{feeding_, budget_};
     std::size_t offset = 0;
     while (offset < bytes.size || !pending_.empty()) {
         // A buffered command's size is fixed by bytes already received; parse once it can be complete.
         if (!pending_.empty() && pending_required_ > pending_.size() + (bytes.size - offset)) {
             pending_.insert(pending_.end(), bytes.data + offset, bytes.data + bytes.size);
             break;
+        }
+        // NOP runs, plain BP and CP writes and XF matrix-memory writes are most of a frame's
+        // commands; they apply here with the general path's effects. Anything else, or a
+        // limit, takes the general path.
+        if (pending_.empty()) {
+            const auto* p = bytes.data + offset;
+            const auto remaining = bytes.size - offset;
+            const bool room = budget.commands < limits_.max_commands && limits_.max_expanded_bytes - budget.bytes >= 6;
+            if (p[0] == 0x61 && room && remaining >= 5 && dropped_bp_[p[1]]) {
+                ++budget.commands;
+                budget.bytes += 5;
+                offset += 5;
+                continue;
+            }
+            if (p[0] == 0x61 && room && remaining >= 5 && plain_bp_[p[1]] && state_.bp_mask_ == 0xffffff) {
+                const auto address = p[1];
+                const auto value = std::uint32_t{p[2]} << 16 | std::uint32_t{p[3]} << 8 | p[4];
+                ++budget.commands;
+                budget.bytes += 5;
+                // TEV registers E0-E7 hold two banks: the selector bit picks color or konstant.
+                const bool tev = address >= 0xe0 && address <= 0xe7;
+                if (tev) state_.tev_registers_[(value >> 23) & 1][address - 0xe0] = value & 0x7fffff;
+                if (state_.bp_[address] != value) {
+                    state_.bp_[address] = value;
+                    ++state_.revision_;
+                    ++state_.bp_revision_;
+                    if (!tev || (value & 0x800000)) ++state_.bp_state_revision_;
+                }
+                if (!sink_.bp_write(state_, address, value)) {
+                    fail(Error::sink_rejected, "GX sink rejected BP operation");
+                    break;
+                }
+                if (!status_) break;
+                offset += 5;
+                continue;
+            }
+            if (p[0] == 0 && fast_nop_) {
+                std::size_t run = 1;
+                while (run < remaining && p[run] == 0) ++run;
+                run = std::min({run, limits_.max_commands - budget.commands, limits_.max_expanded_bytes - budget.bytes});
+                if (run) {
+                    budget.commands += run;
+                    budget.bytes += run;
+                    offset += run;
+                    continue;
+                }
+            }
+            if (p[0] == 0x10 && room && fast_xf_ && remaining >= 5 && p[1] == 0 && p[2] < 16) {
+                const std::size_t count = std::size_t{p[2]} + 1, size = 5 + count * 4;
+                const auto address = be16(p + 3);
+                if (remaining >= size && address + count <= 0x1000 && limits_.max_expanded_bytes - budget.bytes >= size) {
+                    auto* xf = state_.xf_.data() + address;
+                    bool changed = false;
+                    for (std::size_t i = 0; i < count; ++i) {
+                        const auto word = be32(p + 5 + i * 4);
+                        changed |= xf[i] != word;
+                        xf[i] = word;
+                    }
+                    ++budget.commands;
+                    budget.bytes += size;
+                    if (changed) {
+                        ++state_.revision_;
+                        ++state_.xf_memory_revision_;
+                        state_.last_xf_memory_write_ = {state_.xf_memory_revision_, address,
+                                                        static_cast<std::uint16_t>(address + count)};
+                        // Programs key on the GX_PTIDENTITY rows.
+                        if (address < 0x600 && address + count > 0x5f4) ++state_.xf_register_revision_;
+                    }
+                    offset += size;
+                    continue;
+                }
+            }
+            if (p[0] == 0x08 && room && remaining >= 6 && plain_cp_[p[1]]) {
+                const auto address = p[1];
+                const auto value = be32(p + 2);
+                ++budget.commands;
+                budget.bytes += 6;
+                if (state_.cp_[address] != value) {
+                    state_.cp_[address] = value;
+                    ++state_.revision_;
+                    ++state_.cp_revision_;
+                    if (address < 0xa0) ++state_.cp_layout_revision_;
+                }
+                offset += 6;
+                continue;
+            }
         }
         std::size_t consumed = 5;
         const bool buffered = !pending_.empty();
@@ -477,6 +627,44 @@ Status Decoder::feed(ByteView bytes) try {
             pending_.assign(bytes.data + offset, bytes.data + bytes.size);
             break;
         }
+    }
+    return status_;
+} catch (...) {
+    latch_exception();
+    throw;
+}
+
+Status Decoder::inject(ByteView bytes) try {
+    if (!status_) return status_;
+    if (feeding_ ? !host_callback_ : !pending_.empty()) {
+        fail(Error::reentrant_call, feeding_ ? "GX commands can be injected only from host_command and filter_bp"
+                                             : "GX commands cannot be injected inside a partial command");
+        return status_;
+    }
+    if (bytes.size && !bytes.data) {
+        fail(Error::invalid_input, "null GX command buffer");
+        return status_;
+    }
+    Budget local;
+    auto& budget = budget_ ? *budget_ : local;
+    struct Guard {
+        bool& feeding; bool& injecting; bool& callback; bool was_feeding, was_injecting, was_callback;
+        ~Guard() { feeding = was_feeding; injecting = was_injecting; callback = was_callback; }
+    } guard{feeding_, injecting_, host_callback_, feeding_, injecting_, host_callback_};
+    feeding_ = injecting_ = true;
+    host_callback_ = false;
+    std::size_t offset = 0;
+    while (offset < bytes.size) {
+        std::size_t consumed = 5;
+        Parse result;
+        if (!bp_command(bytes.data + offset, bytes.size - offset, 0, budget, result))
+            result = command({bytes.data + offset, bytes.size - offset}, consumed, 0, budget);
+        if (result == Parse::failed) break;
+        if (result == Parse::incomplete) {
+            fail(Error::truncated_command, "injected GX command is incomplete");
+            break;
+        }
+        offset += consumed;
     }
     return status_;
 } catch (...) {

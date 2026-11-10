@@ -212,7 +212,7 @@ struct GlesDirect::Impl {
         std::uint64_t segment = 0, inserted = 0;
         std::size_t bytes = 0;
         // Display-list payload identity: unchanged while its source reports no write.
-        const std::uint8_t* fifo_pointer = nullptr;
+        const void* fifo_pointer = nullptr; // The payload's source key (MemoryReader::source_identity).
         std::uint64_t fifo_generation = 0;
         // Object-space position bounds (min xyz, max xyz) of single-matrix geometry.
         bool boxed = false;
@@ -239,7 +239,8 @@ struct GlesDirect::Impl {
     std::vector<std::uint8_t> geometry_vertices;
     std::vector<std::uint32_t> geometry_indices;
     std::unordered_multimap<std::uint64_t, std::list<Geometry>::iterator> geometry_index;
-    std::unordered_multimap<const std::uint8_t*, std::list<Geometry>::iterator> geometry_pointers;
+    std::unordered_multimap<const void*, std::list<Geometry>::iterator> geometry_pointers;
+    MemoryReader::SourceIdentity source; // The current draw's payload source (find_geometry_by_pointer).
     std::vector<std::uint32_t> geometry_key;
     StreamArraySpans spans;
     // Resident geometry as drawn: copied at record time, since packing moves entries
@@ -834,10 +835,11 @@ struct GlesDirect::Impl {
     }
     // Same display-list payload as a cached entry without hashing or comparing it.
     Geometry* find_geometry_by_pointer(const Draw& draw, MemoryReader& memory) {
-        const auto range = geometry_pointers.equal_range(draw.vertices.data);
+        source = memory.source_identity(draw.vertices.data, draw.vertices.size);
+        if (!source.generation) return nullptr;
+        const auto range = geometry_pointers.equal_range(source.key);
         if (range.first == range.second) return nullptr;
-        const auto generation = memory.source_generation(draw.vertices.data);
-        if (!generation) return nullptr;
+        const auto generation = source.generation;
         for (auto it = range.first; it != range.second; ++it) {
             const auto entry = it->second;
             if (entry->fifo_generation != generation || entry->fifo.size() != draw.vertices.size || entry->key != geometry_key) continue;
@@ -872,9 +874,22 @@ struct GlesDirect::Impl {
             const auto entry = it->second;
             if (entry->key != geometry_key || entry->fifo.size() != draw.vertices.size ||
                 std::memcmp(entry->fifo.data(), draw.vertices.data, draw.vertices.size)) continue;
-            return validate_geometry(it, memory, hash);
+            const auto found = validate_geometry(it, memory, hash);
+            // The compared bytes now stand for the payload's source at its current generation.
+            if (found && source.generation) name_geometry(entry);
+            return found;
         }
         return nullptr;
+    }
+    void name_geometry(std::list<Geometry>::iterator g) {
+        if (g->fifo_pointer == source.key) { g->fifo_generation = source.generation; return; }
+        if (g->fifo_pointer) {
+            const auto range = geometry_pointers.equal_range(g->fifo_pointer);
+            for (auto at = range.first; at != range.second; ++at) if (at->second == g) { geometry_pointers.erase(at); break; }
+        }
+        g->fifo_pointer = source.key;
+        g->fifo_generation = source.generation;
+        geometry_pointers.emplace(source.key, g);
     }
     // Pending records may still name the entry, so its buffers retire after the segment.
     void erase_geometry(std::unordered_multimap<std::uint64_t, std::list<Geometry>::iterator>::iterator it) {
@@ -1025,8 +1040,8 @@ struct GlesDirect::Impl {
         Geometry g;
         g.hash = hash; g.key = geometry_key; g.format = format;
         g.fifo.assign(draw.vertices.data, draw.vertices.data + draw.vertices.size);
-        g.fifo_generation = memory.source_generation(draw.vertices.data);
-        if (g.fifo_generation) g.fifo_pointer = draw.vertices.data;
+        g.fifo_generation = source.generation;
+        if (g.fifo_generation) g.fifo_pointer = source.key;
         g.vertex_count = result.vertices; g.index_count = result.indices;
         for (unsigned a = 0; a < 12; ++a) {
             const auto& s = spans.arrays[a];

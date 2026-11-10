@@ -20,18 +20,21 @@ objects. Each entry's source bytes are content-hashed once per frame, or on
 every use with `verify_textures`, and after `invalidate` reports overlapping CPU
 writes.
 
-Converted indexed geometry stays resident on the GPU. It is reused only while
-the FIFO bytes match exactly and every consumed array span is unchanged: a span
-whose source reports no CPU write since conversion (the game's cache store or
-flush, reported through `MemoryArrayView::generation`) is accepted, and every entry is also compared byte
-for byte against a retained copy once every 64 frames. A span found changed
-without a reported write marks its array volatile, compared on every use from
-then on; identities whose sources keep changing are streamed instead. New
-entries get their own buffer; at a frame boundary, settled ones are packed into
-a fresh exact-size arena that shares one vertex array per stream format and is
-drawn by base vertex. Mali drivers pay per draw for every live buffer and vertex
-array object, and copy a whole buffer when submitted draws still use it, so no
-arena is written after its first draw.
+Converted indexed geometry stays resident on the GPU. It is reused only while the
+FIFO bytes match exactly and every consumed array span is unchanged. A draw's FIFO
+bytes match without reading them when `MemoryReader::source_identity` names the same
+source at the same write generation as the entry: a display list read in place, or
+one the host copied into its FIFO and named with the write stamp it had when copied.
+A span whose source reports no CPU write since conversion (the game's cache store or
+flush, reported through `MemoryArrayView::generation`) is accepted, and every entry
+is also compared byte for byte against a retained copy once every 64 frames. A span
+found changed without a reported write marks its array volatile, compared on every
+use from then on; identities whose sources keep changing are streamed instead. New
+entries get their own buffer; at a frame boundary, settled ones are packed into a
+fresh exact-size arena that shares one vertex array per stream format and is drawn
+by base vertex. Mali drivers pay per draw for every live buffer and vertex array
+object, and copy a whole buffer when submitted draws still use it, so no arena is
+written after its first draw.
 
 A merged draw (decoder.md) goes through the same path as one draw: one program,
 state plan and texture lookup, one conversion of all its runs, and one resident

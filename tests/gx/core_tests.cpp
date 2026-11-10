@@ -460,6 +460,92 @@ void merged_primitives() {
             "a merged draw latches the matrix index of its last vertex");
 }
 
+void host_commands_and_filtered_bp() {
+    // Opcode 0x50 carries a length byte and the commands it stands for; BP 0x12 writes are
+    // dropped, BP 0x13 writes gain bit 8 and also write BP 0x14.
+    struct HostSink final : Sink {
+        Decoder* decoder = nullptr;
+        unsigned hosts = 0;
+        bool host_command(const State&, ByteView input, std::size_t& consumed) override {
+            ++hosts;
+            if (input.size < 2) return false;
+            consumed = 2 + input.data[1];
+            return consumed > input.size || static_cast<bool>(decoder->inject({input.data + 2, input.data[1]}));
+        }
+        bool filter_bp(const State&, std::uint8_t address, std::uint32_t& value) override {
+            if (address == 0x12) return false;
+            value |= 0x100;
+            const std::uint8_t write[] = {0x61, 0x14, 0, 0, 9};
+            return static_cast<bool>(decoder->inject({write, sizeof write}));
+        }
+        bool invalidate_vertices() override {
+            require(decoder->inject({nullptr, 0}).error == Error::reentrant_call, "inject outside host callbacks is reentry");
+            return true;
+        }
+    };
+    Limits limits;
+    limits.host_opcodes.set(0x50);
+    limits.filtered_bp.set(0x12);
+    limits.filtered_bp.set(0x13);
+    limits.dropped_bp.set(0x17);
+    Memory memory;
+    {
+        HostSink sink; Decoder d(memory, sink, limits); sink.decoder = &d;
+        const std::uint8_t pre[] = {0x08,0x50,0,0,2,0, 0x08,0x70,0,0,0,0};
+        ok(d.inject({pre, sizeof pre}));
+        const std::vector<std::uint8_t> bytes = {0x61,0x12,0,0,5, 0x61,0x13,0,0,1, 0x61,0x17,0,0,8,
+            0x50,15, 0x61,0x12,0,0,7, 0x61,0x17,0,0,2, 0xb8,0,1,0xaa,0xbb, 0x61,0x15,0,0,3};
+        ok(d.feed({bytes.data(), bytes.size()}));
+        require(d.state().bp(0x12) == 7 && d.state().bp(0x13) == 0x101 && d.state().bp(0x14) == 9 && d.state().bp(0x15) == 3 &&
+                d.state().bp(0x17) == 2, "filtered writes drop or rewrite, dropped writes vanish; injected writes skip both");
+        require(sink.hosts == 1 && sink.draws.size() == 1 && sink.draws[0].vertices == std::vector<std::uint8_t>({0xaa,0xbb}),
+                "a host command applies the commands it injects in place");
+        const std::uint8_t invalidate[] = {0x48};
+        require(d.feed({invalidate, 1}).error == Error::reentrant_call, "draw-side callbacks cannot inject");
+    }
+    {
+        // A host list call injects a real CALL_DL; the list's own commands pass the filter and
+        // reach host_command again.
+        Memory lists;
+        lists.regions[0x8000] = {0x61,0x13,0,0,2, 0x50,5, 0x61,0x12,0,0,4, 0x61,0x16,0,0,6};
+        HostSink sink; Decoder d(lists, sink, limits); sink.decoder = &d;
+        const std::uint8_t bytes[] = {0x50, 9, 0x40,0,0,0x80,0,0,0,0,17};
+        ok(d.feed({bytes, sizeof bytes}));
+        require(sink.hosts == 2 && d.state().bp(0x13) == 0x102 && d.state().bp(0x14) == 9 && d.state().bp(0x12) == 4 &&
+                d.state().bp(0x16) == 6, "a list run by an injected call decodes as stream commands");
+    }
+    {
+        HostSink sink; Decoder d(memory, sink, limits); sink.decoder = &d;
+        const std::uint8_t bytes[] = {0x50, 9, 0x61};
+        require(d.feed({bytes, sizeof bytes}).error == Error::truncated_command, "a host command must fit its feed");
+    }
+    {
+        HostSink sink; Decoder d(memory, sink, limits); sink.decoder = &d;
+        const std::uint8_t bytes[] = {0x50};
+        require(d.feed({bytes, sizeof bytes}).error == Error::sink_rejected, "a refused host command stops the stream");
+    }
+    {
+        Sink sink; Decoder d(memory, sink);
+        const std::uint8_t partial[] = {0x61, 0x12}, write[] = {0x61, 0x13, 0, 0, 1};
+        ok(d.feed({partial, sizeof partial}));
+        require(d.inject({write, sizeof write}).error == Error::reentrant_call, "no injection inside a partial command");
+    }
+}
+
+void tev_banks_in_fed_writes() {
+    // Plain feed writes of E0-E7 keep both banks and leave the state revision alone for color values.
+    Memory memory; Sink sink; Decoder d(memory, sink);
+    const std::uint8_t konst[] = {0x61,0xe2,0x80,0x01,0x02};
+    ok(d.feed({konst, sizeof konst}));
+    const auto state_revision = d.state().bp_state_revision(), bp_revision = d.state().bp_revision();
+    const std::uint8_t color[] = {0x61,0xe2,0x00,0x03,0x04};
+    ok(d.feed({color, sizeof color}));
+    require(d.state().tev_register(1, 2) == 0x000102 && d.state().tev_register(0, 2) == 0x000304 && d.state().bp(0xe2) == 0x000304,
+            "fed TEV writes fill their bank");
+    require(d.state().bp_state_revision() == state_revision && d.state().bp_revision() == bp_revision + 1,
+            "a TEV color value changes registers but not program state");
+}
+
 void every_split_boundary() {
     const std::vector<std::uint8_t> bytes = {0x08,0x50,0,0,2,0, 0x08,0x70,0,0,0,0,
         0x10,0,1,0x10,0x40,0,0,0,2,0,0,0,4, 0x61,0x12,0x12,0x34,0x56, 0xb8,0,1,0xaa,0xbb, 0x48};
@@ -477,7 +563,8 @@ int main() {
         bp_mask_and_order(); tev_register_banks(); texgen_fields(); layouts_and_streaming(); layout_revision_ignores_arrays(); indexed_xf_and_bounds();
         palettes_snapshot_and_reload(); lists_mutation_and_shared_state(); rejected_inputs_and_limits(); failed_memory_is_not_applied(); immutable_list_during_execution();
         callback_reentry_is_rejected(); processing_exceptions_latch(); merged_primitives(); every_split_boundary();
-        std::cout << "GX core: 15 test groups passed\n";
+        host_commands_and_filtered_bp(); tev_banks_in_fed_writes();
+        std::cout << "GX core: 17 test groups passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "GX core failure: " << error.what() << '\n';
