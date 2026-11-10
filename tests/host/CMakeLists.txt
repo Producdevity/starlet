@@ -1,0 +1,30 @@
+find_package(Threads REQUIRED)
+function(starlet_host_test name)
+    add_executable(starlet_host_${name}_tests ${name}_tests.cpp)
+    target_include_directories(starlet_host_${name}_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/host")
+    target_include_directories(starlet_host_${name}_tests SYSTEM PRIVATE "${STARLET_SDL2_INCLUDE_DIR}")
+    target_link_libraries(starlet_host_${name}_tests PRIVATE starlet_host Threads::Threads ${CMAKE_DL_LIBS})
+endfunction()
+
+foreach(name audio pad quit)
+    starlet_host_test(${name})
+endforeach()
+
+add_test(NAME starlet_host_audio COMMAND starlet_host_audio_tests)
+add_test(NAME starlet_host_pad COMMAND starlet_host_pad_tests)
+add_test(NAME starlet_host_controllers COMMAND starlet_host_pad_tests controllers)
+set(starlet_host_tests starlet_host_audio starlet_host_pad starlet_host_controllers)
+foreach(mode sigterm sigint-after-sdl event exit watchdog)
+    add_test(NAME starlet_host_quit_${mode} COMMAND starlet_host_quit_tests ${mode})
+    list(APPEND starlet_host_tests starlet_host_quit_${mode})
+endforeach()
+
+# SDL runs headless: dummy audio and video drivers. Homebrew's SDL2 is sdl2-compat, which
+# loads SDL3 from its own directory.
+set(starlet_host_environment SDL_AUDIODRIVER=dummy SDL_VIDEODRIVER=dummy)
+if(APPLE)
+    get_filename_component(starlet_sdl2_library_dir "${STARLET_SDL2_LIBRARY}" DIRECTORY)
+    list(APPEND starlet_host_environment "DYLD_FALLBACK_LIBRARY_PATH=${starlet_sdl2_library_dir}")
+endif()
+set_tests_properties(${starlet_host_tests} PROPERTIES ENVIRONMENT "${starlet_host_environment}" TIMEOUT 60)
+set_tests_properties(starlet_host_controllers PROPERTIES SKIP_RETURN_CODE 77)

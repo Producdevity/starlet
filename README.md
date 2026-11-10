@@ -5,7 +5,7 @@ ports to Linux ARM handhelds: OpenGL ES 3.1 on Mali-class GPUs, the firmware's
 SDL2, and about 1 GB of RAM.
 
 It holds the GX graphics stack that the Super Mario Galaxy Linux ARM port runs on,
-and the disc handling its ports share:
+and the disc handling and SDL services its ports share:
 
 - `starlet::gx` (`starlet_gx`) decodes the GX command stream (BP, CP and XF
   registers, display lists, vertex arrays) and models GX vertex processing,
@@ -16,11 +16,15 @@ and the disc handling its ports share:
   and WIA and RVZ stored or with Zstandard), parses the FST and runs the
   first-launch setup that extracts a supported disc into a port's `gamedata/`.
   C++17, with the pinned Zstandard decoder in `third_party/zstd`.
+- `starlet::host` (`starlet_host`) plays audio through the firmware's SDL2, reads
+  its game controllers into a port's GameCube layout, and turns the frontend's
+  SIGTERM into a prompt exit with the saves flushed. C++17 and SDL2.
 
 A port feeds the command stream to a `Decoder` and gives it a `MemoryReader` for
 the memory the commands refer to; [src/gx/decoder.md](src/gx/decoder.md) describes
 that contract. [src/disc/disc.md](src/disc/disc.md) describes the disc formats,
-their limits and the setup flow.
+their limits and the setup flow; [src/host/host.md](src/host/host.md) the audio,
+controller and quit contracts.
 
 ## Layout
 
@@ -28,11 +32,14 @@ their limits and the setup flow.
 include/starlet/gx/       public headers
 include/starlet/gx/gles/  OpenGL ES renderer headers
 include/starlet/disc/     disc image, FST and setup headers
+include/starlet/host/     audio, controller and quit headers
 src/gx/                   GX model, with a note per module
 src/gx/gles/              OpenGL ES renderer
 src/disc/                 disc images and setup
+src/host/                 SDL audio, controllers and quit
 tests/gx/                 host tests
 tests/disc/               disc host tests
+tests/host/               audio, controller and quit tests
 third_party/zstd/         Zstandard v1.5.6 (submodule)
 ```
 
@@ -47,14 +54,16 @@ ctest --test-dir build
 
 The renderer builds when OpenGL ES 3.1 headers are found (`STARLET_GLES_INCLUDE_DIR`);
 its tests run against a recording GL fake. A device build sets `-DSTARLET_GLES=ON`,
-which also links the target's `libGLESv2`.
+which also links the target's `libGLESv2`. `starlet::host` builds when SDL2 is
+found (`STARLET_SDL2_INCLUDE_DIR`, `STARLET_SDL2_LIBRARY`); `-DSTARLET_HOST=OFF`
+leaves it out.
 
 ## Using Starlet in a port
 
 ```cmake
 set(STARLET_GLES ON)
 add_subdirectory(path/to/starlet)
-target_link_libraries(port PRIVATE starlet::gx_gles)
+target_link_libraries(port PRIVATE starlet::gx_gles starlet::host)
 target_link_libraries(port-setup PRIVATE starlet::disc)
 ```
 
@@ -63,6 +72,17 @@ without libzstd. A port's setup describes its supported discs in a
 `starlet::disc::Game` (title, game IDs, revisions, `main.dol` SHA-1s, optional
 manifests) and calls `install()`; port-specific outputs, such as assets carved
 from `main.dol`, go in the setup hook.
+
+`starlet::host` gives a port its SDL services:
+
+- `AudioOutput::open_pull` for an AI DMA model that the device's clock drives,
+  `open_push` and `write()` for one that produces on its own clock;
+- `Controllers` and `to_gamecube()` with the port's `GameCubeMapping` (face
+  layout, Z and trigger sources, threshold, stick dead zones) for PAD or the SI
+  model; a Wii port maps the `Gamepad` itself;
+- `install_quit_signals()`, `poll_events()`, `quit_requested()`, `on_quit()`,
+  `exit_now()` and `exit_after_quit()`: the port flushes its saves and exits
+  within 1 s of SIGTERM.
 
 An embedding project builds Starlet's tests only with `STARLET_TESTS` set.
 
