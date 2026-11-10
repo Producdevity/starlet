@@ -371,6 +371,16 @@ struct GlesDirect::Impl {
     std::uint8_t latch_components = 0;
     std::array<float, 9> latch{};
     std::uint64_t latch_revision = 0;
+    // Raw bytes captured since the last decode; only draws that read the latch convert them.
+    LatchedNormal pending_latch;
+    bool latch_pending = false;
+    void resolve_latch() {
+        if (!latch_pending) return;
+        latch_pending = false;
+        auto vectors = latch;
+        decode_normal(pending_latch, vectors);
+        if (vectors != latch) { latch = vectors; ++latch_revision; }
+    }
     struct { bool valid = false; std::uint64_t bp = 0, segment = 0, frame = 0; const Program* program = nullptr;
              std::array<GLuint, 8> textures{}, samplers{}; std::array<std::uint64_t, 8> palettes{}; } last_textures;
     // Palette contents a CI texture reads, as a generation; 0 for other formats.
@@ -1601,9 +1611,11 @@ struct GlesDirect::Impl {
     void draw(const State& state, const Draw& draw, MemoryReader& memory, TextureCmprModel cmpr) {
         // The XF receives every vertex, including those of draws culled or skipped below.
         if (draw.layout.normal.mode != AttributeMode::none) {
-            auto vectors = latch;
-            if (const auto count = latest_normal(state, draw, memory, vectors)) {
-                if (vectors != latch) { latch = vectors; ++latch_revision; }
+            LatchedNormal captured;
+            if (const auto count = capture_normal(state, draw, memory, captured)) {
+                // A narrower capture keeps the remaining components of an earlier wider one.
+                if (latch_pending && count < pending_latch.count) resolve_latch();
+                pending_latch = captured; latch_pending = true;
                 latch_components = std::max<std::uint8_t>(latch_components, static_cast<std::uint8_t>(count));
             }
         }
@@ -1644,6 +1656,7 @@ struct GlesDirect::Impl {
             for (unsigned a = 0; a < 256; ++a) planned_bp[a] = state.bp(static_cast<std::uint8_t>(a));
             ++stats.state_plans;
         }
+        if (p.plan->transform.latched_normal) resolve_latch();
         const std::uint64_t latch_used = p.plan->transform.latched_normal ? latch_revision + 1 : 0;
         const bool uniform_current = last_uniform.valid && last_uniform.memory == state.xf_memory_revision() &&
                                      last_uniform.registers == state.xf_register_revision() && last_uniform.segment == segment &&

@@ -105,4 +105,19 @@ VertexResult capture_vertices(const State&, const Draw&, MemoryReader&, VertexLi
 // the draw has no normal or its arrays cannot be read.
 unsigned latest_normal(const State&, const Draw&, MemoryReader&, std::array<float, 9>& normal);
 
+// latest_normal split in two so a renderer can defer the conversion. capture_normal copies the raw
+// bytes the XF would receive (inline bytes, or the array element read at this moment) with the
+// attribute format needed to decode them, and returns the component count (0: nothing captured,
+// `latch` untouched). decode_normal converts a capture to floats, writing only its first
+// `count` components; both together equal latest_normal.
+struct LatchedNormal {
+    Attribute attribute;
+    bool byte_dequant = false;
+    std::uint8_t count = 0;
+    std::array<std::uint8_t, 36> bytes{};
+    std::array<bool, 3> native{};
+};
+unsigned capture_normal(const State&, const Draw&, MemoryReader&, LatchedNormal& latch);
+void decode_normal(const LatchedNormal&, std::array<float, 9>& normal);
+
 } // namespace starlet::gx

@@ -290,23 +290,61 @@ VertexCache::VertexCache(VertexCacheLimits limits):impl_(std::make_unique<Impl>(
 VertexCache::~VertexCache() = default;
 VertexCacheStats VertexCache::stats() const { return impl_->stats; }
 
-unsigned latest_normal(const State& state, const Draw& draw, MemoryReader& memory, std::array<float, 9>& normal) {
+unsigned capture_normal(const State& state, const Draw& draw, MemoryReader& memory, LatchedNormal& latch) {
     const auto& layout = draw.layout;
     if (layout.normal.mode == AttributeMode::none || !layout.stride || !draw.vertices.data) return 0;
-    ArrayReader arrays{state, memory, 64};
     for (std::size_t i = draw.vertices.size / layout.stride; i-- > 0;) {
         const auto* cursor = draw.vertices.data + i * layout.stride;
         for (bool present : layout.matrix_indices) cursor += present ? 1 : 0;
         if (indexed(layout.position) &&
             index(layout.position, cursor) == (layout.position.mode == AttributeMode::index8 ? 255 : 65535)) continue;
         cursor += layout.position.fifo_bytes;
-        std::array<float, 9> read{};
-        if (!numbers(arrays, layout.normal, 1, cursor, layout.byte_dequant, true, read.data())) return 0;
-        const unsigned count = layout.normal.components == 9 ? 9 : 3;
-        std::copy_n(read.begin(), count, normal.begin());
-        return count;
+        const auto& a = layout.normal;
+        LatchedNormal read;
+        read.attribute = a;
+        read.byte_dequant = layout.byte_dequant;
+        if (indexed(a)) {
+            ArrayReader arrays{state, memory, 64};
+            const unsigned components = a.components / a.indices;
+            const auto bytes = components * numeric_size[a.format];
+            const auto unit = a.format == 4 ? 4u : a.format == 2 || a.format == 3 ? 2u : 0u;
+            for (unsigned v = 0; v < a.indices; ++v) {
+                const auto data = arrays.read(1, index(a, cursor), v * bytes, bytes, unit);
+                cursor += a.mode == AttributeMode::index8 ? 1 : 2;
+                if (!data.bytes) return 0;
+                std::memcpy(read.bytes.data() + v * bytes, data.bytes, bytes);
+                read.native[v] = data.native_endian;
+            }
+        } else {
+            std::memcpy(read.bytes.data(), cursor, a.components * numeric_size[a.format]);
+        }
+        read.count = a.components == 9 ? 9 : 3;
+        latch = read;
+        return read.count;
     }
     return 0;
+}
+
+void decode_normal(const LatchedNormal& latch, std::array<float, 9>& normal) {
+    const auto& a = latch.attribute;
+    std::array<float, 9> read{};
+    if (indexed(a)) {
+        const unsigned components = a.components / a.indices;
+        const auto bytes = components * numeric_size[a.format];
+        for (unsigned v = 0; v < a.indices; ++v)
+            numeric(latch.bytes.data() + v * bytes, a.format, components, a.fraction_bits, read.data() + v * components,
+                    latch.native[v]);
+    } else {
+        numeric(latch.bytes.data(), a.format, a.components, a.fraction_bits, read.data());
+    }
+    std::copy_n(read.begin(), latch.count, normal.begin());
+}
+
+unsigned latest_normal(const State& state, const Draw& draw, MemoryReader& memory, std::array<float, 9>& normal) {
+    LatchedNormal latch;
+    const unsigned count = capture_normal(state, draw, memory, latch);
+    if (count) decode_normal(latch, normal);
+    return count;
 }
 
 VertexResult capture_vertices(const State& state, const Draw& draw, MemoryReader& memory, VertexLimits limits) {

@@ -506,9 +506,91 @@ void matrix_latches() {
     require(threw && exception.decoder.status().error==Error::processing_exception && exception.decoder.state().matrix_index(0)==6,"throwing draw does not commit latch");
 }
 }
+// The renderer's eager and deferred latch drivers must agree draw for draw.
+struct LatchDriver {
+    bool lazy; std::array<float, 9> latch{}; unsigned components = 0; std::uint64_t revision = 0;
+    LatchedNormal pending; bool is_pending = false;
+    explicit LatchDriver(bool deferred) : lazy(deferred) {}
+    void resolve() {
+        if (!is_pending) return;
+        is_pending = false; auto v = latch; decode_normal(pending, v);
+        if (v != latch) { latch = v; ++revision; }
+    }
+    void draw(const State& state, const Draw& d, MemoryReader& memory) {
+        if (d.layout.normal.mode == AttributeMode::none) return;
+        if (!lazy) {
+            auto v = latch;
+            if (const auto count = latest_normal(state, d, memory, v)) {
+                if (v != latch) { latch = v; ++revision; }
+                components = std::max(components, count);
+            }
+            return;
+        }
+        LatchedNormal captured;
+        if (const auto count = capture_normal(state, d, memory, captured)) {
+            if (is_pending && count < pending.count) resolve();
+            pending = captured; is_pending = true; components = std::max(components, count);
+        }
+    }
+};
+void be_float(std::vector<std::uint8_t>& out, float value) {
+    std::uint32_t w; std::memcpy(&w, &value, 4);
+    for (int shift = 24; shift >= 0; shift -= 8) out.push_back(static_cast<std::uint8_t>(w >> shift));
+}
+void latched_normal_capture() {
+    Fixture f;
+    LatchDriver eager(false), lazy(true);
+    const auto run = [&](const std::vector<std::uint8_t>& bytes, unsigned count) {
+        Draw d; d.primitive = 0xb8; d.vertex_count = static_cast<std::uint16_t>(count);
+        std::string error; require(f.decoder.state().vertex_layout(0, d.layout, error), error.c_str());
+        d.vertices = {bytes.data(), bytes.size()};
+        eager.draw(f.decoder.state(), d, f.memory); lazy.draw(f.decoder.state(), d, f.memory);
+    };
+    const auto float_vertex = [](std::vector<std::uint8_t>& v, std::initializer_list<float> normal) {
+        for (float c : {0.f, 0.f, 0.f}) be_float(v, c);
+        for (float c : normal) be_float(v, c);
+    };
+    std::vector<std::uint8_t> v;
+    f.configure(1u << 9 | 1u << 11, 0, 1 | (4u << 1) | (4u << 10));
+    float_vertex(v, {1, 0, 0}); float_vertex(v, {0, 1, 0}); run(v, 2);
+    f.configure(1u << 9 | 1u << 11, 0, 1 | (4u << 1) | (1u << 9) | (4u << 10));
+    v.clear(); float_vertex(v, {1, 2, 3, 4, 5, 6, 7, 8, 9}); run(v, 1);
+    // Narrower after wider with no consumer between keeps the wider one's remaining components.
+    f.configure(2u << 9 | 1u << 11, 0, 1 | (4u << 1) | (4u << 10));
+    v = {0}; for (float c : {7.f, 8.f, 9.f}) be_float(v, c);
+    v.push_back(255); for (float c : {1.f, 1.f, 1.f}) be_float(v, c);
+    run(v, 2);
+    lazy.resolve();
+    require(lazy.latch == eager.latch && lazy.components == eager.components,
+            "a disabled last vertex and a narrower capture latch like the eager path");
+    require(lazy.latch[0] == 7 && lazy.latch[3] == 4 && lazy.components == 9, "disabled vertices do not latch");
+    // Indexed normals read their array when drawn, not when the latch is consumed.
+    f.configure(1u << 9 | 2u << 11, 0, 1 | (4u << 1) | (3u << 10));
+    f.array(1, 0x3000, 6, {0x20, 0, 0, 0, 0, 0, 0x10, 0, 0x20, 0, 0x30, 0});
+    v = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}; run(v, 1);
+    const auto old = eager.latch;
+    f.memory.regions[0x3000].assign(12, 0x7f);
+    lazy.resolve();
+    require(lazy.latch == eager.latch && lazy.latch != std::array<float, 9>{} && lazy.components == eager.components,
+            "indexed normals latch the bytes present at the draw");
+    std::array<float, 9> later = old; Draw d; d.primitive = 0xb8; d.vertex_count = 1;
+    std::string error; require(f.decoder.state().vertex_layout(0, d.layout, error), error.c_str());
+    d.vertices = {v.data(), v.size()};
+    require(latest_normal(f.decoder.state(), d, f.memory, later) == 3 && later != old,
+            "the array really changed after the capturing draw");
+    // Draws without normals and unreadable arrays leave the latch alone.
+    f.configure(1u << 9, 0, 1 | (4u << 1));
+    v.assign(12, 0); run(v, 1);
+    f.configure(1u << 9 | 2u << 11, 0, 1 | (4u << 1) | (3u << 10));
+    f.array(1, 0x9000, 6, {1, 2}); v.assign(13, 0); v.back() = 1; run(v, 1);
+    lazy.resolve();
+    require(lazy.latch == eager.latch && lazy.components == eager.components,
+            "draws without readable normals leave the latch");
+}
+
 int main() {
     try {
-        numeric_formats(); normals(); colors(); all_attributes_and_lifetime(); primitive_indices(); scoped_array_views(); verified_geometry_cache(); limits_and_failures(); matrix_latches();
+        numeric_formats(); normals(); colors(); all_attributes_and_lifetime(); primitive_indices(); scoped_array_views(); verified_geometry_cache(); limits_and_failures(); matrix_latches(); latched_normal_capture();
         std::cout << "GX vertex expansion and immutable geometry snapshots passed\n";
         return 0;
     } catch (const std::exception& error) {

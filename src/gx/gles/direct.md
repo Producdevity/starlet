@@ -22,8 +22,9 @@ writes.
 
 Draws without normals that light or generate coordinates from them read the
 normal, binormal and tangent the XF latched from the last vertex that carried
-them (`latest_normal`), as the hardware does; the latch travels in the transform
-uniform block and its presence is program identity.
+them, as the hardware does; every draw with normals captures the raw bytes of its
+last enabled vertex (`capture_normal`) and only a draw that reads the latch converts them
+(`decode_normal`). The latch travels in the transform uniform block and its presence is program identity.
 
 Converted indexed geometry stays resident on the GPU. It is reused only while the
 FIFO bytes match exactly and every consumed array span is unchanged. A draw's FIFO
