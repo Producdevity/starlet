@@ -196,9 +196,12 @@ void GlesProgramBuilder::plan() {
             try {
                 State state;
                 VertexLayout layout;
+                std::uint8_t latched = 0;
                 DirectProgramResult planned;
-                if (!direct_program_state(words, state, layout) ||
-                    !(planned = plan_direct_program(state, layout, fetch_, DirectShading::fast, batched, 0, instanced))) {
+                // Batched variants plan without the latch, as the renderer plans them.
+                if (!direct_program_state(words, state, layout, &latched) ||
+                    !(planned = plan_direct_program(state, layout, fetch_, DirectShading::fast, batched, batched ? 0 : latched,
+                                                    instanced))) {
                     ++rejected_;
                     continue;
                 }
@@ -245,9 +248,11 @@ void GlesProgramBuilder::work(unsigned index) {
         try {
             State state;
             VertexLayout layout;
+            std::uint8_t latched = 0;
             DirectProgramResult planned;
-            if (direct_program_state(todo_[at].words, state, layout) &&
-                (planned = plan_direct_program(state, layout, fetch_, DirectShading::fast, todo_[at].batched, 0, todo_[at].instanced)))
+            if (direct_program_state(todo_[at].words, state, layout, &latched) &&
+                (planned = plan_direct_program(state, layout, fetch_, DirectShading::fast, todo_[at].batched,
+                                               todo_[at].batched ? 0 : latched, todo_[at].instanced)))
                 build(planned.program->vertex, planned.program->fragment, built_);
         } catch (const std::exception&) {
             ++failed_;

@@ -102,11 +102,14 @@ std::uint32_t direct_program_register_word(const State& state, DirectShading sha
     return shading == DirectShading::fast ? wide_registers(state) : 0;
 }
 
-bool direct_program_state(const std::vector<std::uint32_t>& words, State& state, VertexLayout& layout) {
+bool direct_program_state(const std::vector<std::uint32_t>& words, State& state, VertexLayout& layout,
+                          std::uint8_t* latched_normal) {
     if (words.size() != 101) return false;
     const auto format = words[0];
     const auto normals = format & 15, colors = (format >> 4) & 15, fetch = (format >> 16) & 15;
-    if ((format >> 20) != 1 || normals == 2 || normals > 3 || colors > 3 || fetch > 2) return false;
+    const auto latched = (format >> 21) & 15;
+    if (((format >> 20) & 1) != 1 || (format >> 25) || normals == 2 || normals > 3 || colors > 3 || fetch > 2) return false;
+    if ((latched != 0 && latched != 3 && latched != 9) || (latched && normals) || (latched && !latched_normal)) return false;
     NoMemory memory;
     NoDraws sink;
     Decoder decoder(memory, sink);
@@ -153,8 +156,11 @@ bool direct_program_state(const std::vector<std::uint32_t>& words, State& state,
     for (unsigned i = 0; i < 2; ++i) if (colors & (1u << i)) layout.colors[i].mode = AttributeMode::direct;
     for (unsigned i = 0; i < 8; ++i) if (format & (0x100u << i)) layout.texcoords[i].mode = AttributeMode::direct;
     std::vector<std::uint32_t> rebuilt;
-    direct_program_words(state, layout, static_cast<FramebufferFetch>(fetch), DirectShading::fast, rebuilt);
-    return rebuilt == words;
+    direct_program_words(state, layout, static_cast<FramebufferFetch>(fetch), DirectShading::fast, rebuilt,
+                         static_cast<std::uint8_t>(latched));
+    if (rebuilt != words) return false;
+    if (latched_normal) *latched_normal = static_cast<std::uint8_t>(latched);
+    return true;
 }
 
 DirectProgramResult plan_direct_program(const State& state, const VertexLayout& layout, FramebufferFetch fetch, DirectShading shading,

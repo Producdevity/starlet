@@ -468,6 +468,26 @@ void fast_program_rebuild(Fixture& f, const char* name) {
         check(rebuilt && rebuilt.program->vertex == fast.program->vertex && rebuilt.program->fragment == fast.program->fragment, name);
     }
 }
+// A lit draw without normals lights with the latched normal; program lists record the latch
+// in the words, and a list entry must plan the same program the draw did.
+void latched_normal_program_rebuild() {
+    Fixture f; f.xf(0x1009, 1); f.xf(0x100e, (1u << 1) | (1u << 2) | (2u << 7));
+    const auto command = f.command();
+    const auto drawn = plan_direct_program(f.decoder.state(), command.layout, FramebufferFetch::none, DirectShading::fast, false, 3);
+    check(bool(drawn) && drawn.program->transform.latched_normal, "lit program with a latched normal plans");
+    std::vector<std::uint32_t> words;
+    direct_program_words(f.decoder.state(), command.layout, FramebufferFetch::none, DirectShading::fast, words, 3);
+    State state; VertexLayout layout; std::uint8_t latch = 0;
+    check(!direct_program_state(words, state, layout), "latched words are refused to a caller that cannot take the latch");
+    check(direct_program_state(words, state, layout, &latch) && latch == 3, "latched words rebuild with their latch");
+    const auto rebuilt = plan_direct_program(state, layout, FramebufferFetch::none, DirectShading::fast, false, latch);
+    check(rebuilt && drawn && rebuilt.program->vertex == drawn.program->vertex && rebuilt.program->fragment == drawn.program->fragment,
+          "latched words plan the drawn program");
+    for (std::uint32_t bad : {5u, 15u}) {
+        auto wrong = words; wrong[0] = (wrong[0] & ~(15u << 21)) | (bad << 21);
+        check(!direct_program_state(wrong, state, layout, &latch), "an impossible latch is refused");
+    }
+}
 void fast_program_rebuilds() {
     { Fixture f; fast_program_rebuild(f, "fast program rebuilds from its words"); }
     { Fixture f; f.bp(0xe2, 0x7ffu | (300u << 12)); fast_program_rebuild(f, "fast program with wide registers rebuilds"); }
@@ -493,6 +513,7 @@ void fast_program_rebuilds() {
     std::vector<std::uint32_t> words(101);
     State state; VertexLayout layout;
     check(!direct_program_state(words, state, layout), "words without the fast flag are refused");
+    latched_normal_program_rebuild();
 }
 int main(int argc, char** argv) {
     try {

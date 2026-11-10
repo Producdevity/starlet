@@ -30,8 +30,11 @@ std::uint32_t direct_program_register_word(const State&, DirectShading);
 inline constexpr std::uint32_t batched_program_word = 0xba7c4ed1u;
 inline constexpr std::uint32_t instanced_program_word = 0x1a57a2c1u;
 // Fast-shading words only: a State and layout whose words equal words, so the program
-// can be planned before a draw needs it. False for any other words.
-bool direct_program_state(const std::vector<std::uint32_t>& words, State&, VertexLayout&);
+// can be planned before a draw needs it. False for any other words. latched_normal
+// receives the latched-normal components the words record, for plan_direct_program;
+// words that record one are refused without it.
+bool direct_program_state(const std::vector<std::uint32_t>& words, State&, VertexLayout&,
+                          std::uint8_t* latched_normal = nullptr);
 
 struct DirectProgram {
     TransformPipeline transform;
