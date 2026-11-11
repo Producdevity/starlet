@@ -869,6 +869,10 @@ struct GlesDirect::Impl {
             stats.texture_hash_bytes += view.size;
             return hash_bytes(view.data, view.size);
         };
+        // The source bytes' write generation as the reader names them; zero when unknown.
+        auto generation_of = [&](const Texture& t) {
+            return t.pointer ? memory.source_identity(t.pointer, t.source_bytes).generation : 0;
+        };
         auto decode = [&](Texture& t) {
             const auto captured = capture_texture(state, static_cast<std::uint8_t>(map), memory, cmpr, {}, nullptr);
             if (!captured) throw std::runtime_error(captured.message);
@@ -877,7 +881,7 @@ struct GlesDirect::Impl {
         };
         if (entry) {
             if (limits.verify_textures || entry->validated != frame) {
-                const auto generation = entry->pointer ? memory.source_generation(entry->pointer) : 0;
+                const auto generation = generation_of(*entry);
                 const bool full = limits.verify_textures || !generation || entry->volatile_data || generation != entry->generation ||
                                   ((frame + (entry->key_hash & 15)) & 15) == 0;
                 if (full) {
@@ -887,7 +891,7 @@ struct GlesDirect::Impl {
                         if (generation && generation == entry->generation) entry->volatile_data = true;
                         decode(*entry);
                     }
-                    entry->generation = entry->pointer ? memory.source_generation(entry->pointer) : 0;
+                    entry->generation = generation_of(*entry);
                 }
                 entry->validated = frame;
             }
@@ -895,7 +899,7 @@ struct GlesDirect::Impl {
             auto created = std::make_unique<Texture>();
             created->key = key; created->key_hash = key_hash;
             decode(*created);
-            created->generation = created->pointer ? memory.source_generation(created->pointer) : 0;
+            created->generation = generation_of(*created);
             created->validated = frame;
             entry = created.get();
             textures.push_back(std::move(created));

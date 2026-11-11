@@ -468,6 +468,33 @@ void rejected_program_skips_draws() {
     renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
     check(fake::draws==before+1,"other programs still draw after a rejection");
 }
+// A reader that names texture sources with a write generation (MemoryReader::source_identity).
+struct GenerationMemory : test::Memory {
+    std::uint64_t generation = 1;
+    ByteView view(std::uint32_t address, std::size_t size) override {
+        if (address != 0x8000 || size > bytes.size()) return {};
+        return {bytes.data(), size};
+    }
+    SourceIdentity source_identity(const void* data, std::size_t) override { return {data, generation}; }
+};
+void texture_generations() {
+    GlesRenderer renderer; Fixture f; const auto command = f.command();
+    GenerationMemory memory; memory.bytes = f.memory.bytes;
+    renderer.draw_direct(f.decoder.state(), command, memory); renderer.wait_until_idle();
+    const auto validations = renderer.stats().direct.texture_validations;
+    for (int frame = 0; frame < 32; ++frame) {
+        renderer.present(640, 480);
+        renderer.draw_direct(f.decoder.state(), command, memory); renderer.wait_until_idle();
+    }
+    auto s = renderer.stats().direct;
+    check(s.texture_validations - validations == 2, "an unchanged source generation skips all but one in sixteen source hashes");
+    const auto mutations = s.texture_mutations;
+    std::fill(memory.bytes.begin(), memory.bytes.end(), 0x42); ++memory.generation;
+    renderer.present(640, 480);
+    renderer.draw_direct(f.decoder.state(), command, memory); renderer.wait_until_idle();
+    s = renderer.stats().direct;
+    check(s.texture_mutations == mutations + 1 && fake::draw_first == 0x42, "a new source generation hashes the source and sees the change");
+}
 void direct_draw_path() {
     GlesRenderer renderer; Fixture f; const auto command=f.command();
     const auto before=fake::draws;
@@ -1208,6 +1235,7 @@ int main() {
         snapshot_layout();
         full_resolution_snapshots();
         region_snapshots();
+        texture_generations();
         std::cout << "GLES dispatch boundary tests passed (not GPU rendering proof)\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';
