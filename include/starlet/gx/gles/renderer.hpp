@@ -29,8 +29,9 @@ struct GlesStats {
     std::size_t texture_bytes = 0;
     std::uint64_t display_copies = 0, texture_copies = 0, presentations = 0, format_conversions = 0, late_depth_snapshots = 0, blooms = 0;
     // EFB peeks, those against the live EFB or waiting for a snapshot (both wait for
-    // queued GL work), and snapshot requests refused for want of a slot.
-    std::uint64_t peeks = 0, live_peeks = 0, peek_waits = 0, refused_snapshots = 0;
+    // queued GL work), and snapshot requests refused for want of a slot. Region misses:
+    // peeks outside a snapshot's read-back region, read from the retained snapshot.
+    std::uint64_t peeks = 0, live_peeks = 0, peek_waits = 0, refused_snapshots = 0, region_misses = 0;
     // EFB attachments invalidated before a copy whose clear rewrites them (see renderer.md).
     std::uint64_t invalidations = 0;
     TextureCacheStats capture_cache;
@@ -71,6 +72,7 @@ public:
     // With the direct path active, draw-sync callbacks are deferred against snapshots
     // of the EFB's packed D24 depth and colour; otherwise snapshot_efb declines.
     int snapshot_efb() override;
+    int snapshot_efb(const EfbRegion&) override;
     bool snapshot_ready(int) const override;
     bool peek_depth_snapshot(int index, int x, int y, std::uint32_t& value) const override;
     bool peek_color_snapshot(int index, int x, int y, std::uint32_t& value) const override;

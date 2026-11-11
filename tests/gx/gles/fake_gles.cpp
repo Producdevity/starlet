@@ -20,6 +20,9 @@ GLenum error = GL_NO_ERROR;
 GLenum wait_result = GL_ALREADY_SIGNALED;
 // Mapped pack buffers hold byte i % 251 instead of zeros.
 bool map_pattern = false;
+// With map_pattern, a read into client memory gets the same pattern as a mapped pack
+// buffer of read_pattern_row texels per row read from (0, 0).
+int read_pattern_row = 0;
 GLuint next = 0, active = 0, bound[16]{}, samplers[16]{}, pack_buffer = 0, unpack_buffer = 0;
 std::map<GLuint, unsigned char> first;
 std::map<GLenum, GLint> pixel;
@@ -76,10 +79,10 @@ void glBindBuffer(GLenum target, GLuint buffer) {
         fake::unpack_buffer = buffer;
 }
 void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {}
-void* glMapBufferRange(GLenum, GLintptr, GLsizeiptr length, GLbitfield) {
+void* glMapBufferRange(GLenum, GLintptr offset, GLsizeiptr length, GLbitfield) {
     static std::vector<unsigned char> mapped;
     mapped.assign(length, 0);
-    if (fake::map_pattern) for (GLsizeiptr i = 0; i < length; ++i) mapped[i] = static_cast<unsigned char>(i % 251);
+    if (fake::map_pattern) for (GLsizeiptr i = 0; i < length; ++i) mapped[i] = static_cast<unsigned char>((offset + i) % 251);
     return mapped.data();
 }
 GLboolean glUnmapBuffer(GLenum) { return GL_TRUE; }
@@ -264,6 +267,12 @@ void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format
     fake::pack_seen = fake::pixel[GL_PACK_SKIP_ROWS];
     fake::pack_pbo_seen = fake::pack_buffer;
     fake::pack_required = transfer_bytes(width, height, true);
+    if (fake::map_pattern && fake::read_pattern_row && !fake::pack_buffer && pixels)
+        for (GLsizei row = 0; row < height; ++row)
+            for (GLsizei column = 0; column < width; ++column)
+                for (int k = 0; k < 4; ++k)
+                    static_cast<unsigned char*>(pixels)[(std::size_t(row) * width + column) * 4 + k] = static_cast<unsigned char>(
+                        ((std::size_t(y + row) * fake::read_pattern_row + std::size_t(x + column)) * 4 + k) % 251);
 }
 void glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height) {}
 void glSamplerParameteri(GLuint sampler, GLenum pname, GLint param) {}

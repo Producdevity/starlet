@@ -25,6 +25,7 @@ extern std::map<GLint,std::array<double,4>> uniform_values;
 extern GLenum error, wait_result;
 extern GLboolean links;
 extern bool map_pattern;
+extern int read_pattern_row;
 extern unsigned clears, uploads, draws, draw_first, sampler_seen, pack_seen, unpack_seen, pack_pbo_seen, unpack_pbo_seen;
 extern std::size_t pack_required, unpack_required;
 extern std::map<GLuint, GLuint> color_attachments;
@@ -919,6 +920,40 @@ void full_resolution_snapshots() {
     try { GlesRenderer invalid(bad); } catch (const std::invalid_argument&) { refused = true; }
     check(refused, "snapshot scales other than 1, 2 and 4 are refused");
 }
+void region_snapshots() {
+    GlesLimits limits; limits.direct.shading = DirectShading::fast; limits.direct.snapshot_scale = 1;
+    GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
+    renderer.draw_direct(f.decoder.state(), command, f.memory);
+    const EfbRegion region{100, 200, 16, 8};
+    const int index = renderer.snapshot_efb(region);
+    check(index >= 0 && fake::pack_required == ((455 - 200) * 1280 + 640 + 100 + 15) * 4 + 4,
+          "a region snapshot transfers only the region's rows and columns");
+    fake::map_pattern = true; fake::read_pattern_row = 1280;
+    // What a whole snapshot answers (full_resolution_snapshots): bottom-up rows of 640
+    // depth then 640 colour texels.
+    const auto whole = [](int x, int y) {
+        const auto at = std::uint32_t(((455 - y) * 1280 + 640 + x) * 4);
+        const auto byte = [&](std::uint32_t k) { return std::uint32_t((at + k) % 251); };
+        return byte(3) << 24 | byte(0) << 16 | byte(1) << 8 | byte(2);
+    };
+    renderer.select_snapshot(index);
+    const auto misses = renderer.stats().region_misses;
+    check(renderer.peek_color(3, 455) == whole(3, 455) && renderer.snapshot_ready(index),
+          "a first peek outside the region still collects the region's readback");
+    check(renderer.peek_color(107, 203) == whole(107, 203) && renderer.peek_color(115, 207) == whole(115, 207) &&
+          renderer.stats().region_misses == misses + 1,
+          "peeks inside the region read the readback, as a whole snapshot would");
+    std::uint32_t inside = 0, outside = 0;
+    check(renderer.peek_color_snapshot(index, 100, 200, inside) && inside == whole(100, 200),
+          "the any-thread peek answers inside the region");
+    check(!renderer.peek_color_snapshot(index, 116, 203, outside) && !renderer.peek_color_snapshot(index, 107, 208, outside),
+          "the any-thread peek declines outside the region");
+    check(renderer.peek_color(140, 230) == whole(140, 230) && renderer.peek_color(3, 455) == whole(3, 455) &&
+          renderer.peek_color(116, 199) == whole(116, 199) && renderer.stats().region_misses == misses + 4,
+          "a peek outside the region reads the retained snapshot exactly");
+    fake::map_pattern = false; fake::read_pattern_row = 0;
+    renderer.release_snapshots();
+}
 void host_bloom() {
     GlesLimits limits; limits.direct.shading = DirectShading::fast;
     GlesRenderer renderer(limits);
@@ -1172,6 +1207,7 @@ int main() {
         shared_depth_snapshots();
         snapshot_layout();
         full_resolution_snapshots();
+        region_snapshots();
         std::cout << "GLES dispatch boundary tests passed (not GPU rendering proof)\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

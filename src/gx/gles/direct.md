@@ -167,7 +167,10 @@ clears, copies, display copies and presentation in call order. EFB
 snapshots (quarter resolution under fast shading unless `snapshot_scale` sets
 another; callbacks that test single pixels need 1) are read back
 asynchronously there, so draw-sync peeks read CPU
-memory; live peeks and materialization wait for the queue.
+memory; live peeks and materialization wait for the queue. A snapshot taken
+with an `EfbRegion` retains the whole EFB on the GPU but reads back only that
+rectangle; a peek outside it waits for the readback and the queue, then reads
+the retained snapshot, so it stays exact (`GlesStats::region_misses`).
 
 These are recording-thread budgets (textures, programs, geometry) of GL objects,
 excluding driver allocations.

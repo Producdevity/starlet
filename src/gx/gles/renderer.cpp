@@ -344,6 +344,14 @@ struct GlesRenderer::Impl {
     static constexpr std::size_t snapshot_slots = 16;
     std::array<std::atomic<std::uint64_t>, snapshot_slots> snapshot_generation{}, snapshot_readable{};
     std::array<const std::uint8_t*, snapshot_slots> snapshot_pixels{};
+    // Each slot's read-back region (empty: all of it) and the byte range of its readback
+    // that is mapped; set by the recording thread before the slot's generation is published.
+    std::array<EfbRegion, snapshot_slots> snapshot_region{};
+    std::array<std::size_t, snapshot_slots> snapshot_mapped_from{}, snapshot_mapped_bytes{};
+    std::array<std::uint8_t, 4> region_miss_pixel{};
+    const std::uint8_t* snapshot_pixel(std::size_t index, int x, int y, bool color) const {
+        return snapshot_pixels[index] + snapshot_offset(x, y, color) - snapshot_mapped_from[index];
+    }
     struct PendingRead { std::size_t index; std::uint64_t generation; };
     std::vector<PendingRead> pending_reads;
     // GL thread: copies signalled snapshot readbacks; wait forces the one for index.
@@ -356,9 +364,9 @@ struct GlesRenderer::Impl {
                 if (forced) throw std::runtime_error("EFB snapshot readback did not retire within one second");
                 ++it; continue;
             }
-            const auto bytes = snapshot_bytes();
             glBindBuffer(GL_PIXEL_PACK_BUFFER, d.pack);
-            snapshot_pixels[it->index] = static_cast<const std::uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT));
+            snapshot_pixels[it->index] = static_cast<const std::uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER,
+                GLintptr(snapshot_mapped_from[it->index]), GLsizeiptr(snapshot_mapped_bytes[it->index]), GL_MAP_READ_BIT));
             glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
             if (!snapshot_pixels[it->index]) throw std::runtime_error("EFB snapshot readback map failed");
             glDeleteSync(d.ready); d.ready = nullptr;
@@ -1799,10 +1807,24 @@ void GlesRenderer::wait_until_idle() {
         }
     }, true);
 }
-int GlesRenderer::snapshot_efb() {
+int GlesRenderer::snapshot_efb() { return snapshot_efb(EfbRegion{}); }
+int GlesRenderer::snapshot_efb(const EfbRegion& requested) {
     auto& g = *impl_; g.require_ready();
     if (!g.direct) return -1;
-    if (g.last_snapshot >= 0 && g.last_snapshot_writes == g.efb_writes && g.snapshot_busy[std::size_t(g.last_snapshot)]) {
+    EfbRegion region;
+    if (!requested.empty()) {
+        region.x = std::clamp(requested.x, 0, g.efb_width);
+        region.y = std::clamp(requested.y, 0, g.efb_height);
+        region.width = std::clamp(requested.x + requested.width, 0, g.efb_width) - region.x;
+        region.height = std::clamp(requested.y + requested.height, 0, g.efb_height) - region.y;
+        if (region.empty()) region.width = region.height = 1;   // still a region: every peek reads the retained snapshot
+    }
+    const auto covers = [](const EfbRegion& held, const EfbRegion& wanted) {
+        return held.empty() || (!wanted.empty() && wanted.x >= held.x && wanted.y >= held.y &&
+                                wanted.x + wanted.width <= held.x + held.width && wanted.y + wanted.height <= held.y + held.height);
+    };
+    if (g.last_snapshot >= 0 && g.last_snapshot_writes == g.efb_writes && g.snapshot_busy[std::size_t(g.last_snapshot)] &&
+        covers(g.snapshot_region[std::size_t(g.last_snapshot)], region)) {
         ++g.snapshot_refs[std::size_t(g.last_snapshot)];
         return g.last_snapshot;
     }
@@ -1818,8 +1840,21 @@ int GlesRenderer::snapshot_efb() {
     g.snapshot_refs[index] = 1;
     g.last_snapshot = static_cast<int>(index);
     g.last_snapshot_writes = g.efb_writes;
+    // The readback covers whole rows of the packed texture between the region's first and
+    // last row; within them only the region's depth and colour columns are transferred.
+    const int scale = g.snapshot_scale(), columns = g.efb_width / scale, rows = g.efb_height / scale;
+    int row0 = 0, row_count = rows, column0 = 0, column_count = columns;
+    if (!region.empty()) {
+        row0 = (g.efb_height - region.y - region.height) / scale;
+        row_count = (g.efb_height - 1 - region.y) / scale - row0 + 1;
+        column0 = region.x / scale;
+        column_count = (region.x + region.width - 1) / scale - column0 + 1;
+    }
+    g.snapshot_region[index] = region;
+    g.snapshot_mapped_from[index] = std::size_t(row0) * 2 * std::size_t(columns) * 4;
+    g.snapshot_mapped_bytes[index] = std::size_t(row_count) * 2 * std::size_t(columns) * 4;
     const auto generation = g.snapshot_generation[index].fetch_add(1, std::memory_order_relaxed) + 1;
-    g.execute([&g, index, generation] {
+    g.execute([&g, index, generation, row0, row_count, column0, column_count] {
         try {
             if (index == g.snapshots.size()) {
                 Impl::Snapshot created;
@@ -1849,10 +1884,21 @@ int GlesRenderer::snapshot_efb() {
             }
             glBindBuffer(GL_PIXEL_PACK_BUFFER, snapshot.pack);
             if (g.snapshot_pixels[index]) { glUnmapBuffer(GL_PIXEL_PACK_BUFFER); g.snapshot_pixels[index] = nullptr; }
-            glPixelStorei(GL_PACK_ALIGNMENT, 1); glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-            glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+            const int columns = g.efb_width / scale;
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
             glBindFramebuffer(GL_READ_FRAMEBUFFER, snapshot.framebuffer);
-            glReadPixels(0, 0, 2 * (g.efb_width / scale), g.efb_height / scale, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            if (column_count == columns && row_count == g.efb_height / scale) {
+                glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+                glReadPixels(0, 0, 2 * columns, row_count, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            } else {
+                // Into the buffer at the same offsets as a whole readback: depth, then colour.
+                glPixelStorei(GL_PACK_ROW_LENGTH, 2 * columns); glPixelStorei(GL_PACK_SKIP_ROWS, row0);
+                for (int block = 0; block < 2; ++block) {
+                    glPixelStorei(GL_PACK_SKIP_PIXELS, block * columns + column0);
+                    glReadPixels(block * columns + column0, row0, column_count, row_count, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                }
+                glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+            }
             glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
             glBindFramebuffer(GL_READ_FRAMEBUFFER, g.framebuffer);
             snapshot.ready = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -1870,14 +1916,18 @@ std::uint32_t argb(const std::uint8_t* p) { return (std::uint32_t(p[3]) << 24) |
 } // namespace
 bool GlesRenderer::peek_depth_snapshot(int index, int x, int y, std::uint32_t& value) const {
     const auto& g = *impl_;
-    if (x < 0 || x >= g.efb_width || y < 0 || y >= g.efb_height || !g.snapshot_ready(index)) return false;
-    value = packed_depth(g.snapshot_pixels[std::size_t(index)] + g.snapshot_offset(x, y, false));
+    if (x < 0 || x >= g.efb_width || y < 0 || y >= g.efb_height || !g.snapshot_ready(index) ||
+        !g.snapshot_region[std::size_t(index)].contains(x, y))
+        return false;
+    value = packed_depth(g.snapshot_pixel(std::size_t(index), x, y, false));
     return true;
 }
 bool GlesRenderer::peek_color_snapshot(int index, int x, int y, std::uint32_t& value) const {
     const auto& g = *impl_;
-    if (x < 0 || x >= g.efb_width || y < 0 || y >= g.efb_height || !g.snapshot_ready(index)) return false;
-    value = argb(g.snapshot_pixels[std::size_t(index)] + g.snapshot_offset(x, y, true));
+    if (x < 0 || x >= g.efb_width || y < 0 || y >= g.efb_height || !g.snapshot_ready(index) ||
+        !g.snapshot_region[std::size_t(index)].contains(x, y))
+        return false;
+    value = argb(g.snapshot_pixel(std::size_t(index), x, y, true));
     return true;
 }
 void GlesRenderer::select_snapshot(int index) {
@@ -1979,7 +2029,24 @@ const std::uint8_t* GlesRenderer::Impl::peek_snapshot(int x, int y, bool color) 
     if (snapshot < 0) return nullptr;
     if (!snapshot_ready(snapshot) && ++stats.peek_waits)
         execute([&] { try { collect_snapshots(snapshot); } catch (...) { failed = true; throw; } }, true);
-    return snapshot_pixels[std::size_t(snapshot)] + snapshot_offset(x, y, color);
+    if (!snapshot_region[std::size_t(snapshot)].contains(x, y)) {
+        // Outside the read-back region: the retained snapshot itself, after queued GL work.
+        ++stats.region_misses;
+        execute([&] {
+            try {
+                const int scale = snapshot_scale();
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, snapshots[std::size_t(snapshot)].framebuffer);
+                glReadPixels((color ? efb_width / scale : 0) + x / scale, (efb_height - 1 - y) / scale, 1, 1, GL_RGBA,
+                             GL_UNSIGNED_BYTE, region_miss_pixel.data());
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+                gl_check("EFB snapshot region miss");
+            } catch (...) { failed = true; throw; }
+        }, true);
+        return region_miss_pixel.data();
+    }
+    return snapshot_pixel(std::size_t(snapshot), x, y, color);
 }
 std::uint32_t GlesRenderer::peek_depth(int x, int y) {
     auto& g=*impl_;g.check_owner();
