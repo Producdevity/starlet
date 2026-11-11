@@ -26,6 +26,7 @@ extern GLenum error, wait_result;
 extern GLboolean links;
 extern bool map_pattern;
 extern int read_pattern_row;
+extern unsigned blits;
 extern unsigned clears, uploads, draws, draw_first, sampler_seen, pack_seen, unpack_seen, pack_pbo_seen, unpack_pbo_seen;
 extern std::size_t pack_required, unpack_required;
 extern std::map<GLuint, GLuint> color_attachments;
@@ -547,6 +548,36 @@ void direct_draw_path() {
     verified.draw_direct(g.decoder.state(),other,g.memory); verified.wait_until_idle();
     check(verified.stats().direct.texture_mutations==1 && verified.stats().direct.submissions==2 && fake::draw_first==0x17,
           "verification hashes every use and splits submissions on new content");
+}
+// The RGB XFB presentation shader's mapping (renderer.cpp) against a nearest blit's, rows
+// flipped: destination pixel centres mapped to source coordinates, floored, over the extents ports use.
+void present_mapping() {
+    for (const auto& [source, destination] : std::vector<std::pair<int, int>>{{448, 480}, {456, 480}, {480, 480}, {640, 640},
+                                                                            {640, 720}, {456, 720}, {608, 640}, {448, 1080}}) {
+        for (int p = 0; p < destination; ++p) {
+            const int flipped = destination - 1 - p;
+            const int shader = (flipped * 2 + 1) * source / (destination * 2);
+            // Blit: destination rows from destination down to 0 take source rows 0 up to source.
+            const double blit = (double(destination) - (p + 0.5)) * source / destination;
+            check(shader == int(std::floor(blit)), "presentation samples the texel a nearest blit samples");
+        }
+    }
+}
+void no_blits_on_the_frame_path() {
+    GlesLimits limits; limits.direct.shading = DirectShading::fast;
+    GlesRenderer renderer(limits); Fixture f; f.memory.bytes.resize(64, 0xa5);
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+    const auto blits = fake::blits, draws = fake::draws;
+    TextureCopy p; p.width = 16; p.height = 8; p.format = 4; p.half_scale = true; p.stride = 64;
+    alignas(32) std::array<std::uint8_t, 256> bytes{};
+    renderer.copy_texture_resident(p, bytes.data(), bytes.size(), 0x8000);
+    renderer.wait_until_idle();
+    check(fake::blits == blits && fake::draws > draws, "half-scale copies box-filter in the copy shader, not a blit");
+    DisplayCopy copy; copy.width = 16; copy.height = 16; copy.stride = 64; copy.filter = {{0, 64, 0}};
+    alignas(32) std::array<std::uint8_t, 1024> xfb{};
+    renderer.copy_display(copy, xfb.data(), xfb.size());
+    renderer.present_framebuffer({{xfb.data(), xfb.size()}, 16, 16, 64}, 640, 480);
+    check(fake::blits == blits && renderer.stats().presentations == 1, "resident RGB XFBs present with a draw");
 }
 void resident_copies() {
     GlesRenderer renderer; Fixture f; f.memory.bytes.resize(64,0xa5);
@@ -1236,6 +1267,7 @@ int main() {
         full_resolution_snapshots();
         region_snapshots();
         texture_generations();
+        present_mapping(); no_blits_on_the_frame_path();
         std::cout << "GLES dispatch boundary tests passed (not GPU rendering proof)\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

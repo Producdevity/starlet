@@ -890,7 +890,9 @@ uniform ivec4 uDestination;
 layout(location=0) out vec4 color;
 void main(){
  ivec2 p=ivec2(gl_FragCoord.xy)-uDestination.xy;
- ivec2 source=(p*2+1)*uSource.xy/(uDestination.zw*2);source.y=uSource.y-1-source.y;
+ // A nearest blit's mapping, rows flipped: the window's top row shows source row 0.
+ p.y=uDestination.w-1-p.y;
+ ivec2 source=(p*2+1)*uSource.xy/(uDestination.zw*2);
  color=vec4(texelFetch(uImage,source,0).rgb,1.0);
 })GLSL";
         // A symmetric three-tap vertical filter (a,64-2a,a) over full-height copies is two
@@ -921,8 +923,10 @@ void main(){
     // Fast shading copies colour formats without the 4/5/6-bit channel quantization
     // and box-filters half-scale copies with one bilinear lookup.
     bool fast_copy(const TextureCopy& p) const {
-        return limits.direct.shading == DirectShading::fast && !p.depth && !p.filtered() && (p.format == 1 || p.format == 4 || p.format == 6 ||
-                                                                             (p.format >= 7 && p.format <= 10));
+        // Half-scale copies box-filter in the copy shader with GX's integer rounding; a linear
+        // blit rounds as the driver chooses, and on Mesa every blit flushes all queued work.
+        return limits.direct.shading == DirectShading::fast && !p.depth && !p.filtered() && (!p.half_scale || p.strip) &&
+               (p.format == 1 || p.format == 4 || p.format == 6 || (p.format >= 7 && p.format <= 10));
     }
     GLuint copy_sampler(bool linear) {
         if (!copy_samplers[0]) {
@@ -1727,24 +1731,6 @@ void GlesRenderer::Impl::present_gl(const FramebufferView& f, int width, int hei
               left = (width - w) / 2, bottom = (height - h) / 2;
     try {
         g.fullscreen_state();
-        if (!black && g.rgb_xfb()) {
-            // Resident RGB XFBs present as a nearest blit, rows flipped to the window's order.
-            const auto xfb = std::find_if(g.xfbs.begin(), g.xfbs.end(), [&](const auto& x) {
-                return x.data == f.bytes.data && x.width == int(f.width) && x.height == int(f.height);
-            });
-            if (xfb != g.xfbs.end()) {
-                glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                if (w != width || h != height) { glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT); }
-                glBindFramebuffer(GL_READ_FRAMEBUFFER, xfb->framebuffer);
-                glBlitFramebuffer(0, 0, xfb->width, xfb->height, left, bottom + h, left + w, bottom, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-                g.bound_frames();
-                gl_check("native VI RGB presentation");
-                ++g.stats.presentations;
-                if (g.swap) g.swap();
-                return;
-            }
-        }
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);

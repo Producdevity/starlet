@@ -23,6 +23,7 @@ bool map_pattern = false;
 // With map_pattern, a read into client memory gets the same pattern as a mapped pack
 // buffer of read_pattern_row texels per row read from (0, 0).
 int read_pattern_row = 0;
+unsigned blits = 0;
 GLuint next = 0, active = 0, bound[16]{}, samplers[16]{}, pack_buffer = 0, unpack_buffer = 0;
 std::map<GLuint, unsigned char> first;
 std::map<GLenum, GLint> pixel;
@@ -108,7 +109,7 @@ void glCullFace(GLenum) {}
 void glBlendFuncSeparate(GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha) {}
 void glBlendFunc(GLenum sfactor, GLenum dfactor) {}
 void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1,
-                       GLint dstY1, GLbitfield mask, GLenum filter) {}
+                       GLint dstY1, GLbitfield mask, GLenum filter) { ++fake::blits; }
 void glBufferSubData(GLenum, GLintptr, GLsizeiptr, const void*) {}
 void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
     if(data && target==GL_ARRAY_BUFFER) fake::submitted_vertices.assign(static_cast<const unsigned char*>(data),static_cast<const unsigned char*>(data)+size);
