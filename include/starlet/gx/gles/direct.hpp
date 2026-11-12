@@ -91,6 +91,9 @@ struct GlesDirectStats {
     std::uint64_t resident_copies = 0, resident_hits = 0, materialized = 0;
     // Resident copies a host transfer wrote over, wholly or in part (before_write).
     std::uint64_t dma_overwritten = 0;
+    // Host transfers that reached a resident byte and were settled here (before_read and
+    // before_write calls); other transfers never reach the renderer.
+    std::uint64_t dma_settled = 0;
     // GPU copies of a resident copy's top-left part made for smaller lookups (counted in resident_hits too).
     std::uint64_t resident_crops = 0;
     std::uint64_t geometry_hits = 0, geometry_misses = 0, geometry_validated_bytes = 0;

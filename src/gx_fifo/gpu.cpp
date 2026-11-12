@@ -627,12 +627,12 @@ bool gpu_idle() {
     return gpu->idle();
 }
 
-void gpu_post(std::function<void()> call) {
+void gpu_post_function(std::function<void()> call) {
     host_allocation_scope host;
     gpu->post({{}, std::move(call)});
 }
 
-void gpu_call(const std::function<void()>& call) {
+void gpu_call_function(const std::function<void()>& call) {
     host_allocation_scope host;
     gpu->post({{}, call});
     gpu->drain();

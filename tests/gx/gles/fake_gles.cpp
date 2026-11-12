@@ -1,6 +1,8 @@
 #include "starlet/gx/transform.hpp"
 #include <GLES3/gl32.h>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <deque>
 #include <map>
 #include <array>
@@ -69,6 +71,15 @@ std::vector<std::string> shader_sources;
 std::vector<GLenum> invalidated;
 GLenum depth_func = GL_LESS;
 GLboolean depth_mask = GL_TRUE, depth_test = GL_FALSE;
+// While hold_readbacks is set, glReadPixels and glClientWaitSync wait for it to clear;
+// readback_held tells a test that one waits.
+std::atomic<bool> hold_readbacks{false}, readback_held{false};
+void hold_readback() {
+    if (!hold_readbacks.load()) return;
+    readback_held = true;
+    while (hold_readbacks.load()) std::this_thread::yield();
+    readback_held = false;
+}
 } // namespace fake
 namespace {
 std::size_t transfer_bytes(GLsizei width, GLsizei height, bool pack) {
@@ -155,7 +166,7 @@ void glInvalidateFramebuffer(GLenum, GLsizei count, const GLenum* attachments) {
 }
 void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {}
 void glClearDepthf(GLfloat d) {}
-GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) { return fake::wait_result; }
+GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) { fake::hold_readback(); return fake::wait_result; }
 void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {}
 void glCompileShader(GLuint shader) {}
 GLuint glCreateProgram(void) { return ++fake::next; }
@@ -299,6 +310,7 @@ void glPixelStorei(GLenum pname, GLint param) {
         fake::pixel[pname] = param;
 }
 void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels) {
+    fake::hold_readback();
     ++fake::read_pixels;
     fake::pack_seen = fake::pixel[GL_PACK_SKIP_ROWS];
     fake::pack_pbo_seen = fake::pack_buffer;

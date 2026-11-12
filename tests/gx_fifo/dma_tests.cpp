@@ -1,7 +1,8 @@
 // ARAM and disc DMA over an EFB texture copy that Starlet's GLES renderer (on a recording GL fake)
 // keeps on the GPU: the transfers see memory as the console has it once the copy has run. A read
 // gets the copy's bytes, a write replaces them, and a later read of a partly written copy gets the
-// copy's remaining bytes beside the written ones.
+// copy's remaining bytes beside the written ones. Transfers reaching no byte a copy still owns
+// return without the GPU thread, and none takes memory from the game's heap.
 #include "starlet/ar/ar.hpp"
 #include "starlet/compat/gx_fifo.h"
 #include "starlet/dvd/dvd.hpp"
@@ -10,6 +11,7 @@
 #include "starlet/gx_fifo/gpu.hpp"
 #include "starlet/os/game_memory.hpp"
 #include "starlet/os/guest_cpu.hpp"
+#include "starlet/os/host_allocation.hpp"
 #include "starlet/os/os_core.hpp"
 #include "starlet/sdk/ar.h"
 #include "starlet/sdk/dvd.h"
@@ -17,11 +19,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <ftw.h>
@@ -30,6 +35,7 @@
 namespace fake {
 extern bool map_pattern;
 extern int read_pattern_row;
+extern std::atomic<bool> hold_readbacks, readback_held;
 }
 
 extern "C" {
@@ -96,6 +102,18 @@ bool all(const std::uint8_t* bytes, std::size_t size, std::uint8_t value) {
     return std::all_of(bytes, bytes + size, [value](std::uint8_t b) { return b == value; });
 }
 
+// A game heap that is gone, as Resident Evil 4's current heap between destroying its movie heap
+// and transferring the game heap back from ARAM: allocations from it are counted.
+std::atomic<bool> heap_gone{false};
+std::atomic<unsigned> game_allocations{0};
+os::GameHeap gone_heap() {
+    os::GameHeap heap;
+    heap.ready = [] { return heap_gone.load(); };
+    heap.allocate = [](std::size_t size) -> void* { ++game_allocations; return std::malloc(size ? size : 1); };
+    heap.release = [](void* pointer) { std::free(pointer); };
+    return heap;
+}
+
 int guest_main() {
     GXFifoObj fifo{};
     __GXFifoInit();
@@ -157,6 +175,56 @@ int guest_main() {
     aram_dma(ARQ_TYPE_MRAM_TO_ARAM, physical(y), 0x600000, copy_bytes);
     require(stats().materialized == 2 && stats().dma_overwritten == 3 && renderer->resident_in(x, copy_bytes),
             "DMA beside a copy leaves it resident");
+
+    // A partly written copy owns only its other bytes: transfers within the written range leave it.
+    auto* z = arena + (3u << 20);
+    copy_to(z);
+    aram_dma(ARAM_DIR_ARAM_TO_MRAM, 0x200000, physical(z + 256), 64);
+    require(stats().dma_overwritten == 4 && !renderer->resident_in(z + 256, 64) && renderer->resident_in(z + 255, 1) &&
+                renderer->resident_in(z + 320, 1),
+            "a partly written copy is resident only in its other bytes");
+    aram_dma(ARAM_DIR_ARAM_TO_MRAM, 0x200000, physical(z + 256), 64);
+    aram_dma(ARQ_TYPE_MRAM_TO_ARAM, physical(z + 256), 0x700000, 64);
+    require(stats().dma_overwritten == 4 && stats().materialized == 2 && all(aram + 0x700000, 64, 0x5a),
+            "transfers within a copy's written range leave the copy");
+
+    // While the GPU thread waits for a readback, transfers reaching no resident byte return.
+    const auto settled = stats().dma_settled;
+    fake::hold_readbacks = true;
+    std::thread reader([z] { os::before_dma_read(z, copy_bytes); });
+    while (!fake::readback_held) std::this_thread::yield();
+    std::atomic<bool> finished{false}, timed_out{false};
+    std::thread watchdog([&finished, &timed_out] {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!finished && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!finished) { timed_out = true; fake::hold_readbacks = false; }
+    });
+    constexpr int rounds = 100000;
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < rounds; ++i) {
+        os::before_dma_write(z + copy_bytes, 64);
+        os::before_dma_read(z - 64, 64);
+        os::before_dma_read(z + 256, 64);
+    }
+    const auto elapsed = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
+    aram_dma(ARAM_DIR_ARAM_TO_MRAM, 0x200000, physical(z + copy_bytes), copy_bytes);
+    finished = true;
+    fake::hold_readbacks = false;
+    reader.join();
+    watchdog.join();
+    std::printf("gx_fifo dma: %.0f ns per transfer beside resident copies\n", elapsed / (3.0 * rounds));
+    require(!timed_out, "transfers reaching no resident byte do not wait for the GPU thread");
+    require(stats().materialized == 3 && stats().dma_settled == settled + 1 && !renderer->resident_in(z, copy_bytes),
+            "only the read reaching the copy was settled by the renderer");
+
+    // A guest thread whose game heap is gone reaches the GPU thread without allocating from it.
+    os::set_game_heap(gone_heap());
+    copy_to(z);
+    heap_gone = true;
+    aram_dma(ARAM_DIR_ARAM_TO_MRAM, 0x200000, physical(z), copy_bytes);
+    heap_gone = false;
+    require(game_allocations == 0 && stats().dma_overwritten == 5 && !renderer->resident_in(z, copy_bytes),
+            "a transfer over a resident copy allocates nothing from the game's heap");
     require(gx_fifo::gpu_failure()[0] == 0, "no command stream failure");
     return 0;
 }

@@ -396,9 +396,12 @@ struct GlesDirect::Impl {
     // are disjoint from each other and from every copy in copies.
     std::vector<GlesResidentCopy> shadowed;
     std::uint64_t stamps = 0;
-    // Destination and size of every copy in copies and shadowed, for resident_in on other threads.
+    // The bytes copies and shadowed hold, as [begin, end) addresses, for resident_in on other
+    // threads: each copy's destination and each shadowed copy's uncovered ranges. published_any
+    // lets a transfer skip the lock while nothing is resident.
     mutable std::mutex published_mutex;
-    std::vector<std::pair<std::uintptr_t, std::size_t>> published;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> published;
+    std::atomic<bool> published_any{false};
     // Copy targets are reused only once the GPU has retired their last frame of use:
     // rendering into a texture that pending draws still sample makes the driver wait.
     struct SpareTarget { int width, height; GLuint texture, framebuffer; std::uint64_t frame; };
@@ -1191,12 +1194,25 @@ struct GlesDirect::Impl {
     void publish() {
         std::lock_guard<std::mutex> lock(published_mutex);
         published.clear();
-        for (const auto& c : copies) published.emplace_back(reinterpret_cast<std::uintptr_t>(c.second.destination), c.second.bytes);
-        for (const auto& c : shadowed) published.emplace_back(reinterpret_cast<std::uintptr_t>(c.destination), c.bytes);
+        for (const auto& c : copies) {
+            const auto destination = reinterpret_cast<std::uintptr_t>(c.second.destination);
+            published.emplace_back(destination, destination + c.second.bytes);
+        }
+        for (const auto& c : shadowed) {
+            const auto destination = reinterpret_cast<std::uintptr_t>(c.destination);
+            std::size_t from = 0;
+            for (const auto& r : c.covered) {
+                if (from < r.first) published.emplace_back(destination + from, destination + r.first);
+                from = std::max(from, r.second);
+            }
+            if (from < c.bytes) published.emplace_back(destination + from, destination + c.bytes);
+        }
+        published_any.store(!published.empty(), std::memory_order_release);
     }
     bool resident_in(std::uintptr_t begin, std::size_t size) const {
+        if (!published_any.load(std::memory_order_acquire)) return false;
         std::lock_guard<std::mutex> lock(published_mutex);
-        for (const auto& r : published) if (begin < r.first + r.second && r.first < begin + size) return true;
+        for (const auto& r : published) if (begin < r.second && r.first < begin + size) return true;
         return false;
     }
     // The bytes [from, to) of c that [begin, begin + size) reaches; false when it reaches none.
@@ -1208,6 +1224,7 @@ struct GlesDirect::Impl {
         return true;
     }
     void before_read(std::uintptr_t begin, std::size_t size) {
+        ++stats.dma_settled;
         bool changed = false;
         std::size_t from = 0, to = 0;
         for (auto it = shadowed.begin(); it != shadowed.end();) {
@@ -1223,10 +1240,11 @@ struct GlesDirect::Impl {
     // Written bytes become covered, as if a newer copy owned them: partly written copies
     // move to shadowed and keep their other bytes on the GPU.
     void before_write(std::uintptr_t begin, std::size_t size) {
+        ++stats.dma_settled;
         bool changed = false;
         std::size_t from = 0, to = 0;
         for (auto it = shadowed.begin(); it != shadowed.end();) {
-            if (!reached(*it, begin, size, from, to)) { ++it; continue; }
+            if (!reached(*it, begin, size, from, to) || it->covers(from, to)) { ++it; continue; }
             changed = true; ++stats.dma_overwritten;
             if (it->cover(from, to)) { retire_shadowed(*it); it = shadowed.erase(it); } else ++it;
         }

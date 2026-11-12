@@ -204,10 +204,13 @@ write (Galaxy unregisters its writable ranges this way).
 
 Host transfers on the game's behalf call `starlet::os::before_dma_read` or
 `before_dma_write` first: ARAM and disc DMA, card reads and writes, THP planes
-and audio DMA. gx_fifo passes one whose range may hold a resident copy
-(`resident_in`, a list the GPU thread republishes whenever its copies change) to
-the GPU thread after the commands queued before it, while the transfer waits;
-other transfers cost a locked list scan. A read materializes the copies it
+and audio DMA. gx_fifo passes one whose range holds a byte a resident copy owns
+(`resident_in`: each copy's destination and the uncovered ranges of partly
+replaced copies, republished by the GPU thread whenever its copies change) to
+the GPU thread after the commands queued before it, while the transfer waits.
+Other transfers never wait for the GPU thread: they cost an atomic load while
+nothing is resident and a locked scan otherwise (about 50 ns on the arm64 test
+host). A read materializes the copies it
 reaches, waiting for the GL thread's readback, so the transfer gets the copy's
 bytes. A write drops the copies it covers without materializing them; one it
 covers in part records the written range as covered and is kept like a copy a

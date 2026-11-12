@@ -2,9 +2,12 @@
 
 // Between the guest-side GX SDK (gx_sdk.cpp) and the GPU thread (gpu.cpp).
 
+#include "starlet/os/host_allocation.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <utility>
 #include <vector>
 
 namespace starlet::gx_fifo {
@@ -16,9 +19,19 @@ void gpu_drain();
 // Guest side: true when the GPU thread has run everything queued so far. Does not wait.
 bool gpu_idle();
 // Guest side: run call on the GPU thread after everything queued so far and wait for it.
-void gpu_call(const std::function<void()>& call);
+void gpu_call_function(const std::function<void()>& call);
 // Guest side: queue call on the GPU thread without waiting.
-void gpu_post(std::function<void()> call);
+void gpu_post_function(std::function<void()> call);
+// The std::function is made outside the game's heaps: a guest thread may call while its
+// current heap is gone (Resident Evil 4 transfers its heap back from ARAM before reinstating it).
+template<class F> void gpu_call(F&& call) {
+    os::host_allocation_scope host;
+    gpu_call_function(std::function<void()>(std::forward<F>(call)));
+}
+template<class F> void gpu_post(F&& call) {
+    os::host_allocation_scope host;
+    gpu_post_function(std::function<void()>(std::forward<F>(call)));
+}
 
 // GPU thread: EFB reads after all prior draws.
 std::uint32_t gpu_peek_depth(int x, int y);

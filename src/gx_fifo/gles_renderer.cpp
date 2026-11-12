@@ -37,7 +37,7 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 "presentations %llu, programs %llu, decoded %llu bytes; direct draws %llu zero-area %llu culled %llu unready %llu "
                 "submissions %llu batched %llu instanced %llu skipped %u; program waits %llu/%llu/%llu/%llu/%llu "
                 "(33/67/133/267 ms/longer) max %llu ms, GL-thread links %llu max %llu ms; resident copies %llu hits %llu "
-                "crops %llu materialized %llu overwritten by DMA %llu; batched with zero alpha %llu, vertex fog %llu; uniform blocks %llu shared %llu bytes %llu\n",
+                "crops %llu materialized %llu overwritten by DMA %llu settled DMA %llu; batched with zero alpha %llu, vertex fog %llu; uniform blocks %llu shared %llu bytes %llu\n",
                 gpu.retraces, gpu.presented, gpu.frame_buffer, gpu.known_frame_buffer, (unsigned long long)s.draws,
                 (unsigned long long)s.display_copies, (unsigned long long)s.texture_copies,
                 (unsigned long long)s.presentations, (unsigned long long)s.shader_compiles,
@@ -51,7 +51,8 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 (unsigned long long)s.direct.fallback_links, (unsigned long long)s.direct.fallback_link_max_ms,
                 (unsigned long long)s.direct.resident_copies, (unsigned long long)s.direct.resident_hits,
                 (unsigned long long)s.direct.resident_crops, (unsigned long long)s.direct.materialized,
-                (unsigned long long)s.direct.dma_overwritten, (unsigned long long)s.direct.zero_alpha_draws,
+                (unsigned long long)s.direct.dma_overwritten, (unsigned long long)s.direct.dma_settled,
+                (unsigned long long)s.direct.zero_alpha_draws,
                 (unsigned long long)s.direct.vertex_fog_draws, (unsigned long long)s.direct.uniform_blocks,
                 (unsigned long long)s.direct.shared_blocks, (unsigned long long)s.direct.uniform_bytes);
 }
