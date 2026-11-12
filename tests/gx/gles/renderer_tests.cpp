@@ -2,6 +2,7 @@
 #include "draw_fixture.hpp"
 #include "jfw_clear_fixture.hpp"
 #include <GLES3/gl31.h>
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <mutex>
@@ -577,6 +578,11 @@ void present_mapping() {
             // Blit: destination rows from destination down to 0 take source rows 0 up to source.
             const double blit = (double(destination) - (p + 0.5)) * source / destination;
             check(shader == int(std::floor(blit)), "presentation samples the texel a nearest blit samples");
+            // The shader's division-free quotient: a float estimate corrected by products.
+            const int n = (flipped * 2 + 1) * source, d = destination * 2;
+            int q = int(float(n) / float(d));
+            q += int((q + 1) * d <= n) - int(q * d > n);
+            check(q == shader, "presentation's corrected float quotient is the integer quotient");
         }
     }
 }
@@ -595,6 +601,9 @@ void no_blits_on_the_frame_path() {
     renderer.copy_display(copy, xfb.data(), xfb.size());
     renderer.present_framebuffer({{xfb.data(), xfb.size()}, 16, 16, 64}, 640, 480);
     check(fake::blits == blits && renderer.stats().presentations == 1, "resident RGB XFBs present with a draw");
+    check(std::none_of(fake::shader_sources.begin(), fake::shader_sources.end(),
+                       [](const std::string& s) { return s.find("/(uDestination") != std::string::npos; }),
+          "presentation divides no integers per pixel");
 }
 void resident_copies() {
     GlesRenderer renderer; Fixture f; f.memory.bytes.resize(64,0xa5);

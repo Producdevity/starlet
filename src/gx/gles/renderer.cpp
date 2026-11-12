@@ -911,7 +911,10 @@ uniform ivec4 uDestination;
 layout(location=0) out vec4 color;
 void main(){
  ivec2 p=ivec2(gl_FragCoord.xy)-uDestination.xy;
- ivec2 source=(p*2+1)*uSource.xy/(uDestination.zw*2);source.y=uSource.y-1-source.y;
+ ivec2 n=(p*2+1)*uSource.xy,d=uDestination.zw*2;
+ // n/d without a per-pixel integer division (see the RGB presentation).
+ ivec2 source=ivec2(vec2(n)/vec2(d));
+ source+=ivec2(lessThanEqual((source+1)*d,n))-ivec2(greaterThan(source*d,n));source.y=uSource.y-1-source.y;
  ivec4 a=ivec4(floor(texelFetch(uImage,ivec2(source.x/2,source.y),0)*255.0+0.5));
  ivec4 b=ivec4(floor(texelFetch(uImage,ivec2(min(source.x/2+1,uSource.x/2-1),source.y),0)*255.0+0.5));
  int y=2*(((source.x&1)!=0?a.b:a.r)-16);
@@ -955,7 +958,7 @@ void main(){
  color=vec4(clamp(sum/64.0,0.0,1.0),1.0);
 })GLSL";
         present.fragment = R"GLSL(#version 310 es
-precision mediump float;
+precision highp float;
 precision highp int;
 uniform sampler2D uImage;
 uniform ivec4 uSource;
@@ -965,7 +968,11 @@ void main(){
  ivec2 p=ivec2(gl_FragCoord.xy)-uDestination.xy;
  // A nearest blit's mapping, rows flipped: the window's top row shows source row 0.
  p.y=uDestination.w-1-p.y;
- ivec2 source=(p*2+1)*uSource.xy/(uDestination.zw*2);
+ ivec2 n=(p*2+1)*uSource.xy,d=uDestination.zw*2;
+ // n/d without an integer division, which Mali-G31 runs as a long sequence for every window
+ // pixel: the float quotient is off by at most one, and the products correct it exactly.
+ ivec2 source=ivec2(vec2(n)/vec2(d));
+ source+=ivec2(lessThanEqual((source+1)*d,n))-ivec2(greaterThan(source*d,n));
  color=vec4(texelFetch(uImage,source,0).rgb,1.0);
 })GLSL";
         // A symmetric three-tap vertical filter (a,64-2a,a) over full-height copies is two
