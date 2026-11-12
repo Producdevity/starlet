@@ -1,0 +1,7 @@
+find_package(Threads REQUIRED)
+add_library(starlet_nand STATIC nand.cpp)
+add_library(starlet::nand ALIAS starlet_nand)
+target_include_directories(starlet_nand PUBLIC "${PROJECT_SOURCE_DIR}/include")
+target_compile_features(starlet_nand PUBLIC cxx_std_17)
+set_target_properties(starlet_nand PROPERTIES CXX_EXTENSIONS OFF)
+target_link_libraries(starlet_nand PUBLIC Threads::Threads)

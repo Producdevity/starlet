@@ -1,0 +1,9 @@
+add_executable(starlet_nand_tests nand_tests.cpp)
+target_link_libraries(starlet_nand_tests PRIVATE starlet::nand)
+add_test(NAME starlet_nand COMMAND starlet_nand_tests)
+set_tests_properties(starlet_nand PROPERTIES TIMEOUT 30)
+
+add_executable(starlet_nand_async_tests nand_async_tests.cpp)
+target_link_libraries(starlet_nand_async_tests PRIVATE starlet::nand)
+add_test(NAME starlet_nand_async COMMAND starlet_nand_async_tests)
+set_tests_properties(starlet_nand_async PROPERTIES TIMEOUT 30)
