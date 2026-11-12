@@ -957,23 +957,18 @@ void main(){
           texelFetch(uImage,ivec2(x,GX_EFB_TOP-clamp(y+1,top,bottom)),0).rgb*float(uFilter.z);
  color=vec4(clamp(sum/64.0,0.0,1.0),1.0);
 })GLSL";
+        // A nearest blit's mapping, rows flipped (the window's top row shows source row 0): the
+        // texture coordinate is interpolated and sampled nearest, as drivers run such a blit,
+        // with no per-pixel integer work. The XFB texture is exactly the source's size.
+        present.vertex = "#version 310 es\nout highp vec2 vSource;\nvoid main(){vec2 "
+                         "p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.0-1.0,0.0,1.0);vSource=vec2(p.x,1.0-p.y);}";
         present.fragment = R"GLSL(#version 310 es
-precision highp float;
-precision highp int;
-uniform sampler2D uImage;
-uniform ivec4 uSource;
-uniform ivec4 uDestination;
+precision mediump float;
+uniform mediump sampler2D uImage;
+in highp vec2 vSource;
 layout(location=0) out vec4 color;
 void main(){
- ivec2 p=ivec2(gl_FragCoord.xy)-uDestination.xy;
- // A nearest blit's mapping, rows flipped: the window's top row shows source row 0.
- p.y=uDestination.w-1-p.y;
- ivec2 n=(p*2+1)*uSource.xy,d=uDestination.zw*2;
- // n/d without an integer division, which Mali-G31 runs as a long sequence for every window
- // pixel: the float quotient is off by at most one, and the products correct it exactly.
- ivec2 source=ivec2(vec2(n)/vec2(d));
- source+=ivec2(lessThanEqual((source+1)*d,n))-ivec2(greaterThan(source*d,n));
- color=vec4(texelFetch(uImage,source,0).rgb,1.0);
+ color=vec4(texture(uImage,vSource).rgb,1.0);
 })GLSL";
         // A symmetric three-tap vertical filter (a,64-2a,a) over full-height copies is two
         // bilinear lookups 2a/64 rows above and below; clamping matches at the EFB edges.

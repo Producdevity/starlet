@@ -604,6 +604,9 @@ void no_blits_on_the_frame_path() {
     check(std::none_of(fake::shader_sources.begin(), fake::shader_sources.end(),
                        [](const std::string& s) { return s.find("/(uDestination") != std::string::npos; }),
           "presentation divides no integers per pixel");
+    check(std::any_of(fake::shader_sources.begin(), fake::shader_sources.end(),
+                      [](const std::string& s) { return s.find("texture(uImage,vSource)") != std::string::npos; }),
+          "resident RGB XFBs present with one nearest lookup per pixel");
 }
 void resident_copies() {
     GlesRenderer renderer; Fixture f; f.memory.bytes.resize(64,0xa5);
