@@ -18,7 +18,8 @@ and the disc handling and SDL services its ports share:
   C++17, with the pinned Zstandard decoder in `third_party/zstd`.
 - `starlet::card` (`starlet_card`) keeps memory cards as Dolphin GCI folders and
   serves them as the SDK's CARD calls (source ports) or as formatted card images
-  (EXI card models). C++17, no other dependencies.
+  (EXI card models). C++17, no other dependencies. `starlet::card_sdk` binds the
+  SDK's CARD functions on `starlet::os`.
 - `starlet::host` (`starlet_host`) plays audio through the firmware's SDL2, reads
   its game controllers into a port's GameCube layout, and turns the frontend's
   SIGTERM into a prompt exit with the saves flushed. C++17 and SDL2.

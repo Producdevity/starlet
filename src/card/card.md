@@ -73,6 +73,32 @@ on one service thread and completes them as EXI interrupts.
   the time.
 - `format` empties the card and gives it a new format time, hence a new serial.
 
+### The SDK's CARD calls on starlet::os
+
+`starlet::card_sdk` (`sdk_card.cpp`, Linux) is the CARD binding for ports on
+`starlet::os`: the functions of `starlet/sdk/card.h` with C linkage, so a
+decompilation's calls bind by name; the port static_asserts that its
+`CARDFileInfo` and `CARDStat` match `starlet::sdk`'s. `initialize_cards(saves_dir)`
+names the saves folder before the game starts; `CARDInit` inserts slot A, Dolphin's
+folder for the boot disc's region (`boot_info_block`), slot B stays empty.
+
+It adds the SDK's control-block rules (`CARD_RESULT_NOCARD` when not mounted,
+`CARD_RESULT_BUSY` while a request is in flight) and timing to `Card`: requests
+that move data (mount, check, format, create, read, write, set status and
+attributes, delete, rename) run in order on one service thread (`starlet-card`)
+and complete through `raise_interrupt`, with the callback on the interrupt thread;
+the synchronous calls sleep the guest thread on the slot's queue as `__CARDSync`
+does. Guest memory is read when a request is made and written when it completes
+(`report_cpu_write`). `finish_card_writes(timeout)` is the exit path's wait for
+requests already made. `tests/card/sdk_card_tests.cpp` (`starlet_card_sdk`) runs
+the calls on the guest CPU: probe and mount rules, geometry, the created entry,
+writes and reads across blocks, asynchronous completion on the interrupt thread,
+persistence across re-initialization, safe writes, Dolphin GCI round trips,
+other games' files, a full directory, encoding and format.
+
+Pikmin 2 keeps its own copy of this binding (on its own OS layer) until it moves
+to `starlet::os`.
+
 ## Hardware level
 
 `Folder::image()` builds a formatted card image of the folder's files: the ID,
