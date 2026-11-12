@@ -16,7 +16,16 @@
 extern "C" {
 #endif
 
-static inline float gqr_scale_(unsigned field) { return __builtin_ldexpf(1.0f, (int)((field & 0x3f) ^ 0x20) - 0x20); }
+/* 2^n for the signed 6-bit scale field, built from the exponent bits (ldexpf is a libm call). */
+static inline float gqr_pow2_(int n)
+{
+    uint32_t bits = (uint32_t)(n + 127) << 23;
+    float value;
+    memcpy(&value, &bits, 4);
+    return value;
+}
+static inline int gqr_exponent_(unsigned field) { return (int)((field & 0x3f) ^ 0x20) - 0x20; }
+static inline float gqr_scale_(unsigned field) { return gqr_pow2_(gqr_exponent_(field)); }
 static inline unsigned gqr_load_type(uint32_t gqr) { return (gqr >> 16) & 7; }
 static inline unsigned gqr_store_type(uint32_t gqr) { return gqr & 7; }
 static inline unsigned gqr_size(unsigned type) { return type == 0 ? 4 : (type == 4 || type == 6) ? 1 : 2; }
@@ -37,7 +46,7 @@ static inline float gqr_load(uint32_t gqr, const void* address)
         return value;
     }
     }
-    return value * (1.0f / gqr_scale_(gqr >> 24));
+    return value * gqr_pow2_(-gqr_exponent_(gqr >> 24));
 }
 
 static inline void gqr_store(uint32_t gqr, void* address, float value)
