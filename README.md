@@ -102,6 +102,10 @@ from `main.dol`, go in the setup hook.
 
 An embedding project builds Starlet's tests only with `STARLET_TESTS` set.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 Starlet is licensed under the GNU General Public License, version 3. See
