@@ -1028,7 +1028,8 @@ void region_snapshots() {
         const auto byte = [&](std::uint32_t k) { return std::uint32_t((at + k) % 251); };
         return byte(3) << 24 | byte(0) << 16 | byte(1) << 8 | byte(2);
     };
-    const auto reads = fake::read_pixels, misses = renderer.stats().region_misses;
+    const auto reads = fake::read_pixels;
+    const auto misses = renderer.stats().region_misses;
     renderer.wait_snapshot(index);
     check(renderer.snapshot_ready(index) && fake::read_pixels == reads && renderer.stats().region_misses == misses,
           "waiting for a snapshot collects its readback without reading a pixel");
