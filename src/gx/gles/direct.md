@@ -208,9 +208,9 @@ and audio DMA. gx_fifo passes one whose range holds a byte a resident copy owns
 (`resident_in`: each copy's destination and the uncovered ranges of partly
 replaced copies, republished by the GPU thread whenever its copies change) to
 the GPU thread after the commands queued before it, while the transfer waits.
-Other transfers never wait for the GPU thread: they cost an atomic load while
-nothing is resident and a locked scan otherwise (about 50 ns on the arm64 test
-host). A read materializes the copies it
+Other transfers never wait for the GPU thread or take a lock while at most 32
+ranges are resident: they read the ranges from atomics under a sequence count
+(about 40 ns on the arm64 test host). A read materializes the copies it
 reaches, waiting for the GL thread's readback, so the transfer gets the copy's
 bytes. A write drops the copies it covers without materializing them; one it
 covers in part records the written range as covered and is kept like a copy a

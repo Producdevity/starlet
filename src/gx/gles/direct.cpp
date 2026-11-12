@@ -7,6 +7,7 @@
 
 #include <GLES3/gl32.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <chrono>
@@ -397,11 +398,15 @@ struct GlesDirect::Impl {
     std::vector<GlesResidentCopy> shadowed;
     std::uint64_t stamps = 0;
     // The bytes copies and shadowed hold, as [begin, end) addresses, for resident_in on other
-    // threads: each copy's destination and each shadowed copy's uncovered ranges. published_any
-    // lets a transfer skip the lock while nothing is resident.
+    // threads: each copy's destination and each shadowed copy's uncovered ranges. Up to
+    // inline_ranges of them are also kept in atomics under a sequence count (odd while being
+    // written), so transfers check them without a lock; more are read under the mutex.
+    static constexpr std::size_t inline_ranges = 32;
     mutable std::mutex published_mutex;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> published;
-    std::atomic<bool> published_any{false};
+    std::atomic<std::uint64_t> published_sequence{0};
+    std::atomic<std::size_t> published_count{0};
+    std::array<std::atomic<std::uintptr_t>, 2 * inline_ranges> published_inline{};
     // Copy targets are reused only once the GPU has retired their last frame of use:
     // rendering into a texture that pending draws still sample makes the driver wait.
     struct SpareTarget { int width, height; GLuint texture, framebuffer; std::uint64_t frame; };
@@ -1192,27 +1197,49 @@ struct GlesDirect::Impl {
         return 0;
     }
     void publish() {
-        std::lock_guard<std::mutex> lock(published_mutex);
-        published.clear();
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> next;
+        next.reserve(copies.size() + shadowed.size());
         for (const auto& c : copies) {
             const auto destination = reinterpret_cast<std::uintptr_t>(c.second.destination);
-            published.emplace_back(destination, destination + c.second.bytes);
+            next.emplace_back(destination, destination + c.second.bytes);
         }
         for (const auto& c : shadowed) {
             const auto destination = reinterpret_cast<std::uintptr_t>(c.destination);
             std::size_t from = 0;
             for (const auto& r : c.covered) {
-                if (from < r.first) published.emplace_back(destination + from, destination + r.first);
+                if (from < r.first) next.emplace_back(destination + from, destination + r.first);
                 from = std::max(from, r.second);
             }
-            if (from < c.bytes) published.emplace_back(destination + from, destination + c.bytes);
+            if (from < c.bytes) next.emplace_back(destination + from, destination + c.bytes);
         }
-        published_any.store(!published.empty(), std::memory_order_release);
+        std::lock_guard<std::mutex> lock(published_mutex);
+        published.swap(next);
+        const auto sequence = published_sequence.load(std::memory_order_relaxed);
+        published_sequence.store(sequence + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        published_count.store(published.size(), std::memory_order_relaxed);
+        for (std::size_t i = 0; i < published.size() && i < inline_ranges; ++i) {
+            published_inline[2 * i].store(published[i].first, std::memory_order_relaxed);
+            published_inline[2 * i + 1].store(published[i].second, std::memory_order_relaxed);
+        }
+        published_sequence.store(sequence + 2, std::memory_order_release);
     }
     bool resident_in(std::uintptr_t begin, std::size_t size) const {
-        if (!published_any.load(std::memory_order_acquire)) return false;
+        const auto end = begin + size;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            const auto sequence = published_sequence.load(std::memory_order_acquire);
+            if (sequence & 1) continue;
+            const auto count = published_count.load(std::memory_order_relaxed);
+            if (count > inline_ranges) break;
+            bool found = false;
+            for (std::size_t i = 0; i < count && !found; ++i)
+                found = begin < published_inline[2 * i + 1].load(std::memory_order_relaxed) &&
+                        published_inline[2 * i].load(std::memory_order_relaxed) < end;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (published_sequence.load(std::memory_order_relaxed) == sequence) return found;
+        }
         std::lock_guard<std::mutex> lock(published_mutex);
-        for (const auto& r : published) if (begin < r.second && r.first < begin + size) return true;
+        for (const auto& r : published) if (begin < r.second && r.first < end) return true;
         return false;
     }
     // The bytes [from, to) of c that [begin, begin + size) reaches; false when it reaches none.
