@@ -542,6 +542,14 @@ void direct_draw_path() {
     f.bp(0x88,f.decoder.state().bp(0x88)^1); renderer.draw_direct(f.decoder.state(),command,f.memory);
     s=renderer.stats().direct;
     check(s.texture_lookups==lookups+1 && s.state_plans==plans+1,"a changed register plans and resolves again");
+    // BP 0xe0-0xe7 hold the last colour or konst write: a colour change followed by an unchanged
+    // konst write leaves the BP value equal, as nw4r layout materials write them.
+    f.bp(0xe2,0x0ff0ff); f.bp(0xe2,(1u<<23)|0x10); renderer.draw_direct(f.decoder.state(),command,f.memory);
+    const auto tev_plans=renderer.stats().direct.state_plans;
+    f.bp(0xe2,0x000000); f.bp(0xe2,(1u<<23)|0x10); renderer.draw_direct(f.decoder.state(),command,f.memory);
+    check(renderer.stats().direct.state_plans==tev_plans+1,"a TEV colour change behind an equal konst write plans again");
+    f.bp(0xe2,0x000000); f.bp(0xe2,(1u<<23)|0x20); f.bp(0xe2,(1u<<23)|0x10); renderer.draw_direct(f.decoder.state(),command,f.memory);
+    check(renderer.stats().direct.state_plans==tev_plans+1,"equal TEV colour and konst registers keep the plan");
     renderer.wait_until_idle();
     f.bp(0x43,2);
     const auto draws=fake::draws;

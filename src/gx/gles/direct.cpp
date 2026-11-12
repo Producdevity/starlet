@@ -397,8 +397,12 @@ struct GlesDirect::Impl {
     // equal values keep the plan and the textures it resolved (CI palettes are checked
     // by generation, since a TLUT load changes them without changing a register).
     std::array<std::uint32_t, 256> planned_bp{};
+    // BP 0xe0-0xe7 keep only the last colour or konst write; both register sets are kept here.
+    std::array<std::uint32_t, 16> planned_tev{};
     bool same_bp_values(const State& state) const {
         for (unsigned a = 0; a < 256; ++a) if (state.bp(static_cast<std::uint8_t>(a)) != planned_bp[a]) return false;
+        for (unsigned i = 0; i < 16; ++i)
+            if (state.tev_register(i >= 8, static_cast<std::uint8_t>(i & 7)) != planned_tev[i]) return false;
         return true;
     }
     bool same_palettes(const State& state, const Program& p) const {
@@ -1703,6 +1707,7 @@ struct GlesDirect::Impl {
             if (!status) { states.pop_back(); throw std::runtime_error(status.message); }
             last_state = {true, state.bp_revision(), state.xf_register_revision(), segment, &p, static_cast<std::uint32_t>(states.size() - 1)};
             for (unsigned a = 0; a < 256; ++a) planned_bp[a] = state.bp(static_cast<std::uint8_t>(a));
+            for (unsigned i = 0; i < 16; ++i) planned_tev[i] = state.tev_register(i >= 8, static_cast<std::uint8_t>(i & 7));
             ++stats.state_plans;
         }
         if (p.plan->transform.latched_normal) resolve_latch();
