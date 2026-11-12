@@ -453,10 +453,44 @@ struct GlesDirect::Impl {
         return true;
     }
     // Batched draws share state, textures and uniform block while only TEV color
-    // registers and their own position matrix change between them.
+    // registers, material colours and their own position matrix change between them.
     struct { bool valid = false; std::uint64_t bp = 0, xf = 0, segment = 0, frame = 0; const Program* program = nullptr;
              std::uint32_t state = 0; std::array<GLuint, 8> textures{}, samplers{}; bool expanded = false; } batch;
-    struct { bool valid = false; std::uint64_t memory = 0, registers = 0, segment = 0; std::uint32_t offset = 0; unsigned pn = 0; } batch_uniform;
+    // What the batch's state plan read: BP values with the konst bank in place of E0-E7 (the
+    // colour bank travels per vertex), texture extents, the XF viewport and CI palettes.
+    struct {
+        std::array<std::uint32_t, 256> bp{};
+        std::array<std::uint32_t, 8> konst{};
+        std::array<std::uint32_t, 6> viewport{};
+        std::array<TextureExtent, 8> extents{};
+        std::array<std::uint64_t, 8> palettes{};
+    } batch_inputs;
+    void record_batch_inputs(const State& state, const Program& p, const DirectDrawState& planned) {
+        for (unsigned a = 0; a < 256; ++a) batch_inputs.bp[a] = state.bp(static_cast<std::uint8_t>(a));
+        for (unsigned i = 0; i < 8; ++i) {
+            batch_inputs.konst[i] = state.tev_register(true, static_cast<std::uint8_t>(i));
+            batch_inputs.extents[i] = state.texture_extent(static_cast<std::uint8_t>(i));
+            batch_inputs.palettes[i] = p.plan->maps & (1u << i) ? palette_generation(state, planned.textures[i]) : 0;
+        }
+        for (unsigned i = 0; i < 6; ++i) batch_inputs.viewport[i] = state.xf(static_cast<std::uint16_t>(0x101a + i));
+    }
+    bool same_batch_inputs(const State& state, const Program& p) const {
+        std::uint32_t differ = 0;
+        for (unsigned a = 0; a < 0xe0; ++a) differ |= state.bp(static_cast<std::uint8_t>(a)) ^ batch_inputs.bp[a];
+        for (unsigned a = 0xe8; a < 256; ++a) differ |= state.bp(static_cast<std::uint8_t>(a)) ^ batch_inputs.bp[a];
+        for (unsigned i = 0; i < 8; ++i) differ |= state.tev_register(true, static_cast<std::uint8_t>(i)) ^ batch_inputs.konst[i];
+        for (unsigned i = 0; i < 6; ++i) differ |= state.xf(static_cast<std::uint16_t>(0x101a + i)) ^ batch_inputs.viewport[i];
+        if (differ) return false;
+        for (unsigned i = 0; i < 8; ++i) if (!(state.texture_extent(static_cast<std::uint8_t>(i)) == batch_inputs.extents[i])) return false;
+        const auto& planned = states[batch.state];
+        for (unsigned map = 0; map < 8; ++map) if (p.plan->maps & (1u << map))
+            if (palette_generation(state, planned.textures[map]) != batch_inputs.palettes[map]) return false;
+        return true;
+    }
+    // keep: the position rows the program's texgens read; every other position row, the normal
+    // matrices and the material lanes no register-material channel reads are zero in the block.
+    struct { bool valid = false; std::uint64_t memory = 0, registers = 0, segment = 0, keep = 0; std::uint32_t offset = 0;
+             const Program* program = nullptr; } batch_uniform;
     TransformUniforms batch_block;
     std::vector<std::uint8_t> batch_vertices, expansion;
     void textures_changed() { last_textures.valid = false; batch.valid = false; }
@@ -828,6 +862,7 @@ struct GlesDirect::Impl {
                 if (other->instanced == oldest->get()) other->instanced = nullptr;
             }
             if (batch.program == oldest->get()) batch.valid = false;
+            if (batch_uniform.program == oldest->get()) batch_uniform.valid = false;
             // Queued segments may still draw with it; the GL thread deletes it after them.
             std::shared_ptr<Program> retired(oldest->release());
             retiring.push_back([retired] { if (retired->name) glDeleteProgram(retired->name); });
@@ -1707,9 +1742,13 @@ struct GlesDirect::Impl {
         Program* p = batched_program(base, state, draw);
         if (!p) return false;
         const auto setup = expanded ? line_point_setup(state, *p->plan, draw.primitive) : LinePointSetup{};
-        if (limits.verify_textures || !(batch.valid && batch.program == p && batch.bp == state.bp_state_revision() &&
-              batch.xf == state.xf_register_revision() && batch.segment == segment && batch.frame == frame &&
-              batch.expanded == expanded)) {
+        const bool same_batch = batch.valid && batch.program == p && batch.segment == segment && batch.frame == frame &&
+                                batch.expanded == expanded && !limits.verify_textures;
+        if (same_batch && (batch.bp != state.bp_state_revision() || batch.xf != state.xf_register_revision()) &&
+            same_batch_inputs(state, *p)) {
+            batch.bp = state.bp_state_revision(); batch.xf = state.xf_register_revision();
+        }
+        if (!(same_batch && batch.bp == state.bp_state_revision() && batch.xf == state.xf_register_revision())) {
             states.emplace_back();
             const auto status = plan_direct_state(state, *p->plan, cmpr, states.back(), limits.guard_band,
                                                    limits.fractional_viewport);
@@ -1725,18 +1764,39 @@ struct GlesDirect::Impl {
             }
             batch = {true, state.bp_state_revision(), state.xf_register_revision(), segment, frame, p,
                      static_cast<std::uint32_t>(states.size() - 1), names, samplers_used, expanded};
+            record_batch_inputs(state, *p, planned);
         }
-        // One XF memory write confined to the position rows the block zeroes keeps it valid.
+        const auto& batched_transform = p->plan->transform;
+        std::uint64_t keep = 0;
+        for (unsigned i = 0; i < batched_transform.texgen_count; ++i) {
+            const auto& t = batched_transform.texgens[i];
+            if (t.type != 0) continue;
+            const unsigned row = state.matrix_index(static_cast<std::uint8_t>(1 + i));
+            for (unsigned k = 0; k < (t.projected ? 3u : 2u) && row + k < 64; ++k) keep |= std::uint64_t{1} << (row + k);
+        }
+        // One XF memory write confined to words the block zeroes or does not hold keeps it valid.
         const auto write = state.last_xf_memory_write();
-        if (batch_uniform.valid && batch_uniform.pn == pn && write.revision == state.xf_memory_revision() &&
-            batch_uniform.memory + 1 == write.revision && write.first >= pn * 4 && write.end <= pn * 4 + 12)
-            batch_uniform.memory = write.revision;
-        if (!(batch_uniform.valid && batch_uniform.memory == state.xf_memory_revision() &&
-              batch_uniform.registers == state.xf_register_revision() && batch_uniform.segment == segment)) {
+        if (batch_uniform.valid && batch_uniform.program == p && batch_uniform.keep == keep && write.revision == state.xf_memory_revision() &&
+            batch_uniform.memory + 1 == write.revision) {
+            bool unread = true;
+            for (unsigned w = write.first; w < write.end && unread; ++w)
+                unread = w < 0x100 ? !((keep >> (w / 4)) & 1) : w < 0x500;
+            if (unread) batch_uniform.memory = write.revision;
+        }
+        if (!(batch_uniform.valid && batch_uniform.program == p && batch_uniform.keep == keep &&
+              batch_uniform.memory == state.xf_memory_revision() && batch_uniform.registers == state.xf_register_revision() &&
+              batch_uniform.segment == segment)) {
             TransformUniforms block;
             direct_transform_uniforms(state, block);
-            // Batched programs never read the draw's own position matrix.
-            for (unsigned row = pn; row < pn + 3; ++row) block.position[row] = {};
+            // Batched programs read no normal matrix, no position row but their texgens' and
+            // only the material lanes of channels with a register material.
+            for (unsigned row = 0; row < 64; ++row) if (!((keep >> row) & 1)) block.position[row] = {};
+            block.normal = {};
+            const auto register_materials = transform_register_materials(batched_transform);
+            for (unsigned i = 0; i < 4; ++i) if (!(register_materials & (1u << i))) {
+                auto& material = block.material[i % 2];
+                if (i < 2) material[0] = material[1] = material[2] = 0; else material[3] = 0;
+            }
             if (!(batch_uniform.valid && batch_uniform.segment == segment && !std::memcmp(&block, &batch_block, sizeof block))) {
                 const auto offset = (uniforms.size() + uniform_alignment - 1) / uniform_alignment * uniform_alignment;
                 uniforms.resize(offset + sizeof block);
@@ -1746,11 +1806,26 @@ struct GlesDirect::Impl {
                 ++stats.uniform_blocks;
             }
             batch_uniform.valid = true; batch_uniform.memory = state.xf_memory_revision();
-            batch_uniform.registers = state.xf_register_revision(); batch_uniform.segment = segment; batch_uniform.pn = pn;
+            batch_uniform.registers = state.xf_register_revision(); batch_uniform.segment = segment;
+            batch_uniform.keep = keep; batch_uniform.program = p;
         }
+        // The batched vertex: eye position, colours, texture coordinates, TEV registers. With
+        // vertex materials, colour c holds what channel c reads, its register material parts
+        // written over it.
+        const auto materials = p->plan->vertex_materials;
         auto batched = format;
+        if (materials) batched.colors = 3;
         batched.registers = true;
-        batched.stride = static_cast<std::uint16_t>(format.stride + 32);
+        batched.stride = static_cast<std::uint16_t>(batched.texcoord_offset(8) + 32);
+        std::array<std::array<std::uint8_t, 4>, 2> material{};
+        std::array<unsigned, 2> color_source{};
+        for (unsigned c = 0; c < 2; ++c) {
+            const auto word = state.xf(static_cast<std::uint16_t>(0x100c + c));
+            material[c] = {{std::uint8_t(word >> 24), std::uint8_t(word >> 16), std::uint8_t(word >> 8), std::uint8_t(word)}};
+            color_source[c] = transform_vertex_color_source(transform, c);
+        }
+        const std::size_t color_bytes = format.texcoord_offset(0) - format.color_offset(0);
+        const std::size_t texcoord_bytes = format.texcoord_offset(8) - format.texcoord_offset(0);
         if (runs.empty() || runs.back().format != batched) {
             const auto base_offset = (vertices.size() + 15) & ~std::size_t{15};
             vertices.resize(base_offset);
@@ -1772,14 +1847,23 @@ struct GlesDirect::Impl {
         target.resize(at + std::size_t{result.vertices} * batched.stride);
         for (std::uint32_t v = 0; v < result.vertices; ++v) {
             auto* out = target.data() + at + std::size_t{v} * batched.stride;
-            std::memcpy(out, batch_vertices.data() + std::size_t{v} * format.stride, format.stride);
+            const auto* in = batch_vertices.data() + std::size_t{v} * format.stride;
             float position[3];
-            std::memcpy(position, out, sizeof position);
+            std::memcpy(position, in, sizeof position);
             float eye[3];
             for (unsigned k = 0; k < 3; ++k)
                 eye[k] = m[k * 4] * position[0] + m[k * 4 + 1] * position[1] + m[k * 4 + 2] * position[2] + m[k * 4 + 3];
             std::memcpy(out, eye, sizeof eye);
-            std::memcpy(out + format.stride, registers.data(), sizeof registers);
+            if (!materials) std::memcpy(out + batched.color_offset(0), in + format.color_offset(0), color_bytes);
+            else for (unsigned c = 0; c < 2; ++c) {
+                auto* color = out + batched.color_offset(c);
+                if (color_source[c] < 2) std::memcpy(color, in + format.color_offset(color_source[c]), 4);
+                else std::memset(color, 255, 4);
+                if (materials & (1u << c)) std::memcpy(color, material[c].data(), 3);
+                if (materials & (4u << c)) color[3] = material[c][3];
+            }
+            std::memcpy(out + batched.texcoord_offset(0), in + format.texcoord_offset(0), texcoord_bytes);
+            std::memcpy(out + batched.register_offset(), registers.data(), sizeof registers);
         }
         auto added = result.vertices;
         auto added_indices = result.indices;

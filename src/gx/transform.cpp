@@ -354,6 +354,26 @@ TransformStatus capture_transform_pipeline(const State& s, const VertexLayout& l
     return validate(p);
 }
 
+unsigned transform_vertex_color_source(const TransformPipeline& p, unsigned channel) { return vertex_color_source(p, channel); }
+std::uint8_t transform_vertex_materials(TransformPipeline& p) {
+    std::uint8_t moved = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!(p.computed_colors & (1u << (i%2))) || (i >= 2 && i%2 >= p.color_count)) continue;
+        auto& c = p.channels[i];
+        if (!c.enabled && !c.material_vertex) { c.material_vertex = true; moved |= 1u << i; }
+    }
+    if (moved) p.vertex_colors = 3;
+    return moved;
+}
+std::uint8_t transform_register_materials(const TransformPipeline& p) {
+    std::uint8_t registers = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!(p.computed_colors & (1u << (i%2))) || (i >= 2 && i%2 >= p.color_count)) continue;
+        if (!p.channels[i].material_vertex) registers |= 1u << i;
+    }
+    return registers;
+}
+
 void direct_transform_uniforms(const State& s, TransformUniforms& u) {
     const auto* xf = s.xf_data();
     auto row = [xf](std::uint16_t base, unsigned width, TransformVector& v) {

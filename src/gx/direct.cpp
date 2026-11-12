@@ -177,6 +177,7 @@ DirectProgramResult plan_direct_program(const State& state, const VertexLayout& 
     for (unsigned i = 0; i < p->tev.stage_count; ++i) raster_colors |= tev_input_use(p->tev.stages[i]).raster_mask;
     const auto transform = capture_transform_pipeline(state, layout, raster_colors, p->transform, latched_normal);
     if (!transform) return fail(DrawError::transform, transform.message);
+    if (batched) p->vertex_materials = transform_vertex_materials(p->transform);
     std::uint8_t direct_maps = 0;
     for (unsigned i = 0; i < p->tev.stage_count; ++i) {
         const auto& stage = p->tev.stages[i];

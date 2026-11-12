@@ -946,6 +946,90 @@ void direct_batched_draws() {
     renderer.wait_until_idle();
     check(renderer.stats().direct.batched_draws == 3, "position texgens keep the object-space path");
 }
+GlesLimits batching_limits() {
+    GlesLimits limits; limits.direct.shading = DirectShading::fast; limits.direct.background_programs = false;
+    return limits;
+}
+void direct_batch_merging() {
+    GlesRenderer renderer(batching_limits()); Fixture f;
+    const auto draw = [&] { renderer.draw_direct(f.decoder.state(), f.command(), f.memory); };
+    draw();
+    f.bp(0x41, 0xf4a8); f.bp(0x41, 0xf4a9); // Blend mode changed and restored.
+    f.xf(0x100e, 3); f.xf(0x100e, 1); // Channel control changed and restored.
+    f.bp(0xfe, 0x00ffff); f.bp(0x41, 0xf4a9); // A masked write of the same value.
+    f.f(3, 10.0f);
+    draw();
+    for (unsigned i = 0; i < 9; ++i) f.f(0x400 + i, 2.0f); // A normal matrix load.
+    f.f(30 * 4, 5.0f); // A position row no texgen reads.
+    f.f(3, 20.0f);
+    draw();
+    renderer.wait_until_idle();
+    auto s = renderer.stats().direct;
+    check(s.batched_draws == 3 && s.submissions == 1, "same-value register writes and normal matrix loads keep one batch");
+    check(s.state_plans == 1 && s.uniform_blocks == 1, "they share one state plan and one uniform block");
+    draw();
+    f.f(60 * 4, 2.0f); // The texture matrix texgens 0 and 1 read.
+    draw(); renderer.wait_until_idle();
+    auto t = renderer.stats().direct;
+    check(t.state_plans == s.state_plans + 1 && t.uniform_blocks == s.uniform_blocks + 2 && t.submissions == s.submissions + 2,
+          "a texture matrix the texgens read splits the batch");
+    draw();
+    f.bp(0xe0, (1u << 23) | 0x10); // Konst register 0.
+    draw(); renderer.wait_until_idle();
+    s = renderer.stats().direct;
+    check(s.state_plans == t.state_plans + 2 && s.uniform_blocks == t.uniform_blocks + 1 && s.submissions == t.submissions + 2,
+          "a konst colour change splits the batch");
+}
+void direct_batched_materials() {
+    GlesRenderer renderer(batching_limits()); Fixture f;
+    const auto sources = fake::shader_sources.size();
+    f.xf(0x100e, 0); // RGB0 unlit with a register material; A0 keeps the vertex alpha.
+    f.xf(0x100c, 0x11223344);
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+    f.xf(0x100c, 0x55667788);
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+    renderer.wait_until_idle();
+    auto s = renderer.stats().direct;
+    check(s.batched_draws == 2 && s.submissions == 1 && s.uniform_blocks == 1 && s.state_plans == 1,
+          "draws differing in their unlit material colour merge");
+    const std::size_t stride = 12 + 8 + 16 + 32;
+    const auto& v = fake::submitted_vertices;
+    const auto color = [&](std::size_t vertex, unsigned slot) {
+        return std::array<std::uint8_t, 4>{{v[vertex * stride + 12 + slot * 4], v[vertex * stride + 13 + slot * 4],
+                                            v[vertex * stride + 14 + slot * 4], v[vertex * stride + 15 + slot * 4]}};
+    };
+    check(v.size() >= 8 * stride && color(0, 0) == std::array<std::uint8_t, 4>{{0x11, 0x22, 0x33, 255}} &&
+          color(1, 0) == std::array<std::uint8_t, 4>{{0x11, 0x22, 0x33, 192}} &&
+          color(5, 0) == std::array<std::uint8_t, 4>{{0x55, 0x66, 0x77, 192}} && color(5, 1) == std::array<std::uint8_t, 4>{{255, 255, 255, 255}},
+          "each draw's material colour travels in its vertex colour beside the vertex alpha");
+    bool vertex_material = false;
+    for (auto i = sources; i < fake::shader_sources.size(); ++i) {
+        const auto& source = fake::shader_sources[i];
+        if (source.find("a_register0") == std::string::npos) continue;
+        vertex_material = source.find("vec4 material = round(a_color0*255.0)") != std::string::npos &&
+                          source.find("u_material[0]") == std::string::npos;
+    }
+    check(vertex_material, "the batched program reads its material from the vertex colour");
+    TransformUniforms block; std::memcpy(&block, fake::uniform_bytes.data(), sizeof block);
+    check(block.material[0] == TransformVector{} && block.material[1] == TransformVector{}, "the block holds no material the program does not read");
+
+    // Channel 0 reads vertex colour 1 when colour 0 is absent.
+    Fixture g; g.cp(0x50, (1u << 9) | (1u << 15)); g.cp(0x70, 1u | (4u << 1) | (1u << 17) | (5u << 18) | (1u << 21) | (4u << 22));
+    g.xf(0x100e, 0); g.xf(0x100c, 0x11223344);
+    renderer.draw_direct(g.decoder.state(), g.command(), g.memory); renderer.wait_until_idle();
+    check(renderer.stats().direct.batched_draws == s.batched_draws + 1 && color(1, 0) == std::array<std::uint8_t, 4>{{0x11, 0x22, 0x33, 192}} &&
+          color(1, 1) == std::array<std::uint8_t, 4>{{255, 255, 255, 255}}, "colour 0 then holds what channel 0 read");
+
+    s = renderer.stats().direct;
+    f.xf(0x100e, 2); // Lit without lights: the material stays a register.
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+    f.xf(0x100c, 0x11223344);
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+    renderer.wait_until_idle();
+    const auto lit = renderer.stats().direct;
+    check(lit.batched_draws == s.batched_draws + 2 && lit.uniform_blocks == s.uniform_blocks + 2 && lit.submissions == s.submissions + 2,
+          "a lit channel's register material splits batches");
+}
 void direct_clip_culling() {
     for (const auto shading : {DirectShading::exact, DirectShading::fast}) {
         GlesLimits limits; limits.direct.shading = shading;
@@ -1538,6 +1622,8 @@ int main() {
     format_after_depth_copy();
     copy_clear_invalidation();
         direct_batched_draws();
+        direct_batch_merging();
+        direct_batched_materials();
         direct_clip_culling();
         direct_indexed_clip_culling();
         direct_submission_thread();

@@ -44,6 +44,9 @@ struct DirectProgram {
     bool rgba6 = false, needs_fetch = false, early_depth = false, fast = false, constant_alpha = false;
     // Fast program for eye-space positions and per-vertex TEV registers; see generate_transform_glsl.
     bool batched = false;
+    // Batched: channels (RGB0, RGB1, A0, A1) whose register material travels in vertex colour
+    // RGB or alpha; see transform_vertex_materials.
+    std::uint8_t vertex_materials = 0;
     // Fast program whose position and normal matrices come per instance; see generate_transform_glsl.
     bool instanced = false;
     std::uint8_t affine = 0; // Fast coordinates with q == 1.

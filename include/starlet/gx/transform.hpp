@@ -102,6 +102,14 @@ TransformCapture capture_transform(const State&, const VertexSnapshot&, std::uin
 // without normals that needs them then reads those.
 TransformStatus capture_transform_pipeline(const State&, const VertexLayout&, std::uint8_t raster_colors,
                                            TransformPipeline&, std::uint8_t latched_components = 0);
+// The vertex colour (0 or 1) that channel's vertex material and ambient read; 2: white.
+unsigned transform_vertex_color_source(const TransformPipeline&, unsigned channel);
+// Batched pipelines: every unlit channel with a register material reads it from the vertex
+// colour instead. Returns those channels as bits RGB0, RGB1, A0, A1; when any, vertex colour c
+// then feeds channel c and both are present.
+std::uint8_t transform_vertex_materials(TransformPipeline&);
+// The channels (bits RGB0, RGB1, A0, A1) whose material is the XF register, read as u_material.
+std::uint8_t transform_register_materials(const TransformPipeline&);
 // Every XF matrix row, light and register value in the uniform layout, unvalidated.
 // Rows a draw consumes equal capture_transform's; the GPU evaluates the values as given.
 // Every byte of the block is written, unused lanes as zero, so it may be reused unreset.

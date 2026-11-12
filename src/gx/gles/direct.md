@@ -75,14 +75,20 @@ the TEV alpha (raster.hpp, premultiply). The fog type is program identity, and s
 are its projection and range adjustment while fog is on; with fog off they are
 ignored, as games leave them set. It targets visual fidelity, not GX bit equality.
 
-In fast mode, draws of at most 64 vertices whose program reads no normals and
-no position-sourced texgens are batched: their positions are transformed to eye
-space on the CPU by the draw's own position matrix, and the four TEV registers
-travel as flat per-vertex attributes of a batched program variant. Consecutive
-batched draws whose other BP state (`State::bp_state_revision`), XF registers,
-textures and remaining XF matrix memory are unchanged share one state plan and
-uniform block, and merge into one GL draw; particles and layout panes otherwise
-cost a driver draw each.
+In fast mode, draws of at most 64 vertices whose program reads no normals and no
+position-sourced texgens are batched: their positions are transformed to eye space on
+the CPU by the draw's own position matrix, and the four TEV registers travel as flat
+per-vertex attributes of a batched program variant. In that variant unlit channels with
+a register material read it from the vertex colour, so each draw's material colour
+travels with its vertices; vertex colour c then holds what channel c read. Consecutive
+batched draws share one state plan while the values it read are unchanged: BP registers
+(the konst bank in place of E0-E7), texture extents, CI palette generations and the XF
+viewport. Games rewrite registers between draws, so values are compared, not revisions.
+They share one uniform block while it is unchanged once what the batched program never
+reads is zeroed: normal matrices, position rows no texgen indexes and material lanes no
+register-material channel reads. Such draws merge into one GL draw; Resident Evil 4
+loads a normal matrix and a material colour per particle, and particles and layout
+panes otherwise cost a driver draw each.
 
 In fast mode, consecutive draws of the same resident geometry with the same program,
 state plan, textures and matrix latches, whose transform blocks differ only in the
