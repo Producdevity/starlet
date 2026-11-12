@@ -45,7 +45,7 @@ struct Arrays {
     StreamArraySpans* spans;
     std::array<std::uint8_t, 36> scratch;
     // Returns element bytes and whether they are native-endian words.
-    const std::uint8_t* read(const Input& in, std::uint16_t element, std::size_t offset, std::size_t size, bool& native) {
+    [[gnu::noinline]] const std::uint8_t* read(const Input& in, std::uint16_t element, std::size_t offset, std::size_t size, bool& native) {
         const std::uint64_t relative = std::uint64_t{element} * in.stride + offset;
         // Native units are 2 or 4, so the mask tests divisibility.
         const unsigned native_unit = in.host_order ? in.unit : in.native_unit;
@@ -67,6 +67,37 @@ struct Arrays {
             return nullptr;
         native = false;
         return scratch.data();
+    }
+};
+
+// One input's array, read in place with only a bounds check per element when every
+// element is aligned for its native unit; the consumed range reaches the spans once.
+struct InPlace {
+    const std::uint8_t* data = nullptr; // Null: every read takes Arrays::read.
+    std::size_t size = 0, first = std::numeric_limits<std::size_t>::max(), end = 0;
+    bool native = false;
+    explicit InPlace(const Input& in) {
+        const unsigned native_unit = in.host_order ? in.unit : in.native_unit;
+        if (!in.data || (native_unit && (native_unit != in.unit || ((in.stride | in.element_bytes) & (in.unit - 1u))))) return;
+        data = in.data;
+        size = in.size;
+        native = native_unit != 0;
+    }
+    // Null when the element needs Arrays::read.
+    const std::uint8_t* find(const Input& in, std::uint16_t element, std::size_t offset, std::size_t bytes) {
+        const std::size_t relative = std::size_t{element} * in.stride + offset;
+        if (!data || relative > size || bytes > size - relative) return nullptr;
+        first = std::min(first, relative);
+        end = std::max(end, relative + bytes);
+        return data + relative;
+    }
+    void finish(const Input& in, StreamArraySpans* spans) const {
+        if (!spans || first >= end) return;
+        auto& span = spans->arrays[in.array];
+        if (span.first == span.end) { span.first = first; span.end = end; }
+        else { span.first = std::min(span.first, first); span.end = std::max(span.end, end); }
+        span.native_unit = static_cast<std::uint8_t>(in.host_order ? in.unit : in.native_unit);
+        span.host_order = in.host_order;
     }
 };
 
@@ -111,25 +142,31 @@ struct Column {
     const std::uint8_t* disabled;
     Arrays& arrays;
 };
-template <unsigned IndexBytes, unsigned Format>
+// Components is the per-vector component count when fixed at compile time, else 0.
+template <unsigned IndexBytes, unsigned Format, unsigned Components>
 bool numbers_column(const Column& c) {
     const auto& in = c.in;
+    const unsigned components = Components ? Components : in.components;
+    InPlace array(in);
     for (std::size_t i = 0; i < c.count; ++i) {
         if (c.disabled && c.disabled[i]) continue;
         const auto* cursor = c.fifo + i * c.fifo_stride + in.fifo_offset;
         float values[9];
-        unsigned filled = in.components;
+        unsigned filled = components;
         if constexpr (IndexBytes != 0) {
             for (unsigned v = 0; v < in.vectors; ++v) {
                 const std::uint16_t element = IndexBytes == 1 ? cursor[v] : be16(cursor + v * 2);
-                bool native = false;
-                const auto* data = c.arrays.read(in, element, v * in.element_bytes, in.element_bytes, native);
-                if (!data) return false;
-                convert<Format>(data, in.components, in.scale, native, values + v * in.components);
+                bool native = array.native;
+                const auto* data = array.find(in, element, v * in.element_bytes, in.element_bytes);
+                if (!data && !(data = c.arrays.read(in, element, v * in.element_bytes, in.element_bytes, native))) {
+                    array.finish(in, c.arrays.spans);
+                    return false;
+                }
+                convert<Format>(data, components, in.scale, native, values + v * components);
             }
-            filled = in.components * in.vectors;
+            filled = components * in.vectors;
         } else {
-            convert<Format>(cursor, in.components, in.scale, false, values);
+            convert<Format>(cursor, components, in.scale, false, values);
         }
         for (unsigned k = filled; k < in.width; ++k) values[k] = 0;
         auto* target = c.out + i * c.out_stride + in.output;
@@ -140,34 +177,47 @@ bool numbers_column(const Column& c) {
         default: std::memcpy(target, values, in.width * 4u); break;
         }
     }
+    array.finish(in, c.arrays.spans);
     return true;
 }
 template <unsigned IndexBytes, unsigned Format>
 bool color_column(const Column& c) {
     const auto& in = c.in;
+    InPlace array(in);
     for (std::size_t i = 0; i < c.count; ++i) {
         if (c.disabled && c.disabled[i]) continue;
         const auto* data = c.fifo + i * c.fifo_stride + in.fifo_offset;
         if constexpr (IndexBytes != 0) {
+            const std::uint16_t element = IndexBytes == 1 ? data[0] : be16(data);
             bool native = false;
-            data = c.arrays.read(in, IndexBytes == 1 ? data[0] : be16(data), 0, in.element_bytes, native);
-            if (!data) return false;
+            data = array.find(in, element, 0, in.element_bytes);
+            if (!data && !(data = c.arrays.read(in, element, 0, in.element_bytes, native))) {
+                array.finish(in, c.arrays.spans);
+                return false;
+            }
         }
         convert_color<Format>(data, c.out + i * c.out_stride + in.output);
     }
+    array.finish(in, c.arrays.spans);
     return true;
 }
 using ColumnFunction = bool (*)(const Column&);
-template <unsigned IndexBytes>
-constexpr ColumnFunction numbers_columns[] = {numbers_column<IndexBytes, 0>, numbers_column<IndexBytes, 1>, numbers_column<IndexBytes, 2>,
-                                              numbers_column<IndexBytes, 3>, numbers_column<IndexBytes, 4>};
+template <unsigned IndexBytes, unsigned Components>
+constexpr ColumnFunction numbers_columns[] = {
+    numbers_column<IndexBytes, 0, Components>, numbers_column<IndexBytes, 1, Components>, numbers_column<IndexBytes, 2, Components>,
+    numbers_column<IndexBytes, 3, Components>, numbers_column<IndexBytes, 4, Components>};
+template <unsigned Components>
+ColumnFunction numbers_function(const Input& in) {
+    return in.index_bytes == 0 ? numbers_columns<0, Components>[in.format]
+         : in.index_bytes == 1 ? numbers_columns<1, Components>[in.format] : numbers_columns<2, Components>[in.format];
+}
 template <unsigned IndexBytes>
 constexpr ColumnFunction color_columns[] = {color_column<IndexBytes, 0>, color_column<IndexBytes, 1>, color_column<IndexBytes, 2>,
                                             color_column<IndexBytes, 3>, color_column<IndexBytes, 4>, color_column<IndexBytes, 5>};
 ColumnFunction column_function(const Input& in) {
     if (in.kind == Input::color)
         return in.index_bytes == 0 ? color_columns<0>[in.format] : in.index_bytes == 1 ? color_columns<1>[in.format] : color_columns<2>[in.format];
-    return in.index_bytes == 0 ? numbers_columns<0>[in.format] : in.index_bytes == 1 ? numbers_columns<1>[in.format] : numbers_columns<2>[in.format];
+    return in.components == 3 ? numbers_function<3>(in) : in.components == 2 ? numbers_function<2>(in) : numbers_function<0>(in);
 }
 bool primitive_count(std::uint8_t primitive, std::size_t n, std::size_t& count) {
     switch (primitive) {
