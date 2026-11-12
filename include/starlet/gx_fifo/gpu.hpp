@@ -46,6 +46,11 @@ struct GpuSetup {
     // __GXData, so the port passes a function doing what the SDK's GXFlush does with it:
     // if (__GXData->dirtyState) __GXSetDirtyState();
     void (*flush_dirty_state)() = nullptr;
+    // The port converts the vertex data it loads to host byte order (Super Mario Sunshine's
+    // resource converters), so every GXSetArray array holds host-order numbers at their own width,
+    // except ranges registered with starlet_gx_big_endian_array. Off: arrays are canonical GX bytes
+    // except ranges registered with starlet_gx_host_order_array.
+    bool arrays_host_order = false;
     Diagnostics diagnostics;
 };
 

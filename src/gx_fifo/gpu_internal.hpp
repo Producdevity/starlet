@@ -36,6 +36,7 @@ std::uint16_t gpu_token();
 
 // GPU thread: native-order arrays (see starlet/compat/gx_fifo.h), in command order.
 void gpu_host_order_array(std::uintptr_t base, std::size_t bytes);
+void gpu_big_endian_array(std::uintptr_t base, std::size_t bytes);
 void gpu_release_array(std::uintptr_t base);
 
 // Guest side: the VI shows frame_buffer (or black) at this retrace.

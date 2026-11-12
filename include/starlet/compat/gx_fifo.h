@@ -24,6 +24,9 @@ extern StarletGxStage starlet_gx_stage;
  * Release before the memory is reused. */
 void starlet_gx_host_order_array(const void* base, unsigned long bytes);
 void starlet_gx_release_array(const void* base);
+/* With GpuSetup::arrays_host_order: an array that holds canonical big-endian GX bytes (retail
+ * bytes the port does not convert). Release before the memory is reused. */
+void starlet_gx_big_endian_array(const void* base, unsigned long bytes);
 
 /* Makes room for bytes more bytes (submits the chunk, or flags list overflow). */
 void starlet_gx_reserve(unsigned bytes);

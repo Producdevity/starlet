@@ -54,7 +54,16 @@ vi.c: `VIInit`, `VIConfigure`, `VIFlush`, `VISetNextFrameBuffer`,
 `VI_NTSC`.
 
 Write-gather pipe (`starlet/compat/gx_fifo.h`): `starlet_gx_stage`,
-`starlet_gx_reserve`, `starlet_gx_host_order_array`, `starlet_gx_release_array`.
+`starlet_gx_reserve`, `starlet_gx_host_order_array`, `starlet_gx_big_endian_array`,
+`starlet_gx_release_array`.
+
+Vertex array byte order: arrays hold canonical GX bytes, and arrays the game fills
+natively are registered with `starlet_gx_host_order_array`. A port that converts
+the vertex data it loads to host order sets `GpuSetup::arrays_host_order`: every
+array is then read as host-order numbers at their own width (bytes as stored),
+and retail bytes it leaves big-endian are registered with
+`starlet_gx_big_endian_array`. Textures, TLUTs and display lists stay canonical
+either way.
 
 ## The port's decompilation
 

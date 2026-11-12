@@ -159,6 +159,12 @@ void starlet_gx_host_order_array(const void* base, unsigned long bytes) {
     gpu_post([address, bytes] { gpu_host_order_array(address, bytes); });
 }
 
+void starlet_gx_big_endian_array(const void* base, unsigned long bytes) {
+    flush_stage();
+    const auto address = reinterpret_cast<std::uintptr_t>(base);
+    gpu_post([address, bytes] { gpu_big_endian_array(address, bytes); });
+}
+
 void starlet_gx_release_array(const void* base) {
     flush_stage();
     const auto address = reinterpret_cast<std::uintptr_t>(base);

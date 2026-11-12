@@ -80,6 +80,16 @@ HostOrderArrays& host_order_arrays() {
     return *arrays;
 }
 
+// GpuSetup::arrays_host_order: arrays are host order unless registered here as canonical bytes.
+bool arrays_host_order = false;
+HostOrderArrays& big_endian_arrays() {
+    static HostOrderArrays* arrays = [] {
+        host_allocation_scope host;
+        return new HostOrderArrays;
+    }();
+    return *arrays;
+}
+
 // Write generations of the arena's 4 KiB pages. Console code must flush the data cache (DCFlushRange,
 // DCStoreRange) before the GPU reads what the CPU wrote, and every DMA into memory (disc, ARAM, card,
 // THP) reports its range, so a page's generation changes whenever bytes the GPU reads can have
@@ -198,6 +208,13 @@ public:
         const auto range = host_order_arrays().find(reinterpret_cast<std::uintptr_t>(source));
         if (range.second) {
             v.bytes = {source, std::size_t(range.second - reinterpret_cast<std::uintptr_t>(source))};
+            v.host_order = true;
+            return v;
+        }
+        // Host-order arrays need no registration; copy() still reads them as stored, so a vertex read
+        // past this view (none in practice: the view runs to the end of the region) would be wrong.
+        if (arrays_host_order && !big_endian_arrays().find(reinterpret_cast<std::uintptr_t>(source)).second) {
+            v.bytes = {source, region_rest(source)};
             v.host_order = true;
             return v;
         }
@@ -550,6 +567,7 @@ void start_gpu(GpuSetup setup) {
     if (!setup.renderer) throw std::invalid_argument("GpuSetup needs a renderer");
     if (!setup.flush_dirty_state) throw std::invalid_argument("GpuSetup needs flush_dirty_state");
     if (!setup.efb.valid()) throw std::invalid_argument("GpuSetup has an invalid EFB layout");
+    arrays_host_order = setup.arrays_host_order;
     if (gpu) throw std::logic_error("the GPU thread is already running");
     host_allocation_scope host;
     dirty_state = setup.flush_dirty_state;
@@ -609,7 +627,11 @@ void gpu_present(const void* frame_buffer, bool black) {
 }
 
 void gpu_host_order_array(std::uintptr_t base, std::size_t bytes) { host_order_arrays().add(base, bytes); }
-void gpu_release_array(std::uintptr_t base) { host_order_arrays().remove(base); }
+void gpu_big_endian_array(std::uintptr_t base, std::size_t bytes) { big_endian_arrays().add(base, bytes); }
+void gpu_release_array(std::uintptr_t base) {
+    host_order_arrays().remove(base);
+    big_endian_arrays().remove(base);
+}
 
 const char* gpu_failure() {
     host_allocation_scope host;
