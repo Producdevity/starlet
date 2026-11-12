@@ -2,3 +2,8 @@ add_executable(starlet_gx_fifo_tests gx_fifo_tests.cpp)
 target_link_libraries(starlet_gx_fifo_tests PRIVATE starlet_gx_fifo)
 add_test(NAME starlet_gx_fifo COMMAND starlet_gx_fifo_tests)
 set_tests_properties(starlet_gx_fifo PROPERTIES TIMEOUT 30)
+
+add_executable(starlet_gx_fifo_host_order_tests host_order_arrays_tests.cpp)
+target_link_libraries(starlet_gx_fifo_host_order_tests PRIVATE starlet_gx_fifo)
+add_test(NAME starlet_gx_fifo_host_order COMMAND starlet_gx_fifo_host_order_tests)
+set_tests_properties(starlet_gx_fifo_host_order PROPERTIES TIMEOUT 30)
