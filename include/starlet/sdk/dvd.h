@@ -77,6 +77,12 @@ starlet::sdk::BOOL DVDOpen(char* fileName, starlet::sdk::DVDFileInfo* fileInfo);
 starlet::sdk::BOOL DVDFastOpen(starlet::sdk::s32 entryNum, starlet::sdk::DVDFileInfo* fileInfo);
 starlet::sdk::BOOL DVDClose(starlet::sdk::DVDFileInfo* fileInfo);
 starlet::sdk::s32 DVDConvertPathToEntrynum(char* path);
+starlet::sdk::BOOL DVDFastOpenDir(starlet::sdk::s32 entryNum, starlet::sdk::DVDDir* dir);
+starlet::sdk::BOOL DVDOpenDir(char* dirName, starlet::sdk::DVDDir* dir);
+starlet::sdk::BOOL DVDReadDir(starlet::sdk::DVDDir* dir, starlet::sdk::DVDDirEntry* dirEntry);
+starlet::sdk::BOOL DVDCloseDir(starlet::sdk::DVDDir* dir);
+starlet::sdk::BOOL DVDChangeDir(char* dirName);
+starlet::sdk::BOOL DVDGetCurrentDir(char* path, starlet::sdk::u32 maxLength);
 starlet::sdk::BOOL DVDReadAsyncPrio(starlet::sdk::DVDFileInfo* fileInfo, void* addr, starlet::sdk::s32 length,
                                     starlet::sdk::s32 offset, starlet::sdk::DVDCallback callback, starlet::sdk::s32 prio);
 starlet::sdk::s32 DVDReadPrio(starlet::sdk::DVDFileInfo* fileInfo, void* addr, starlet::sdk::s32 length,

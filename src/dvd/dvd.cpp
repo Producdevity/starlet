@@ -381,4 +381,47 @@ s32 DVDChangeDisk(DVDCommandBlock* block, DVDDiskID* id) {
 
 void* DVDGetFSTLocation() { return fst_memory; }
 
+// Directories of the disc in the drive: a directory's entries follow it up to its next index.
+BOOL DVDFastOpenDir(s32 entryNum, DVDDir* dir) {
+    const auto& table = *disc_now().table;
+    if (entryNum < 0 || u32(entryNum) >= table.size() || !table.entry(u32(entryNum)).directory) return FALSE;
+    dir->entryNum = u32(entryNum);
+    dir->location = u32(entryNum) + 1;
+    dir->next = table.entry(u32(entryNum)).next;
+    return TRUE;
+}
+
+BOOL DVDOpenDir(char* dirName, DVDDir* dir) {
+    const s32 entry = DVDConvertPathToEntrynum(dirName);
+    return entry >= 0 && DVDFastOpenDir(entry, dir);
+}
+
+BOOL DVDReadDir(DVDDir* dir, DVDDirEntry* dirEntry) {
+    const auto& table = *disc_now().table;
+    const u32 i = dir->location;
+    if (i <= dir->entryNum || i >= dir->next || i >= table.size()) return FALSE;
+    const auto& e = table.entry(i);
+    dirEntry->entryNum = i;
+    dirEntry->isDir = e.directory;
+    dirEntry->name = const_cast<char*>(e.name.c_str());
+    dir->location = e.directory ? e.next : i + 1;
+    return TRUE;
+}
+
+BOOL DVDCloseDir(DVDDir*) { return TRUE; }
+
+BOOL DVDChangeDir(char* dirName) {
+    const s32 entry = DVDConvertPathToEntrynum(dirName);
+    if (entry < 0 || !disc_now().table->entry(u32(entry)).directory) return FALSE;
+    current_dir = u32(entry);
+    return TRUE;
+}
+
+BOOL DVDGetCurrentDir(char* path, u32 maxLength) {
+    const std::string out = disc_now().table->path(current_dir);
+    if (out.size() + 1 > maxLength) return FALSE;
+    std::memcpy(path, out.c_str(), out.size() + 1);
+    return TRUE;
+}
+
 }
