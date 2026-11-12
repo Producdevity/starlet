@@ -1,0 +1,4 @@
+add_executable(starlet_os_tests guest_cpu_tests.cpp)
+target_link_libraries(starlet_os_tests PRIVATE starlet::os)
+add_test(NAME starlet_os_guest_cpu COMMAND starlet_os_tests)
+set_tests_properties(starlet_os_guest_cpu PROPERTIES TIMEOUT 20)
