@@ -107,7 +107,10 @@ starlet::sdk::s32 CARDUnmount(starlet::sdk::s32 chan);
 starlet::sdk::s32 CARDCheckExAsync(starlet::sdk::s32 chan, starlet::sdk::s32* xferBytes, starlet::sdk::CARDCallback callback);
 starlet::sdk::s32 CARDCheckAsync(starlet::sdk::s32 chan, starlet::sdk::CARDCallback callback);
 starlet::sdk::s32 CARDCheck(starlet::sdk::s32 chan);
+starlet::sdk::s32 CARDFormatAsync(starlet::sdk::s32 chan, starlet::sdk::CARDCallback callback);
 starlet::sdk::s32 CARDFormat(starlet::sdk::s32 chan);
+// The channel's last result; CARD_RESULT_BUSY while a request runs.
+starlet::sdk::s32 CARDGetResultCode(starlet::sdk::s32 chan);
 starlet::sdk::s32 CARDFreeBlocks(starlet::sdk::s32 chan, starlet::sdk::s32* byteNotUsed, starlet::sdk::s32* filesNotUsed);
 starlet::sdk::s32 CARDGetSerialNo(starlet::sdk::s32 chan, starlet::sdk::u64* serialNo);
 starlet::sdk::s32 CARDGetSectorSize(starlet::sdk::s32 chan, starlet::sdk::u32* size);

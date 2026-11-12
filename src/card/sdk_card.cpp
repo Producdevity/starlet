@@ -333,12 +333,24 @@ s32 CARDCheck(s32 channel) {
     return result < 0 ? result : wait(channel);
 }
 
-s32 CARDFormat(s32 channel) {
+s32 CARDFormatAsync(s32 channel, CARDCallback callback) {
     Slot* slot = nullptr;
     const s32 result = acquire(channel, slot);
     if (result < 0) return result;
+    slot->api_callback = callback;
     transfer(channel, [slot] { return s32(slot->card->format()); });
-    return wait(channel);
+    return CARD_RESULT_READY;
+}
+
+s32 CARDFormat(s32 channel) {
+    const s32 result = CARDFormatAsync(channel, nullptr);
+    return result < 0 ? result : wait(channel);
+}
+
+// The channel's last result; CARD_RESULT_BUSY while a request runs.
+s32 CARDGetResultCode(s32 channel) {
+    if (channel < 0 || channel >= 2) return CARD_RESULT_FATAL_ERROR;
+    return cards().slots[channel].result;
 }
 
 s32 CARDFreeBlocks(s32 channel, s32* byteNotUsed, s32* filesNotUsed) {

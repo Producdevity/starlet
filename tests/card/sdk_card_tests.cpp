@@ -150,6 +150,8 @@ void fresh_card() {
     expect_result(CARDOpen(0, save_name, &info), CARD_RESULT_NOCARD, "open before mount");
     expect_result(CARDMount(0, work_area, nullptr), CARD_RESULT_READY, "mount");
     expect_result(CARDCheck(0), CARD_RESULT_READY, "check");
+    expect_result(CARDGetResultCode(0), CARD_RESULT_READY, "result code after check");
+    expect_result(CARDGetResultCode(1), CARD_RESULT_NOCARD, "slot B result code");
     free_space(0, 251, 127, "empty card");
     expect_result(CARDGetSerialNo(0, &first_serial), CARD_RESULT_READY, "serial");
     expect(!read_bytes(folder + "/card.txt").empty(), "card identity file");
@@ -453,7 +455,11 @@ void encoding_and_format() {
     CARDFileInfo info;
     expect_result(CARDOpen(0, save_name, &info), CARD_RESULT_BROKEN, "open on a Japanese card");
     expect_result(CARDFreeBlocks(0, nullptr, nullptr), CARD_RESULT_BROKEN, "free blocks on a Japanese card");
-    expect_result(CARDFormat(0), CARD_RESULT_READY, "format");
+    expect_result(CARDFormatAsync(0, nullptr), CARD_RESULT_READY, "format request");
+    expect_result(CARDGetResultCode(0), CARD_RESULT_BUSY, "busy while formatting");
+    expect_result(CARDFormat(0), CARD_RESULT_BUSY, "a second request while busy");
+    while (CARDGetResultCode(0) == CARD_RESULT_BUSY) OSYieldThread();
+    expect_result(CARDGetResultCode(0), CARD_RESULT_READY, "format");
     free_space(0, 251, 127, "formatted card");
     u64 serial = 0;
     expect_result(CARDGetSerialNo(0, &serial), CARD_RESULT_READY, "serial after format");
