@@ -98,13 +98,13 @@ BP change.
 
 ## Fast commands
 
-NOP runs, plain BP writes (both TEV banks), plain CP writes and XF matrix-memory writes of
-up to 16 words are most commands. `fast_command` applies them directly, with the general
+NOP runs, plain BP writes (both TEV banks), plain CP writes and XF writes of up to 16 words
+(memory and registers) are most commands. `fast_command` applies them directly, with the general
 path's state, revisions and `bp_write` callbacks, at the stream's top level and inside
 display lists; games such as Pikmin 2 send most of their material and shape state through
 lists (about 590 KB of list bytes per title frame). A list's bytes are charged when the
 list is called, so commands inside it charge only their count. Anything else (TLUT loads,
-texture-cache invalidation, masked writes, XF registers, indexed loads, primitives, host
+texture-cache invalidation, masked writes, indexed loads, primitives, host
 opcodes) or a limit takes the general path. `Decoder::counts()` reports how many commands
 each path took, by opcode for the general path.
 

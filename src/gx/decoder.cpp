@@ -226,23 +226,10 @@ Decoder::Fast Decoder::fast_command(const std::uint8_t* p, std::size_t remaining
     if (p[0] == 0x10 && room && fast_xf_ && remaining >= 5 && p[1] == 0 && p[2] < 16) {
         const std::size_t count = std::size_t{p[2]} + 1, size = 5 + count * 4;
         const auto address = be16(p + 3);
-        if (remaining >= size && address + count <= 0x1000 && (!stream || limits_.max_expanded_bytes - budget.bytes >= size)) {
-            auto* xf = state_.xf_.data() + address;
-            bool changed = false;
-            for (std::size_t i = 0; i < count; ++i) {
-                const auto word = be32(p + 5 + i * 4);
-                changed |= xf[i] != word;
-                xf[i] = word;
-            }
+        if (remaining >= size && address + count <= State::xf_words && (!stream || limits_.max_expanded_bytes - budget.bytes >= size)) {
+            apply_xf(address, p + 5, count);
             charge(size);
             ++counts_.fast_xf;
-            if (changed) {
-                ++state_.revision_;
-                ++state_.xf_memory_revision_;
-                state_.last_xf_memory_write_ = {state_.xf_memory_revision_, address, static_cast<std::uint16_t>(address + count)};
-                // Programs key on the GX_PTIDENTITY rows.
-                if (address < 0x600 && address + count > 0x5f4) ++state_.xf_register_revision_;
-            }
             consumed = size;
             return Fast::applied;
         }
@@ -262,6 +249,47 @@ Decoder::Fast Decoder::fast_command(const std::uint8_t* p, std::size_t remaining
         return Fast::applied;
     }
     return Fast::none;
+}
+
+void Decoder::apply_xf(std::size_t address, const std::uint8_t* words, std::size_t count) {
+    bool memory_changed = false, register_changed = false;
+    auto* xf = state_.xf_.data() + address;
+    const std::size_t memory_words = address < 0x1000 ? std::min<std::size_t>(count, 0x1000 - address) : 0;
+    for (std::size_t i = 0; i < memory_words; ++i) {
+        const auto word = be32(words + i * 4);
+        memory_changed |= xf[i] != word;
+        xf[i] = word;
+    }
+    for (std::size_t i = memory_words; i < count; ++i) {
+        const auto word = be32(words + i * 4);
+        // Indexed draws latch their last vertex's matrix indices without touching
+        // the register image, so a rewrite of the same value still restores them.
+        if (address + i == 0x1018 || address + i == 0x1019) {
+            const unsigned first = address + i == 0x1018 ? 0 : 5;
+            const unsigned latch_count = first == 0 ? 5 : 4;
+            bool latched = false;
+            for (unsigned m = 0; m < latch_count; ++m) {
+                const auto value = static_cast<std::uint8_t>((word >> (6 * m)) & 63);
+                latched |= state_.matrix_indices_[first + m] != value;
+                state_.matrix_indices_[first + m] = value;
+            }
+            if (latched) {
+                ++state_.revision_;
+                ++state_.matrix_index_revision_;
+            }
+        }
+        register_changed |= xf[i] != word;
+        xf[i] = word;
+    }
+    // Programs key on the GX_PTIDENTITY rows, so writes there act on registers too.
+    if (memory_changed && address < 0x600 && address + count > 0x5f4) register_changed = true;
+    if (memory_changed || register_changed) ++state_.revision_;
+    if (memory_changed) {
+        ++state_.xf_memory_revision_;
+        state_.last_xf_memory_write_ = {state_.xf_memory_revision_, static_cast<std::uint16_t>(address),
+            static_cast<std::uint16_t>(std::min<std::size_t>(address + count, 0x1000))};
+    }
+    if (register_changed) ++state_.xf_register_revision_;
 }
 
 bool Decoder::parse_list(ByteView bytes, unsigned depth, Budget& budget) {
@@ -466,45 +494,7 @@ Decoder::Parse Decoder::command(ByteView input, std::size_t& consumed, unsigned 
         if (address >= State::xf_words || count > State::xf_words - address) {
             ok = fail(Error::invalid_xf_range, "GX XF transfer exceeds state memory");
         } else {
-            bool memory_changed = false, register_changed = false;
-            const auto* words = input.data + 5;
-            auto* xf = state_.xf_.data() + address;
-            const std::size_t memory_words = address < 0x1000 ? std::min<std::size_t>(count, 0x1000 - address) : 0;
-            for (std::size_t i = 0; i < memory_words; ++i) {
-                const auto word = be32(words + i * 4);
-                memory_changed |= xf[i] != word;
-                xf[i] = word;
-            }
-            for (std::size_t i = memory_words; i < count; ++i) {
-                const auto word = be32(words + i * 4);
-                // Indexed draws latch their last vertex's matrix indices without touching
-                // the register image, so a rewrite of the same value still restores them.
-                if (address + i == 0x1018 || address + i == 0x1019) {
-                    const unsigned first = address + i == 0x1018 ? 0 : 5;
-                    const unsigned count = first == 0 ? 5 : 4;
-                    bool latched = false;
-                    for (unsigned m = 0; m < count; ++m) {
-                        const auto value = static_cast<std::uint8_t>((word >> (6 * m)) & 63);
-                        latched |= state_.matrix_indices_[first + m] != value;
-                        state_.matrix_indices_[first + m] = value;
-                    }
-                    if (latched) {
-                        ++state_.revision_;
-                        ++state_.matrix_index_revision_;
-                    }
-                }
-                register_changed |= xf[i] != word;
-                xf[i] = word;
-            }
-            // Programs key on the GX_PTIDENTITY rows, so writes there act on registers too.
-            if (memory_changed && address < 0x600 && address + count > 0x5f4) register_changed = true;
-            if (memory_changed || register_changed) ++state_.revision_;
-            if (memory_changed) {
-                ++state_.xf_memory_revision_;
-                state_.last_xf_memory_write_ = {state_.xf_memory_revision_, static_cast<std::uint16_t>(address),
-                    static_cast<std::uint16_t>(std::min<std::size_t>(address + count, 0x1000))};
-            }
-            if (register_changed) ++state_.xf_register_revision_;
+            apply_xf(address, input.data + 5, count);
         }
     } else if (opcode == 0x20 || opcode == 0x28 || opcode == 0x30 || opcode == 0x38) {
         const auto word = be32(input.data + 1);

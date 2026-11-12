@@ -184,6 +184,8 @@ private:
     bool charge_list(std::size_t size, unsigned depth, Budget& budget);
     bool parse_list(ByteView bytes, unsigned depth, Budget& budget);
     bool apply_bp(std::uint32_t word);
+    // A transfer of count XF words from big-endian words, within State::xf_words.
+    void apply_xf(std::size_t address, const std::uint8_t* words, std::size_t count);
     bool load_palette(std::uint32_t control);
     bool read_memory(std::uint32_t address, std::uint8_t* destination, std::size_t size);
     bool fail(Error error, const char* message);
@@ -203,7 +205,7 @@ private:
     bool injecting_ = false;
     bool host_callback_ = false; // Inside host_command or filter_bp, where inject may run.
     // The feed loop and display lists apply NOP runs, these BP and CP writes and XF
-    // matrix-memory writes themselves (fast_command).
+    // writes themselves (fast_command).
     enum class Fast { none, applied, failed };
     Fast fast_command(const std::uint8_t* p, std::size_t remaining, unsigned depth, Budget& budget, std::size_t& consumed);
     bool fast_nop_ = false, fast_xf_ = false;
