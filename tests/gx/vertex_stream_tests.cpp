@@ -92,6 +92,7 @@ void compare(Fixture& f, const Draw& draw, std::uint32_t first_index, const std:
             require(!std::memcmp(out + format.texcoord_offset(t), v.texcoords[t].data(), 8), name + ": texcoord");
         std::array<std::uint32_t, 3> words{};
         for (unsigned m = 0; m < 9; ++m) words[m / 3] |= std::uint32_t{v.matrix_indices[m]} << ((m % 3) * 8);
+        words[0] |= std::uint32_t{transform_normal_row(v.matrix_indices[0])} << 24;
         if (format.matrices) require(!std::memcmp(out + format.matrix_offset(), words.data(), 12), name + ": matrices");
         else require(words == latches, name + ": matrix latches");
     }

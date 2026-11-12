@@ -51,8 +51,11 @@ struct TransformLight {
     TransformVector position{};
     TransformVector direction{}; // Already negated by GXInitLightDir.
 };
-// Exact std140 layout: all fields are vec4, with 80-byte light stride. No
-// native pointer, GX State, texture memory or vertex storage is retained.
+// All fields are vec4, with 80-byte light stride. No native pointer, GX State, texture
+// memory or vertex storage is retained. Three std140 blocks of generate_transform_glsl
+// lie in it at offsets every GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT divides: GXMatrices in its
+// full form (position then normal rows), GXPost and GXTransform (projection to
+// latched_normal). The viewport is for the CPU evaluator only.
 struct alignas(16) TransformUniforms {
     std::array<TransformVector, 64> position{};
     std::array<TransformVector, 32> normal{};
@@ -61,10 +64,18 @@ struct alignas(16) TransformUniforms {
     std::array<TransformVector, 2> ambient{}; // RGBA in 0..255.
     std::array<TransformVector, 2> material{};
     std::array<TransformLight, 8> lights{};
-    std::array<TransformVector, 2> viewport{}; // sx,sy,sz,ox / oy,oz,0,0.
     // Normal, binormal and tangent last received by the XF; see latest_normal.
     std::array<TransformVector, 3> latched_normal{};
+    std::array<TransformVector, 2> viewport{}; // sx,sy,sz,ox / oy,oz,0,0.
 };
+// GXMatrices: the rows a draw's matrix indices address, transform_matrix_rows vec4s. Its
+// full form is TransformUniforms' position rows (0-63) then its normal rows (64-95).
+inline constexpr unsigned transform_matrix_rows = 96;
+inline constexpr std::size_t transform_matrix_bytes = transform_matrix_rows * 16;
+inline constexpr std::size_t transform_post_offset = 96 * 16, transform_post_bytes = 64 * 16;
+inline constexpr std::size_t transform_shared_offset = 160 * 16, transform_shared_bytes = 49 * 16;
+// The GXMatrices row of the normal matrix in the full form, for position matrix row pn.
+inline constexpr unsigned transform_normal_row(unsigned pn) { return 64 + pn % 32; }
 struct TransformSnapshot {
     const TransformPipeline pipeline;
     const TransformUniforms uniforms;
@@ -113,6 +124,14 @@ unsigned transform_vertex_color_source(const TransformPipeline&, unsigned channe
 std::uint8_t transform_vertex_materials(TransformPipeline&);
 // The channels (bits RGB0, RGB1, A0, A1) whose material is the XF register, read as u_material.
 std::uint8_t transform_register_materials(const TransformPipeline&);
+// Whether the vertex stage reads the normal matrix: for lighting or an emboss texgen.
+bool transform_reads_normal_matrix(const TransformPipeline&);
+// The post-transform rows the vertex stage reads, as bits; nonzero declares GXPost.
+std::uint64_t transform_post_rows(const TransformPipeline&);
+// Writes into u's GXTransform fields the lanes the pipeline's vertex stage reads, from the
+// XF, except latched_normal; every other lane keeps its value. Blocks that differ only in
+// unread lanes then compare equal once both are built over the same previous block.
+void direct_transform_shared(const State&, const TransformPipeline&, TransformUniforms&);
 // Every XF matrix row, light and register value in the uniform layout, unvalidated.
 // Rows a draw consumes equal capture_transform's; the GPU evaluates the values as given.
 // Every byte of the block is written, unused lanes as zero, so it may be reused unreset.
@@ -167,9 +186,13 @@ struct TransformShader {
     std::string source;
     explicit operator bool() const { return static_cast<bool>(status); }
 };
-// Standalone GLES 3.1 vertex stage. std140 block GXTransform binding 0, layout
-// above. Inputs: pos=0, N/B/T=1..3, normalized RGBA=4..5, ST=6..13,
-// uvec3 packed matrix bytes=14 (PN,TEX0,TEX1 / TEX2..4 / TEX5..7).
+// Standalone GLES 3.1 vertex stage. std140 blocks, see TransformUniforms: GXTransform
+// binding 0 (projection, colours, lights, latched vectors), GXMatrices binding 2
+// (vec4 u_matrix[transform_matrix_rows]) and, when transform_post_rows is nonzero, GXPost
+// binding 3 (vec4 u_post[64]). Inputs: pos=0, N/B/T=1..3, normalized RGBA=4..5, ST=6..13,
+// uvec3 packed matrix bytes=14 (PN,TEX0,TEX1,NRM / TEX2..4 / TEX5..7): each a GXMatrices row,
+// NRM the first of the normal matrix (transform_normal_row(PN) in the full form). A
+// renderer may pack the rows a draw reads and give their packed rows instead.
 // Output names: gx_eye, gx_normal, gx_clip, gx_gles_clip, gx_color0/1,
 // gx_tex0..7. Inactive outputs are zero placeholders, not hardware defaults.
 // Submit captured vertices with matching uniforms. Capture does not prove the
@@ -188,7 +211,7 @@ struct TransformShader {
 // identity one) output vec2 gx_texN without it. compact: 16-bit colour outputs.
 // instanced: the draw's position matrix rows (pn..pn+2) and normal matrix rows come per
 // instance from GXInstances (binding 1), transform_instance_rows vec4s per instance:
-// three position rows, then three normal rows; everything else from GXTransform. Emboss
+// three position rows, then three normal rows; texgen rows from GXMatrices. Emboss
 // texgens (which read the normal matrix themselves) are rejected.
 // fog (batched only, type | orthographic << 3 as for fast_fragment_source, no range
 // adjustment): the vertex evaluates fast_fog_glsl at its own window depth into flat highp

@@ -134,6 +134,7 @@ void append_vertices(std::vector<GpuVertex>& destination, const VertexSnapshot& 
     for (const auto& v : source.vertices()) {
         GpuVertex gpu{v.position, v.normal, v.colors, v.texcoords, {}};
         for (unsigned i=0;i<9;++i) gpu.matrices[i/3] |= std::uint32_t(v.matrix_indices[i]) << ((i%3)*8);
+        gpu.matrices[0] |= std::uint32_t(transform_normal_row(v.matrix_indices[0] & 63u)) << 24;
         destination.push_back(gpu);
     }
 }
@@ -640,7 +641,7 @@ struct GlesRenderer::Impl {
             const auto block = glGetUniformBlockIndex(p.name, "GXTransform");
             if (block == GL_INVALID_INDEX) throw std::runtime_error("missing GX transform uniform block");
             GLint size = 0; glGetActiveUniformBlockiv(p.name, block, GL_UNIFORM_BLOCK_DATA_SIZE, &size);
-            if (size > sizeof(TransformUniforms)) throw std::runtime_error("GX uniform block layout mismatch");
+            if (size > GLint(transform_shared_bytes)) throw std::runtime_error("GX uniform block layout mismatch");
             glUniformBlockBinding(p.name, block, 0); glUseProgram(p.name);
             auto location = [&](const std::string& name) { return glGetUniformLocation(p.name, name.c_str()); };
             for (unsigned i = 0; i < 4; ++i) {
@@ -1524,7 +1525,10 @@ void GlesRenderer::Impl::submit(const DrawPacket& packet,const GlesDrawPipeline&
             glBufferData(GL_UNIFORM_BUFFER, sizeof(TransformUniforms), &packet.transform->uniforms, GL_STREAM_DRAW);
             g.uploaded_transform = packet.transform->uniforms; g.transform_uploaded = true;
         }
-        glBindBufferBase(GL_UNIFORM_BUFFER, 0, g.ubo);
+        // The snapshot holds every block at an offset any uniform buffer alignment divides.
+        glBindBufferRange(GL_UNIFORM_BUFFER, 0, g.ubo, transform_shared_offset, transform_shared_bytes);
+        glBindBufferRange(GL_UNIFORM_BUFFER, 2, g.ubo, 0, transform_matrix_bytes);
+        glBindBufferRange(GL_UNIFORM_BUFFER, 3, g.ubo, transform_post_offset, transform_post_bytes);
         for (unsigned i = 0; i < 4; ++i) {
             const auto& r = packet.tev->uniforms.registers[i]; const auto& k = packet.tev->uniforms.konst[i];
             if (program.registers[i].update(r)) glUniform4i(program.registers[i].location, r[0], r[1], r[2], r[3]);

@@ -50,6 +50,10 @@ unsigned instanced_draws = 0, instance_count = 0;
 GLintptr instance_offset = 0;
 GLsizeiptr instance_size = 0;
 std::vector<unsigned char> uniform_bytes;
+// The last uniform buffer range bound at each index, and the last constant matrix indices.
+std::map<GLuint, std::pair<GLintptr, GLsizeiptr>> uniform_bindings;
+std::array<GLuint, 4> matrix_latches{};
+GLint uniform_alignment = 0;
 GLsizeiptr element_bytes = 0;
 unsigned uploads = 0, draws = 0, draw_first = 0, sampler_seen = 0, pack_seen = 0, unpack_seen = 0, pack_pbo_seen = 0,
          unpack_pbo_seen = 0;
@@ -104,11 +108,12 @@ GLboolean glUnmapBuffer(GLenum) { return GL_TRUE; }
 void glFlush() {}
 void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
     ++fake::uniform_ranges;
+    fake::uniform_bindings[index] = {offset, size};
     if (index == 1) { fake::instance_offset = offset; fake::instance_size = size; }
 }
 void glDisableVertexAttribArray(GLuint index) {}
 void glVertexAttrib4f(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {}
-void glVertexAttribI4ui(GLuint index, GLuint x, GLuint y, GLuint z, GLuint w) {}
+void glVertexAttribI4ui(GLuint index, GLuint x, GLuint y, GLuint z, GLuint w) { if (index == 14) fake::matrix_latches = {x, y, z, w}; }
 void glBindFramebuffer(GLenum target, GLuint framebuffer) {
     if (target != GL_READ_FRAMEBUFFER) fake::framebuffer = framebuffer;
     if (target != GL_DRAW_FRAMEBUFFER) fake::read_framebuffer = framebuffer;
@@ -211,7 +216,7 @@ void glGenVertexArrays(GLsizei n, GLuint *arrays) {
         arrays[i] = ++fake::next;
 }
 void glGetActiveUniformBlockiv(GLuint program, GLuint uniformBlockIndex, GLenum pname, GLint *params) {
-    *params = sizeof(starlet::gx::TransformUniforms);
+    *params = static_cast<GLint>(starlet::gx::transform_shared_bytes);
 }
 GLenum glGetError(void) {
     auto e = fake::error;
@@ -237,6 +242,9 @@ void glGetIntegerv(GLenum pname, GLint *data) {
         break;
     case GL_READ_FRAMEBUFFER_BINDING:
         *data = GLint(fake::read_framebuffer);
+        break;
+    case GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT:
+        *data = fake::uniform_alignment;
         break;
     case GL_MAX_VIEWPORT_DIMS:
         data[0] = 16384;

@@ -323,11 +323,21 @@ struct GlesDirect::Impl {
         std::uint32_t index_offset = 0;
         bool short_indices = false;
     };
+    // Offsets of a draw's GXMatrices, GXTransform and GXPost blocks in the segment's
+    // uniforms; post is no_block for programs without GXPost.
+    static constexpr std::uint32_t no_block = ~0u;
+    struct Blocks {
+        std::uint32_t matrices = 0, shared = 0, post = no_block;
+        bool operator==(const Blocks& o) const { return matrices == o.matrices && shared == o.shared && post == o.post; }
+        bool operator!=(const Blocks& o) const { return !(*this == o); }
+    };
     struct Record {
         Program* program;
         bool resident; // Draws geometry instead of the segment run.
         GeometryDraw geometry;
-        std::uint32_t state, uniform, run, first, count, low, high;
+        std::uint32_t state;
+        Blocks blocks;
+        std::uint32_t run, first, count, low, high;
         std::array<GLuint, 8> textures, samplers;
         std::array<std::uint32_t, 3> latches;
         // Instanced records: instance count and the offset of their rows in the segment's uniforms.
@@ -398,7 +408,19 @@ struct GlesDirect::Impl {
     std::vector<Crop> crops;
     std::vector<std::uint8_t> vertices, scratch;
     UniformBytes uniforms;
-    TransformUniforms transform_block;
+    // Bytes the bound GXMatrices ranges reach: a packed block is bound at its declared size
+    // over whatever follows it, so the segment's uniforms are padded to this on flush.
+    std::size_t uniform_reach = 0;
+    // The draw's GXMatrices rows, packed (pack_matrix_rows) or in the full form.
+    std::array<TransformVector, transform_matrix_rows> draw_rows{};
+    unsigned draw_row_count = 0;
+    // GXTransform and GXPost as last appended (its other fields unused); a draw's blocks start
+    // as copies of them, so lanes its program does not read never differ.
+    TransformUniforms shared_block{}, built_block{};
+    struct { bool valid = false; std::uint64_t segment = 0; unsigned count = 0; std::uint32_t offset = 0; } last_matrices;
+    struct { bool valid = false; std::uint64_t segment = 0, registers = 0, lights = 0, latch = 0; const Program* program = nullptr;
+             std::uint32_t offset = 0; } last_shared;
+    struct { bool valid = false; std::uint64_t segment = 0, lights = 0, rows = 0; std::uint32_t offset = 0; } last_post;
     std::vector<std::uint32_t> indices, words;
     std::vector<Record> records;
     std::vector<DirectDrawState> states;
@@ -410,7 +432,8 @@ struct GlesDirect::Impl {
              Program* program = nullptr; std::uint8_t latch = 0; } last_program;
     struct { bool valid = false; std::uint64_t bp = 0; std::uint32_t word = 0; } last_registers;
     struct { bool valid = false; std::uint64_t bp = 0, xf = 0, segment = 0; const Program* program = nullptr; std::uint32_t index = 0; } last_state;
-    struct { bool valid = false; std::uint64_t memory = 0, registers = 0, segment = 0, latch = 0; std::uint32_t offset = 0; } last_uniform;
+    struct { bool valid = false; std::uint64_t memory = 0, registers = 0, indices = 0, segment = 0, latch = 0; const Program* program = nullptr;
+             bool full = false; Blocks blocks; std::array<std::uint32_t, 3> latches{}; } last_uniform;
     // The XF's latched normal, binormal and tangent: components held (0, 3 or 9), values and
     // a revision that changes with them.
     std::uint8_t latch_components = 0;
@@ -490,11 +513,111 @@ struct GlesDirect::Impl {
             if (palette_generation(state, planned.textures[map]) != batch_inputs.palettes[map]) return false;
         return true;
     }
-    // keep: the position rows the program's texgens read; every other position row, the normal
-    // matrices and the material lanes no register-material channel reads are zero in the block.
-    struct { bool valid = false; std::uint64_t memory = 0, registers = 0, segment = 0, keep = 0; std::uint32_t offset = 0;
-             const Program* program = nullptr; } batch_uniform;
-    TransformUniforms batch_block;
+    std::uint32_t append_block(const void* data, std::size_t bytes, std::size_t declared) {
+        const auto offset = (uniforms.size() + uniform_alignment - 1) / uniform_alignment * uniform_alignment;
+        uniforms.resize(offset + bytes);
+        std::memcpy(uniforms.data() + offset, data, bytes);
+        uniform_reach = std::max(uniform_reach, offset + declared);
+        return static_cast<std::uint32_t>(offset);
+    }
+    // The rows a draw with the XF's matrix indices reads, packed: its position matrix (unless
+    // batched, which transforms positions on the CPU), its normal matrix when read, then each
+    // texgen's rows, shared by texgens of the same rows. latches name the packed rows.
+    void pack_matrix_rows(const State& state, const TransformPipeline& t, bool batched, std::array<std::uint32_t, 3>& latches) {
+        const auto* xf = state.xf_data();
+        unsigned n = 0;
+        latches = {};
+        if (!batched) {
+            const unsigned pn = state.matrix_index(0);
+            std::memcpy(draw_rows[0].data(), xf + pn * 4, 48);
+            n = 3;
+            if (transform_reads_normal_matrix(t)) {
+                latches[0] = 3u << 24;
+                for (unsigned k = 0; k < 3; ++k, ++n) {
+                    std::memcpy(draw_rows[n].data(), xf + 0x400 + (pn % 32 + k) * 3, 12);
+                    draw_rows[n][3] = 0.0f;
+                }
+            }
+        }
+        std::array<std::uint8_t, 8> base{}, rows{};
+        for (unsigned i = 0; i < t.texgen_count; ++i) {
+            if (t.texgens[i].type != 0) continue;
+            const unsigned row = state.matrix_index(static_cast<std::uint8_t>(1 + i)), count = t.texgens[i].projected ? 3 : 2;
+            rows[i] = static_cast<std::uint8_t>(count);
+            base[i] = static_cast<std::uint8_t>(n);
+            for (unsigned j = 0; j < i; ++j)
+                if (rows[j] >= count && state.matrix_index(static_cast<std::uint8_t>(1 + j)) == row) { base[i] = base[j]; break; }
+            if (base[i] == n) { std::memcpy(draw_rows[n].data(), xf + row * 4, count * 16); n += count; }
+            latches[(i + 1) / 3] |= std::uint32_t{base[i]} << ((i + 1) % 3 * 8);
+        }
+        draw_row_count = n;
+    }
+    // The full form, for vertices that carry their own matrix indices.
+    void full_matrix_rows(const State& state) {
+        const auto* xf = state.xf_data();
+        std::memcpy(draw_rows.data(), xf, 64 * 16);
+        for (unsigned i = 0; i < 32; ++i) { std::memcpy(draw_rows[64 + i].data(), xf + 0x400 + i * 3, 12); draw_rows[64 + i][3] = 0.0f; }
+        draw_row_count = transform_matrix_rows;
+    }
+    // The draw's rows as a GXMatrices block, the previous block when equal. A draw without
+    // rows binds offset 0, inside the padded uniforms.
+    std::uint32_t matrix_block() {
+        if (!draw_row_count) { uniform_reach = std::max(uniform_reach, transform_matrix_bytes); return 0; }
+        const std::size_t bytes = std::size_t{draw_row_count} * 16;
+        if (last_matrices.valid && last_matrices.segment == segment && last_matrices.count == draw_row_count &&
+            !std::memcmp(uniforms.data() + last_matrices.offset, draw_rows.data(), bytes))
+            return last_matrices.offset;
+        const auto offset = append_block(draw_rows.data(), bytes, transform_matrix_bytes);
+        last_matrices = {true, segment, draw_row_count, offset};
+        ++stats.uniform_blocks;
+        return offset;
+    }
+    // GXTransform with what the program reads; appended only when that differs from the last.
+    std::uint32_t shared_offset(const State& state, const Program& p, std::uint64_t latch_used) {
+        if (last_shared.valid && last_shared.segment == segment && last_shared.program == &p &&
+            last_shared.registers == state.xf_register_revision() && last_shared.lights == state.xf_post_light_revision() &&
+            last_shared.latch == latch_used)
+            return last_shared.offset;
+        auto* built = reinterpret_cast<std::uint8_t*>(&built_block) + transform_shared_offset;
+        auto* current = reinterpret_cast<std::uint8_t*>(&shared_block) + transform_shared_offset;
+        std::memcpy(built, current, transform_shared_bytes);
+        direct_transform_shared(state, p.plan->transform, built_block);
+        if (latch_used)
+            for (unsigned k = 0; k < 9; ++k) built_block.latched_normal[k / 3][k % 3] = latch[k];
+        std::uint32_t offset = last_shared.offset;
+        if (!(last_shared.valid && last_shared.segment == segment && !std::memcmp(built, current, transform_shared_bytes))) {
+            std::memcpy(current, built, transform_shared_bytes);
+            offset = append_block(built, transform_shared_bytes, transform_shared_bytes);
+            ++stats.shared_blocks;
+        }
+        last_shared = {true, segment, state.xf_register_revision(), state.xf_post_light_revision(), latch_used, &p, offset};
+        return offset;
+    }
+    // GXPost for programs that declare it, likewise.
+    std::uint32_t post_offset(const State& state, const Program& p) {
+        const auto rows = transform_post_rows(p.plan->transform);
+        if (!rows) return no_block;
+        if (last_post.valid && last_post.segment == segment && last_post.rows == rows && last_post.lights == state.xf_post_light_revision())
+            return last_post.offset;
+        const auto* xf = state.xf_data();
+        built_block.post = shared_block.post;
+        for (unsigned row = 0; row < 64; ++row)
+            if ((rows >> row) & 1) std::memcpy(built_block.post[row].data(), xf + 0x500 + row * 4, 16);
+        std::uint32_t offset = last_post.offset;
+        if (!(last_post.valid && last_post.segment == segment &&
+              !std::memcmp(built_block.post.data(), shared_block.post.data(), transform_post_bytes))) {
+            shared_block.post = built_block.post;
+            offset = append_block(shared_block.post.data(), transform_post_bytes, transform_post_bytes);
+            ++stats.shared_blocks;
+        }
+        last_post = {true, segment, state.xf_post_light_revision(), rows, offset};
+        return offset;
+    }
+    // An evicted program's address may come back.
+    void forget_program(const Program* p) {
+        if (last_uniform.program == p) last_uniform.valid = false;
+        if (last_shared.program == p) last_shared.valid = false;
+    }
     std::vector<std::uint8_t> batch_vertices, expansion;
     void textures_changed() { last_textures.valid = false; batch.valid = false; }
     GLuint vao = 0, vbo = 0, ibo = 0, ubo = 0;
@@ -696,37 +819,27 @@ struct GlesDirect::Impl {
         base.instanced->used = ++sequence; base.instanced->segment = segment;
         return base.instanced;
     }
-    // The block bytes outside the instanced rows: position rows pn..pn+2 and normal rows
-    // pn % 32 .. +2 (which the shader reads at those indices even past the normal array).
-    static bool same_outside_instance_rows(const std::uint8_t* a, const std::uint8_t* b, unsigned pn) {
-        const std::size_t position = std::size_t{pn} * 16, normal = offsetof(TransformUniforms, normal) + std::size_t{pn % 32} * 16;
-        const std::size_t first = std::min(position, normal), second = std::max(position, normal);
-        if (std::memcmp(a, b, first)) return false;
-        if (std::memcmp(a + first + 48, b + first + 48, second - first - 48)) return false;
-        return !std::memcmp(a + second + 48, b + second + 48, sizeof(TransformUniforms) - second - 48);
-    }
-    void append_instance_rows(const std::uint8_t* block, unsigned pn) {
+    // Packed rows (pack_matrix_rows): the position matrix, then the normal matrix when read.
+    void append_instance_rows(const TransformVector* rows, bool normal) {
         const auto at = uniforms.size();
         uniforms.resize(at + transform_instance_rows * 16);
-        std::memcpy(uniforms.data() + at, block + std::size_t{pn} * 16, 48);
-        std::memcpy(uniforms.data() + at + 48, block + offsetof(TransformUniforms, normal) + std::size_t{pn % 32} * 16, 48);
+        std::memcpy(uniforms.data() + at, rows, 48);
+        if (normal) std::memcpy(uniforms.data() + at + 48, rows + 3, 48);
+        else std::memset(uniforms.data() + at + 48, 0, 48);
     }
     // Adds the draw as an instance of the previous record when both draw the same resident
-    // geometry with the same program, state, textures and latches, and their transform
-    // blocks differ only in the draw's position and normal matrix. The previous record
-    // becomes an instanced draw of the program's instanced variant on its first join.
+    // geometry with the same program, state, textures, latches and GXTransform and GXPost
+    // blocks, and their packed rows differ only in the position and normal matrix. The
+    // previous record becomes an instanced draw of the program's instanced variant on its
+    // first join. The draw's rows are in draw_rows.
     struct { bool open = false; std::uint32_t record = 0, base = 0; unsigned pn = 0; } instance_group;
     bool join_instances(Program& p, const State& state, const Draw& draw, const GeometryDraw& geometry, std::uint32_t count,
-                        std::uint32_t low, std::uint32_t high, const std::array<std::uint32_t, 3>& latches) {
+                        std::uint32_t low, std::uint32_t high, const std::array<std::uint32_t, 3>& latches, const Blocks& blocks) {
         if (!p.instanceable || records.empty() || geometry.format.matrices) return false;
         const unsigned pn = state.matrix_index(0);
         if (pn > 61) return false;
-        const auto& transform = p.plan->transform;
-        for (unsigned i = 0; i < transform.texgen_count; ++i) {
-            if (transform.texgens[i].type >= 2) continue;
-            const unsigned row = state.matrix_index(static_cast<std::uint8_t>(1 + i));
-            if (row + 3 > pn && row < pn + 3) return false;
-        }
+        const bool normal = transform_reads_normal_matrix(p.plan->transform);
+        const unsigned instance_rows = normal ? 6 : 3;
         auto& last = records.back();
         const auto index = static_cast<std::uint32_t>(records.size() - 1);
         const bool grouped = instance_group.open && instance_group.record == index;
@@ -737,28 +850,32 @@ struct GlesDirect::Impl {
             last.textures != last_textures.textures || last.samplers != last_textures.samplers || last.latches != latches ||
             last.geometry.buffer != geometry.buffer || last.geometry.base_vertex != geometry.base_vertex ||
             last.geometry.index_offset != geometry.index_offset || last.geometry.short_indices != geometry.short_indices ||
-            last.geometry.format != geometry.format || last.count != count || last.low != low || last.high != high)
+            last.geometry.format != geometry.format || last.count != count || last.low != low || last.high != high ||
+            last.blocks.shared != blocks.shared || last.blocks.post != blocks.post)
             return false;
         if (grouped && (instance_group.pn != pn || last.instances >= transform_instance_limit ||
                         uniforms.size() != std::size_t{last.instance_offset} + std::size_t{last.instances} * transform_instance_rows * 16))
             return false;
-        if (!grouped && (last.instances || last.uniform + sizeof(TransformUniforms) > uniforms.size())) return false;
-        const auto* base = uniforms.data() + (grouped ? instance_group.base : last.uniform);
-        const auto* block = reinterpret_cast<const std::uint8_t*>(&transform_block);
-        if (!same_outside_instance_rows(base, block, pn)) return false;
+        const std::size_t bytes = std::size_t{draw_row_count} * 16;
+        if (!grouped && (last.instances || last.blocks.matrices + bytes > uniforms.size())) return false;
+        // The same program and latches pack the same rows; the texgen rows must match.
+        const auto* base = uniforms.data() + (grouped ? instance_group.base : last.blocks.matrices);
+        if (std::memcmp(base + instance_rows * 16, draw_rows.data() + instance_rows, bytes - instance_rows * 16)) return false;
         if (!grouped) {
             Program* variant = instanced_program(p, state, draw);
             if (!variant) return false;
             // The first instance's rows come from its own block.
             const auto first = (uniforms.size() + uniform_alignment - 1) / uniform_alignment * uniform_alignment;
             uniforms.resize(first);
-            instance_group = {true, index, last.uniform, pn};
+            instance_group = {true, index, last.blocks.matrices, pn};
             last.program = variant;
             last.instance_offset = static_cast<std::uint32_t>(first);
             last.instances = 1;
-            append_instance_rows(uniforms.data() + last.uniform, pn);
+            std::array<TransformVector, 6> first_rows;
+            std::memcpy(first_rows.data(), uniforms.data() + last.blocks.matrices, instance_rows * 16);
+            append_instance_rows(first_rows.data(), normal);
         }
-        append_instance_rows(block, pn);
+        append_instance_rows(draw_rows.data(), normal);
         ++last.instances;
         ++stats.draws; ++stats.instanced_draws;
         if (last_state.index != last.state && last_state.index + 1 == states.size()) {
@@ -885,7 +1002,7 @@ struct GlesDirect::Impl {
                 if (other->instanced == oldest->get()) other->instanced = nullptr;
             }
             if (batch.program == oldest->get()) batch.valid = false;
-            if (batch_uniform.program == oldest->get()) batch_uniform.valid = false;
+            forget_program(oldest->get());
             // Queued segments may still draw with it; the GL thread deletes it after them.
             std::shared_ptr<Program> retired(oldest->release());
             retiring.push_back([retired] { if (retired->name) glDeleteProgram(retired->name); });
@@ -1790,49 +1907,11 @@ struct GlesDirect::Impl {
                      batched_zero_alpha_exact(*p->plan, planned) ? batched_zero_alpha : 0u};
             record_batch_inputs(state, *p, planned);
         }
-        const auto& batched_transform = p->plan->transform;
-        std::uint64_t keep = 0;
-        for (unsigned i = 0; i < batched_transform.texgen_count; ++i) {
-            const auto& t = batched_transform.texgens[i];
-            if (t.type != 0) continue;
-            const unsigned row = state.matrix_index(static_cast<std::uint8_t>(1 + i));
-            for (unsigned k = 0; k < (t.projected ? 3u : 2u) && row + k < 64; ++k) keep |= std::uint64_t{1} << (row + k);
-        }
-        // One XF memory write confined to words the block zeroes or does not hold keeps it valid.
-        const auto write = state.last_xf_memory_write();
-        if (batch_uniform.valid && batch_uniform.program == p && batch_uniform.keep == keep && write.revision == state.xf_memory_revision() &&
-            batch_uniform.memory + 1 == write.revision) {
-            bool unread = true;
-            for (unsigned w = write.first; w < write.end && unread; ++w)
-                unread = w < 0x100 ? !((keep >> (w / 4)) & 1) : w < 0x500;
-            if (unread) batch_uniform.memory = write.revision;
-        }
-        if (!(batch_uniform.valid && batch_uniform.program == p && batch_uniform.keep == keep &&
-              batch_uniform.memory == state.xf_memory_revision() && batch_uniform.registers == state.xf_register_revision() &&
-              batch_uniform.segment == segment)) {
-            TransformUniforms block;
-            direct_transform_uniforms(state, block);
-            // Batched programs read no normal matrix, no position row but their texgens' and
-            // only the material lanes of channels with a register material.
-            for (unsigned row = 0; row < 64; ++row) if (!((keep >> row) & 1)) block.position[row] = {};
-            block.normal = {};
-            const auto register_materials = transform_register_materials(batched_transform);
-            for (unsigned i = 0; i < 4; ++i) if (!(register_materials & (1u << i))) {
-                auto& material = block.material[i % 2];
-                if (i < 2) material[0] = material[1] = material[2] = 0; else material[3] = 0;
-            }
-            if (!(batch_uniform.valid && batch_uniform.segment == segment && !std::memcmp(&block, &batch_block, sizeof block))) {
-                const auto offset = (uniforms.size() + uniform_alignment - 1) / uniform_alignment * uniform_alignment;
-                uniforms.resize(offset + sizeof block);
-                std::memcpy(uniforms.data() + offset, &block, sizeof block);
-                batch_block = block;
-                batch_uniform.offset = static_cast<std::uint32_t>(offset);
-                ++stats.uniform_blocks;
-            }
-            batch_uniform.valid = true; batch_uniform.memory = state.xf_memory_revision();
-            batch_uniform.registers = state.xf_register_revision(); batch_uniform.segment = segment;
-            batch_uniform.keep = keep; batch_uniform.program = p;
-        }
+        // Batched programs read no position or normal matrix, and only the material lanes of
+        // channels with a register material: blocks that differ elsewhere are shared.
+        std::array<std::uint32_t, 3> latches;
+        pack_matrix_rows(state, p->plan->transform, true, latches);
+        const Blocks blocks{matrix_block(), shared_offset(state, *p, 0), post_offset(state, *p)};
         // The batched vertex: eye position, colours, texture coordinates, TEV registers. Normals
         // are dropped; with vertex materials, colour c holds what channel c reads, its register
         // material parts written over it.
@@ -1924,11 +2003,8 @@ struct GlesDirect::Impl {
         ++stats.draws; ++stats.batched_draws;
         if (batch.options & batched_zero_alpha) ++stats.zero_alpha_draws;
         if (one_depth) ++stats.vertex_fog_draws;
-        auto latches = stream_matrix_latches(state);
-        latches[0] &= ~0xffu; // The PN row is unused.
         if (added_indices) push_record(*drawn, nullptr, static_cast<std::uint32_t>(indices.size() - added_indices), added_indices,
-                                       low, low + added - 1, latches, batch.state, batch_uniform.offset,
-                                       batch.textures, batch.samplers);
+                                       low, low + added - 1, latches, batch.state, blocks, batch.textures, batch.samplers);
         check_segment();
         return true;
     }
@@ -1984,13 +2060,19 @@ struct GlesDirect::Impl {
         }
         if (p.plan->transform.latched_normal) resolve_latch();
         const std::uint64_t latch_used = p.plan->transform.latched_normal ? latch_revision + 1 : 0;
+        const bool full = format.matrices;
         const bool uniform_current = last_uniform.valid && last_uniform.memory == state.xf_memory_revision() &&
-                                     last_uniform.registers == state.xf_register_revision() && last_uniform.segment == segment &&
-                                     last_uniform.latch == latch_used;
-        if (!uniform_current) {
-            direct_transform_uniforms(state, transform_block);
-            if (latch_used)
-                for (unsigned k = 0; k < 9; ++k) transform_block.latched_normal[k / 3][k % 3] = latch[k];
+                                     last_uniform.registers == state.xf_register_revision() &&
+                                     last_uniform.indices == state.matrix_index_revision() && last_uniform.segment == segment &&
+                                     last_uniform.latch == latch_used && last_uniform.program == &p && last_uniform.full == full;
+        Blocks blocks;
+        std::array<std::uint32_t, 3> latches{};
+        if (uniform_current) { blocks = last_uniform.blocks; latches = last_uniform.latches; }
+        else {
+            if (full) full_matrix_rows(state);
+            else pack_matrix_rows(state, p.plan->transform, false, latches);
+            blocks.shared = shared_offset(state, p, latch_used);
+            blocks.post = post_offset(state, p);
         }
         const auto& planned = states[last_state.index];
         if (limits.verify_textures || !(last_textures.valid && last_textures.bp == state.bp_revision() &&
@@ -2004,22 +2086,18 @@ struct GlesDirect::Impl {
             last_textures.valid = true; last_textures.bp = state.bp_revision(); last_textures.segment = segment;
             last_textures.frame = frame; last_textures.program = &p;
         }
-        const auto latches = format.matrices ? std::array<std::uint32_t, 3>{} : stream_matrix_latches(state);
         // A matrix change alone on resident geometry: an instance of the previous draw.
         if (!uniform_current && cached && cached->clusters.empty()) {
             const GeometryDraw resident{cached->buffer, cached->format, cached->base_vertex, cached->index_offset, cached->short_indices};
-            if (join_instances(p, state, draw, resident, cached->index_count, 0, cached->vertex_count - 1, latches)) {
+            if (join_instances(p, state, draw, resident, cached->index_count, 0, cached->vertex_count - 1, latches, blocks)) {
                 last_uniform.valid = false;
                 return check_segment();
             }
         }
         if (!uniform_current) {
-            const auto offset = (uniforms.size() + uniform_alignment - 1) / uniform_alignment * uniform_alignment;
-            uniforms.resize(offset + sizeof(TransformUniforms));
-            std::memcpy(uniforms.data() + offset, &transform_block, sizeof transform_block);
-            last_uniform = {true, state.xf_memory_revision(), state.xf_register_revision(), segment, latch_used,
-                            static_cast<std::uint32_t>(offset)};
-            ++stats.uniform_blocks;
+            blocks.matrices = matrix_block();
+            last_uniform = {true, state.xf_memory_revision(), state.xf_register_revision(), state.matrix_index_revision(), segment,
+                            latch_used, &p, full, blocks, latches};
         }
         if (runs.empty() || runs.back().format != format) {
             const auto base = (vertices.size() + 15) & ~std::size_t{15};
@@ -2045,7 +2123,7 @@ struct GlesDirect::Impl {
                     stats.vertex_bytes += std::size_t{count} * format.stride;
                     ++stats.draws;
                     if (converted.indices) push_record(p, nullptr, first, converted.indices, low, low + count - 1, latches,
-                                                       last_state.index, last_uniform.offset, last_textures.textures, last_textures.samplers);
+                                                       last_state.index, blocks, last_textures.textures, last_textures.samplers);
                     return check_segment();
                 }
             }
@@ -2055,7 +2133,7 @@ struct GlesDirect::Impl {
             auto push = [&](std::uint32_t first, std::uint32_t count, std::uint32_t low, std::uint32_t high) {
                 auto part = resident;
                 part.index_offset += first * (g->short_indices ? 2 : 4);
-                records.push_back({&p, true, part, last_state.index, last_uniform.offset, 0, 0, count, low, high,
+                records.push_back({&p, true, part, last_state.index, blocks, 0, 0, count, low, high,
                                    last_textures.textures, last_textures.samplers, latches});
             };
             if (g->clusters.empty()) push(0, g->index_count, 0, g->vertex_count - 1);
@@ -2097,17 +2175,17 @@ struct GlesDirect::Impl {
         stats.vertex_bytes += std::size_t{result.vertices} * format.stride;
         ++stats.draws;
         if (result.indices) push_record(p, nullptr, static_cast<std::uint32_t>(indices.size() - result.indices), result.indices,
-                                        low, low + result.vertices - 1, latches, last_state.index, last_uniform.offset,
+                                        low, low + result.vertices - 1, latches, last_state.index, blocks,
                                         last_textures.textures, last_textures.samplers);
         check_segment();
     }
     void push_record(Program& p, std::nullptr_t, std::uint32_t first, std::uint32_t count, std::uint32_t low, std::uint32_t high,
-                     const std::array<std::uint32_t, 3>& latches, std::uint32_t state, std::uint32_t uniform,
+                     const std::array<std::uint32_t, 3>& latches, std::uint32_t state, const Blocks& blocks,
                      const std::array<GLuint, 8>& bound, const std::array<GLuint, 8>& samplers_used) {
         const auto run_index = static_cast<std::uint32_t>(runs.size() - 1);
         if (!records.empty()) {
             auto& last = records.back();
-            if (!last.resident && last.program == &p && last.state == state && last.uniform == uniform &&
+            if (!last.resident && last.program == &p && last.state == state && last.blocks == blocks &&
                 last.run == run_index && last.textures == bound && last.samplers == samplers_used &&
                 last.latches == latches && last.first + last.count == first) {
                 last.count += count;
@@ -2115,7 +2193,7 @@ struct GlesDirect::Impl {
                 return;
             }
         }
-        records.push_back({&p, false, {}, state, uniform, run_index, first, count, low, high, bound, samplers_used, latches});
+        records.push_back({&p, false, {}, state, blocks, run_index, first, count, low, high, bound, samplers_used, latches});
     }
     void check_segment() {
         if (vertices.size() + indices.size() * 4 + uniforms.size() > limits.segment_bytes) flush();
@@ -2261,6 +2339,8 @@ struct GlesDirect::Impl {
         seg.before.swap(pending);
         seg.warm.swap(warming);
         seg.records.swap(records); seg.states.swap(states); seg.runs.swap(runs);
+        if (uniforms.size() < uniform_reach) uniforms.resize(uniform_reach);
+        stats.uniform_bytes += uniforms.size();
         seg.vertices.swap(vertices); seg.uniforms.swap(uniforms); seg.indices.swap(indices);
         reset_segment();
         seg.after.swap(retiring);
@@ -2297,14 +2377,16 @@ struct GlesDirect::Impl {
         fixed_state(depth);
         const Program* program = nullptr;
         GLuint bound_vao = vao;
-        std::uint32_t run = ~0u, state = ~0u, uniform = ~0u;
+        std::uint32_t run = ~0u, state = ~0u;
+        Blocks bound_blocks{no_block, no_block, no_block};
         std::array<GLuint, 8> bound{}, bound_samplers{};
         std::array<std::uint32_t, 3> latches{{~0u, ~0u, ~0u}};
         bool fresh = true;
         for (auto& r : records) {
             if (!r.program->plan->fast && target.format(r.program->plan->rgba6)) { fixed_state(depth); fresh = true; }
             if (fresh) {
-                program = nullptr; run = state = uniform = ~0u; latches = {{~0u, ~0u, ~0u}}; bound_vao = vao;
+                program = nullptr; run = state = ~0u; bound_blocks = {no_block, no_block, no_block}; latches = {{~0u, ~0u, ~0u}};
+                bound_vao = vao;
                 for (unsigned i = 0; i < 8; ++i) { bound[i] = ~0u; bound_samplers[i] = ~0u; }
                 fresh = false;
             }
@@ -2319,9 +2401,13 @@ struct GlesDirect::Impl {
             if (!format.matrices && latches != r.latches) {
                 glVertexAttribI4ui(14, r.latches[0], r.latches[1], r.latches[2], 0); latches = r.latches;
             }
-            if (uniform != r.uniform) {
-                glBindBufferRange(GL_UNIFORM_BUFFER, 0, ubo, r.uniform, sizeof(TransformUniforms)); uniform = r.uniform;
-            }
+            const auto& b = r.blocks;
+            if (bound_blocks.matrices != b.matrices)
+                glBindBufferRange(GL_UNIFORM_BUFFER, 2, ubo, b.matrices, transform_matrix_bytes);
+            if (bound_blocks.shared != b.shared) glBindBufferRange(GL_UNIFORM_BUFFER, 0, ubo, b.shared, transform_shared_bytes);
+            if (b.post != no_block && bound_blocks.post != b.post)
+                glBindBufferRange(GL_UNIFORM_BUFFER, 3, ubo, b.post, transform_post_bytes);
+            bound_blocks = {b.matrices, b.shared, b.post == no_block ? bound_blocks.post : b.post};
             if (r.instances)
                 glBindBufferRange(GL_UNIFORM_BUFFER, 1, ubo, r.instance_offset,
                                   static_cast<GLsizeiptr>(r.instances) * transform_instance_rows * 16);
@@ -2364,7 +2450,8 @@ struct GlesDirect::Impl {
         retired_geometries.clear();
         ++segment;
         evict_geometry();
-        last_state.valid = last_uniform.valid = batch_uniform.valid = false;
+        last_state.valid = last_uniform.valid = false;
+        uniform_reach = 0;
         instance_group.open = false;
         textures_changed();
         evict_textures();

@@ -219,8 +219,11 @@ void instanced_variant() {
     require(instanced.key!=plain.key,"instancing is program identity");
     require(instanced.source.find("dot(u_instance[ib],position)")!=std::string::npos &&
             instanced.source.find("dot(u_instance[ib+3].xyz,normalIn)")!=std::string::npos &&
-            instanced.source.find("u_position[pn]")==std::string::npos && instanced.source.find("u_normal[nr]")==std::string::npos,
+            instanced.source.find("u_matrix[pn]")==std::string::npos && instanced.source.find("u_matrix[nr]")==std::string::npos,
             "instanced GLSL takes both matrices from the instance rows");
+    require(plain.source.find("dot(u_matrix[pn],position)")!=std::string::npos && plain.source.find("int nr = int(a_matrix.x >> 24u);")!=std::string::npos &&
+            plain.source.find("u_matrix[nr+2]")!=std::string::npos && plain.source.find("GXPost")==std::string::npos,
+            "the plain variant reads both matrices from GXMatrices, the normal matrix at the row the matrix indices name");
     require(plain.source.find("u_instance")==std::string::npos,"the plain variant has no instance block");
     require(generate_transform_glsl(p,TransformArithmetic::float32_candidate_v1,true,true,0,false,true).status.error==
             TransformError::unsupported_state,"a transform is batched or instanced, not both");
@@ -431,7 +434,8 @@ void write_fixture(const std::string& directory,const std::string& name,Fixture&
         for(const auto& color:v.colors) for(auto c:color) add_float(attributes,float(c)/255);
         for(const auto& st:v.texcoords) for(float c:st) add_float(attributes,c);
         for(unsigned i=0;i<3;++i) little32(attributes,std::uint32_t(v.matrix_indices[i*3])|
-            (std::uint32_t(v.matrix_indices[i*3+1])<<8)|(std::uint32_t(v.matrix_indices[i*3+2])<<16));
+            (std::uint32_t(v.matrix_indices[i*3+1])<<8)|(std::uint32_t(v.matrix_indices[i*3+2])<<16)|
+            (i?0u:std::uint32_t(transform_normal_row(v.matrix_indices[0]))<<24));
         const auto r=evaluate_transform(snapshot.pipeline,snapshot.uniforms,v,TransformArithmetic::float32_candidate_v1); ok(r);
         for(float c:r.output.eye_position) add_float(expected,c);
         for(float c:r.output.normal) add_float(expected,c);
@@ -452,8 +456,10 @@ void write_fixture(const std::string& directory,const std::string& name,Fixture&
     manifest << "{\n  \"name\": \"" << name << "\",\n  \"vertex_count\": " << input.size()
       << ",\n  \"vertex_stride\": 156,\n  \"feedback_stride\": 184,\n"
       << "  \"byte_order\": \"little\",\n  \"model\": \"float32_candidate_v1\",\n"
-      << "  \"uniform_block\": {\"name\": \"GXTransform\", \"binding\": 0, \"bytes\": 3328},\n"
-      << "  \"uniform_offsets\": {\"position\": 0, \"normal\": 1024, \"post\": 1536, \"projection\": 2560, \"ambient\": 2592, \"material\": 2624, \"lights\": 2656, \"viewport\": 3296},\n"
+      << "  \"uniform_blocks\": [{\"name\": \"GXMatrices\", \"binding\": 2, \"offset\": 0, \"bytes\": 1536},"
+         " {\"name\": \"GXPost\", \"binding\": 3, \"offset\": 1536, \"bytes\": 1024},"
+         " {\"name\": \"GXTransform\", \"binding\": 0, \"offset\": 2560, \"bytes\": 784}],\n"
+      << "  \"uniform_offsets\": {\"position\": 0, \"normal\": 1024, \"post\": 1536, \"projection\": 2560, \"ambient\": 2592, \"material\": 2624, \"lights\": 2656, \"latched_normal\": 3296, \"viewport\": 3344},\n"
       << "  \"light_stride\": 80,\n  \"light_offsets\": {\"color\": 0, \"angle\": 16, \"distance\": 32, \"position\": 48, \"direction\": 64},\n"
       << "  \"attributes\": [";
     for(unsigned i=0;i<15;++i) {

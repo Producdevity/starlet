@@ -39,6 +39,9 @@ extern unsigned instanced_draws, instance_count;
 extern GLintptr instance_offset;
 extern GLsizeiptr instance_size;
 extern std::vector<unsigned char> uniform_bytes;
+extern std::map<GLuint, std::pair<GLintptr, GLsizeiptr>> uniform_bindings;
+extern std::array<GLuint, 4> matrix_latches;
+extern GLint uniform_alignment;
 extern GLsizeiptr element_bytes;
 extern std::vector<std::string> shader_sources;
 extern std::vector<GLenum> invalidated;
@@ -1057,8 +1060,10 @@ void direct_batched_materials() {
                           source.find("u_material[0]") == std::string::npos;
     }
     check(vertex_material, "the batched program reads its material from the vertex colour");
-    TransformUniforms block; std::memcpy(&block, fake::uniform_bytes.data(), sizeof block);
-    check(block.material[0] == TransformVector{} && block.material[1] == TransformVector{}, "the block holds no material the program does not read");
+    TransformUniforms block{};
+    std::memcpy(reinterpret_cast<unsigned char*>(&block) + transform_shared_offset,
+                fake::uniform_bytes.data() + fake::uniform_bindings.at(0).first, transform_shared_bytes);
+    check(block.material[0] == TransformVector{} && block.material[1] == TransformVector{}, "GXTransform holds no material the program does not read");
 
     // Channel 0 reads vertex colour 1 when colour 0 is absent.
     Fixture g; g.cp(0x50, (1u << 9) | (1u << 15)); g.cp(0x70, 1u | (4u << 1) | (1u << 17) | (5u << 18) | (1u << 21) | (4u << 22));
@@ -1074,8 +1079,109 @@ void direct_batched_materials() {
     renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
     renderer.wait_until_idle();
     const auto lit = renderer.stats().direct;
-    check(lit.batched_draws == s.batched_draws + 2 && lit.uniform_blocks == s.uniform_blocks + 2 && lit.submissions == s.submissions + 2,
-          "a lit channel's register material splits batches");
+    check(lit.batched_draws == s.batched_draws + 2 && lit.uniform_blocks == s.uniform_blocks + 1 &&
+          lit.shared_blocks == s.shared_blocks + 2 && lit.submissions == s.submissions + 2,
+          "a lit channel's register material splits batches with a new GXTransform block");
+}
+// A lit draw with a normal attribute whose texgens read rows 60 and 30: see direct_uniform_blocks.
+void lit_two_matrices(Fixture& f) {
+    use_normals(f);
+    f.xf(0x100e, 2u | (1u << 2) | (2u << 7)); // RGB0 lit by light 0, clamped; register material and ambient.
+    f.xf(0x100c, 0x11223344); f.xf(0x100a, 0x05060708);
+    f.xf(0x603, 0x80604020);
+    for (unsigned k = 0; k < 3; ++k) f.f(0x60a + k, 10.0f * (k + 1));
+    for (unsigned i = 0; i < 9; ++i) f.f(0x400 + i, 0.5f + i);
+    for (unsigned i = 0; i < 12; ++i) f.f(30 * 4 + i, 2.0f + i);
+    f.xf(0x1018, (60u << 6) | (30u << 12));
+}
+bool same_lanes(GLintptr offset, unsigned row, const TransformVector& v, unsigned first = 0, unsigned end = 4) {
+    return !std::memcmp(fake::uniform_bytes.data() + offset + row * 16 + first * 4, v.data() + first, (end - first) * 4);
+}
+// Unbatched draws pack the matrix rows they read into GXMatrices and share GXTransform, which
+// is recorded again only when a lane the program reads changes.
+void direct_uniform_blocks() {
+    fake::uniform_alignment = 16; fake::uniform_bindings.clear();
+    GlesRenderer renderer; Fixture f; lit_two_matrices(f);
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+    auto s = renderer.stats().direct;
+    check(s.draws == 1 && s.batched_draws == 0 && s.uniform_blocks == 1 && s.shared_blocks == 1, "one draw records one block of each");
+    const auto matrices = fake::uniform_bindings.at(2), shared = fake::uniform_bindings.at(0);
+    check(matrices.second == GLsizeiptr(transform_matrix_bytes) && shared.second == GLsizeiptr(transform_shared_bytes) &&
+          shared.first == 0 && matrices.first == GLintptr(transform_shared_bytes) &&
+          fake::uniform_bytes.size() == transform_shared_bytes + transform_matrix_bytes && s.uniform_bytes == fake::uniform_bytes.size(),
+          "blocks are bound at their declared sizes, the buffer padded to reach them");
+    check(fake::uniform_bindings.count(3) == 0, "programs without post-transformed texgens bind no GXPost");
+    // Position rows 0-2, normal rows 3-5, then texgen 0's rows 60-61 and texgen 1's rows 30-31.
+    check(fake::matrix_latches[0] == (6u << 8 | 8u << 16 | 3u << 24) && fake::matrix_latches[1] == 0 && fake::matrix_latches[2] == 0,
+          "the matrix indices name packed rows, the normal matrix in the top byte");
+    TransformUniforms full; direct_transform_uniforms(f.decoder.state(), full);
+    bool rows = true;
+    for (unsigned k = 0; k < 3; ++k) rows = rows && same_lanes(matrices.first, k, full.position[k]) && same_lanes(matrices.first, 3 + k, full.normal[k]);
+    for (unsigned k = 0; k < 2; ++k)
+        rows = rows && same_lanes(matrices.first, 6 + k, full.position[60 + k]) && same_lanes(matrices.first, 8 + k, full.position[30 + k]);
+    check(rows, "each packed row is, bit for bit, the row the full form holds at the original index");
+    // GXTransform rows: projection 0-1, ambient 2-3, material 4-5, lights 6-45, latched vectors 46-48.
+    bool read = same_lanes(0, 0, full.projection[0]) && same_lanes(0, 1, full.projection[1]) &&
+                same_lanes(0, 2, full.ambient[0], 0, 3) && same_lanes(0, 4, full.material[0], 0, 3);
+    for (unsigned k = 0; k < 5; ++k) read = read && same_lanes(0, 6 + k, (&full.lights[0].color)[k]);
+    check(read, "GXTransform holds the projection, colours and light the program reads, bit for bit");
+
+    // In one segment: matrix changes add only GXMatrices blocks; a read light, projection or
+    // material lane adds a GXTransform block; unread lanes and lights add nothing.
+    const auto before = renderer.stats().direct;
+    const auto draw = [&] { renderer.draw_direct(f.decoder.state(), f.command(), f.memory); };
+    for (float x : {1.0f, 2.0f, 3.0f}) { f.f(3, x); draw(); }
+    f.xf(0x603, 0x10203040); draw();
+    f.f(0x1020, 1.0f / 640); draw();
+    f.xf(0x100c, 0x99887744); draw();
+    f.xf(0x100c, 0x998877ff); draw(); // Material alpha: A0 reads the vertex colour.
+    f.xf(0x613, 0x10203040); draw(); // Light 1 colour.
+    renderer.wait_until_idle();
+    s = renderer.stats().direct;
+    check(s.draws == before.draws + 8 && s.uniform_blocks == before.uniform_blocks + 3 && s.shared_blocks == before.shared_blocks + 4,
+          "GXTransform is recorded once for draws sharing it and again for each read change");
+    check(s.uniform_bytes - before.uniform_bytes == 4 * transform_shared_bytes + 3 * 160, "each matrix change adds its ten packed rows");
+
+    // Post-transformed texgens read GXPost, recorded with GXTransform's rule.
+    f.xf(0x1012, 1); f.xf(0x1050, 20); f.xf(0x1051, 20);
+    for (unsigned i = 0; i < 12; ++i) f.f(0x500 + 20 * 4 + i, 1.0f + i);
+    const auto plain = renderer.stats().direct;
+    for (float x : {4.0f, 5.0f}) { f.f(3, x); draw(); }
+    f.f(0x500 + 40 * 4, 9.0f); draw(); // A post row no texgen reads.
+    renderer.wait_until_idle();
+    s = renderer.stats().direct;
+    const auto post = fake::uniform_bindings.at(3);
+    direct_transform_uniforms(f.decoder.state(), full);
+    bool post_rows = post.second == GLsizeiptr(transform_post_bytes) && std::size_t(post.first) + transform_post_bytes <= fake::uniform_bytes.size();
+    for (unsigned k = 0; k < 3 && post_rows; ++k) post_rows = same_lanes(post.first, 20 + k, full.post[20 + k]);
+    check(post_rows && s.shared_blocks == plain.shared_blocks + 2 && s.uniform_blocks == plain.uniform_blocks + 2,
+          "GXPost holds the post rows read and is recorded once for the segment");
+    fake::uniform_alignment = 0;
+}
+// Vertices with their own matrix indices read GXMatrices in the full form.
+void direct_full_matrix_block() {
+    GlesRenderer renderer; Fixture f;
+    f.cp(0x50, 1u | (1u << 9) | (1u << 13));
+    std::vector<std::uint8_t> with;
+    for (unsigned v = 0; v < 4; ++v) {
+        with.push_back(0);
+        with.insert(with.end(), f.vertices.begin() + v * 32, f.vertices.begin() + v * 32 + 32);
+    }
+    f.vertices = std::move(with);
+    f.f(0x400, 3.0f); f.f(0x500, 4.0f);
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+    TransformUniforms full; direct_transform_uniforms(f.decoder.state(), full);
+    const auto matrices = fake::uniform_bindings.at(2);
+    check(renderer.stats().direct.uniform_blocks >= 1 && std::size_t(matrices.first) + transform_matrix_bytes <= fake::uniform_bytes.size() &&
+          !std::memcmp(fake::uniform_bytes.data() + matrices.first, &full, transform_matrix_bytes),
+          "the full form is the XF's position rows then its normal rows");
+    const auto format = stream_format(f.command().layout);
+    bool words = fake::submitted_vertices.size() >= 4u * format.stride;
+    for (unsigned v = 0; v < 4 && words; ++v) {
+        std::uint32_t word; std::memcpy(&word, fake::submitted_vertices.data() + v * format.stride + format.matrix_offset(), 4);
+        words = word == (0u | 60u << 8 | 60u << 16 | 64u << 24);
+    }
+    check(format.matrices && words, "each vertex names its normal matrix by its full-form row");
 }
 // The fragment or vertex source of the last batched program compiled since sources.
 std::string last_batched_fragment(std::size_t sources, bool vertex = false) {
@@ -1765,6 +1871,8 @@ int main() {
         direct_batched_normals();
         direct_batch_merging();
         direct_batched_materials();
+        direct_uniform_blocks();
+        direct_full_matrix_block();
         direct_batched_zero_alpha();
         direct_batched_vertex_fog();
         direct_clip_culling();

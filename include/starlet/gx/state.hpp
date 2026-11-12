@@ -100,6 +100,8 @@ public:
     std::uint64_t cp_layout_revision() const { return cp_layout_revision_; }
     std::uint64_t xf_memory_revision() const { return xf_memory_revision_; } // XF below 0x1000.
     std::uint64_t xf_register_revision() const { return xf_register_revision_; }
+    // XF memory changes reaching words 0x500 and above: post-transform matrices and lights.
+    std::uint64_t xf_post_light_revision() const { return xf_post_light_revision_; }
     std::uint64_t matrix_index_revision() const { return matrix_index_revision_; }
     // XF memory words [first, end) written by the change that advanced xf_memory_revision() to revision.
     struct XfWrite { std::uint64_t revision = 0; std::uint16_t first = 0, end = 0; };
@@ -119,7 +121,7 @@ private:
     std::uint64_t palette_generation_ = 0;
     std::uint64_t revision_ = 0;
     std::uint64_t bp_revision_ = 0, bp_state_revision_ = 0, cp_revision_ = 0, xf_memory_revision_ = 0, xf_register_revision_ = 0;
-    std::uint64_t cp_layout_revision_ = 0, matrix_index_revision_ = 0;
+    std::uint64_t cp_layout_revision_ = 0, matrix_index_revision_ = 0, xf_post_light_revision_ = 0;
     XfWrite last_xf_memory_write_;
     std::array<TextureExtent, 8> texture_extents_{};
 };

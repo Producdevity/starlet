@@ -95,7 +95,10 @@ struct GlesDirectStats {
     std::uint64_t resident_crops = 0;
     std::uint64_t geometry_hits = 0, geometry_misses = 0, geometry_validated_bytes = 0;
     std::size_t geometry_bytes = 0, geometries = 0;
-    std::uint64_t program_misses = 0, state_plans = 0, uniform_blocks = 0, batched_draws = 0, culled_draws = 0, culled_clusters = 0;
+    std::uint64_t program_misses = 0, state_plans = 0, batched_draws = 0, culled_draws = 0, culled_clusters = 0;
+    // GXMatrices blocks recorded; GXTransform and GXPost blocks recorded; bytes of uniform
+    // buffer data handed to the GL thread.
+    std::uint64_t uniform_blocks = 0, shared_blocks = 0, uniform_bytes = 0;
     std::uint64_t texture_uploads = 0, texture_validations = 0, texture_hash_bytes = 0, texture_mutations = 0;
     std::size_t texture_bytes = 0, textures = 0, programs = 0;
     // Time the GL thread spent compiling, linking or loading programs.

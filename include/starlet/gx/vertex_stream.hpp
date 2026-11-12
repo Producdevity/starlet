@@ -1,5 +1,6 @@
 #pragma once
 
+#include "starlet/gx/transform.hpp"
 #include "starlet/gx/vertex.hpp"
 
 #include <cstring>
@@ -40,7 +41,8 @@ inline float fraction_scale(unsigned fraction) {
     return scale;
 }
 // Effective PN/TEX matrix rows packed like the per-vertex words, for draws
-// whose layout carries no explicit matrix index.
+// whose layout carries no explicit matrix index; both name the normal matrix by its
+// full-form GXMatrices row (transform_normal_row) in the top byte of the first word.
 std::array<std::uint32_t, 3> stream_matrix_latches(const State&);
 
 struct StreamResult {

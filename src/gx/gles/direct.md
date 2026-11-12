@@ -5,12 +5,11 @@ callback and records it into a segment; GL submission happens at the next EFB
 access, presentation, idle boundary or 16 MiB of pending payload. A segment
 uploads its vertices, 32-bit indices and transform uniform blocks with one
 `glBufferData` each and replays the records with state diffing. Adjacent records
-with identical program, state, uniform block, textures, samplers, vertex run and
+with identical program, state, uniform blocks, textures, samplers, vertex run and
 matrix latches merge into one ranged draw.
 
 Programs are cached by `direct_program_words` (direct.md). Per-draw state is
-replanned when BP or XF-register revisions change; the 3,328-byte transform
-block is rebuilt when XF memory or registers change. Draws whose vertex records
+replanned when BP or XF-register revisions change. Draws whose vertex records
 are byte-identical are skipped: every triangle has zero area on GX and GL. The
 SDK's XF flush primitive is such a draw.
 
@@ -24,7 +23,22 @@ Draws without normals that light or generate coordinates from them read the
 normal, binormal and tangent the XF latched from the last vertex that carried
 them, as the hardware does; every draw with normals captures the raw bytes of its
 last enabled vertex (`capture_normal`) and only a draw that reads the latch converts them
-(`decode_normal`). The latch travels in the transform uniform block and its presence is program identity.
+(`decode_normal`). The latch travels in `GXTransform` and its presence is program identity.
+
+The vertex stage reads three uniform blocks (`generate_transform_glsl`). `GXMatrices`
+holds the matrix rows a draw reads. A draw whose matrix indices are the XF's packs them:
+its position matrix, its normal matrix when the program reads it, then each texgen's rows,
+and its matrix latches name the packed rows (the normal matrix in the top byte of the
+first word). That is at most 480 bytes instead of the 3,376 of all XF matrices, lights and
+registers. Vertices with their own matrix indices read the full form: the 64 position
+rows, then the 32 normal rows. Every `GXMatrices` range is bound at the block's declared
+1,536 bytes over whatever follows it, and the segment's uniforms are padded to reach the
+last one. `GXTransform` (projection, ambient and material colours, lights, latched
+vectors) and `GXPost` (post-transform rows, declared only by programs that read them) are
+built from the previous block with only the lanes the program reads replaced, and recorded
+only when that differs from the previous block. Draws that change their matrices then add
+only their packed rows, and changes to a colour lane or light a program does not read add
+nothing. Equal consecutive `GXMatrices` blocks are recorded once.
 
 Converted indexed geometry stays resident on the GPU. It is reused only while the
 FIFO bytes match exactly and every consumed array span is unchanged. A draw's FIFO
@@ -85,9 +99,9 @@ draw's material colour travels with its vertices; vertex colour c then holds wha
 channel c read. Consecutive batched draws share one state plan while the values it read
 are unchanged: BP registers (the konst bank in place of E0-E7), texture extents, CI
 palette generations and the XF viewport. Games rewrite registers between draws, so values are compared, not revisions.
-They share one uniform block while it is unchanged once what the batched program never
-reads is zeroed: normal matrices, position rows no texgen indexes and material lanes no
-register-material channel reads. Such draws merge into one GL draw; Resident Evil 4
+They share their uniform blocks while what the batched program reads is unchanged: its
+packed rows hold only its texgens' rows, and `GXTransform` replaces only the material
+lanes of register-material channels. Such draws merge into one GL draw; Resident Evil 4
 draws each particle as its own unlit quad whose layout carries a normal, with a normal
 matrix and a material colour, and particles and layout panes otherwise cost a driver
 draw each.
@@ -119,14 +133,13 @@ draws per frame have one eye depth; most particle quads span depths, by more tha
 about half of them, so they keep per-fragment fog.
 
 In fast mode, consecutive draws of the same resident geometry with the same program,
-state plan, textures and matrix latches, whose transform blocks differ only in the
-position matrix rows pn..pn+2 and normal matrix rows pn % 32..+2 of the draw's PN index,
-are one instanced draw (`glDrawElementsInstancedBaseVertex`) of the program's instanced
-variant: it reads those two matrices per instance from `GXInstances` (binding 1, six
-vec4 rows per instance, at most 128 instances) and everything else from the first
-draw's block, so each instance computes exactly what its own draw would. Programs with
-emboss texgens, texgens reading rows that overlap the PN rows, per-vertex matrices and
-clustered geometry draw separately. A scene of repeated models (a title made of
+state plan, textures, matrix latches, `GXTransform` and `GXPost`, whose packed rows
+differ only in the position and normal matrix, are one instanced draw
+(`glDrawElementsInstancedBaseVertex`) of the program's instanced variant: it reads those
+two matrices per instance from `GXInstances` (binding 1, six vec4 rows per instance, at
+most 128 instances) and its texgen rows from the first draw's block, so each instance
+computes exactly what its own draw would. Programs with emboss texgens, per-vertex
+matrices and clustered geometry draw separately. A scene of repeated models (a title made of
 hundreds of flowers) then costs one driver draw per run of identical shapes.
 
 Games often write BP registers again with unchanged values between draws (a material

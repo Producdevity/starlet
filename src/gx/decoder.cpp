@@ -286,6 +286,7 @@ void Decoder::apply_xf(std::size_t address, const std::uint8_t* words, std::size
     if (memory_changed || register_changed) ++state_.revision_;
     if (memory_changed) {
         ++state_.xf_memory_revision_;
+        if (address + count > 0x500) ++state_.xf_post_light_revision_;
         state_.last_xf_memory_write_ = {state_.xf_memory_revision_, static_cast<std::uint16_t>(address),
             static_cast<std::uint16_t>(std::min<std::size_t>(address + count, 0x1000))};
     }
@@ -521,6 +522,7 @@ Decoder::Parse Decoder::command(ByteView input, std::size_t& consumed, unsigned 
             if (changed) {
                 ++state_.revision_;
                 ++state_.xf_memory_revision_;
+                if (destination + count > 0x500) ++state_.xf_post_light_revision_;
                 if (destination < 0x600 && destination + count > 0x5f4) ++state_.xf_register_revision_;
                 state_.last_xf_memory_write_ = {state_.xf_memory_revision_, static_cast<std::uint16_t>(destination),
                                                 static_cast<std::uint16_t>(destination + count)};

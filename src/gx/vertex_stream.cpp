@@ -255,6 +255,7 @@ std::array<std::uint32_t, 3> stream_matrix_latches(const State& state) {
     std::array<std::uint32_t, 3> words{};
     for (unsigned i = 0; i < 9; ++i)
         words[i / 3] |= std::uint32_t{state.matrix_index(static_cast<std::uint8_t>(i))} << ((i % 3) * 8);
+    words[0] |= std::uint32_t{transform_normal_row(state.matrix_index(0))} << 24;
     return words;
 }
 
@@ -347,6 +348,7 @@ StreamResult convert_records(const State& state, const Draw& draw, MemoryReader&
                     const std::uint32_t row = layout.matrix_indices[m] ? (*cursor++ & 63u) : ((latches[m / 3] >> ((m % 3) * 8)) & 255u);
                     words[m / 3] |= row << ((m % 3) * 8);
                 }
+                words[0] |= std::uint32_t{transform_normal_row(words[0] & 63u)} << 24;
                 std::memcpy(out + format.matrix_offset(), words.data(), 12);
             }
             if (sentinel_possible) {

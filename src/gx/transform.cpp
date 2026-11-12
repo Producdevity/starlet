@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -162,6 +163,9 @@ std::string vertex_color_glsl(const TransformPipeline& p, unsigned channel) {
 } // namespace
 
 static_assert(sizeof(TransformLight) == 80 && sizeof(TransformUniforms) == 3376, "std140 uniform layout");
+static_assert(offsetof(TransformUniforms, normal) == 64 * 16 && offsetof(TransformUniforms, post) == transform_post_offset &&
+              offsetof(TransformUniforms, projection) == transform_shared_offset &&
+              offsetof(TransformUniforms, viewport) == transform_shared_offset + transform_shared_bytes, "uniform blocks");
 static_assert(std::is_standard_layout<TransformUniforms>::value, "uniforms must be standard layout");
 
 namespace {
@@ -361,6 +365,14 @@ bool transform_reads_object_space(const TransformPipeline& p) {
         if (p.texgens[i].type == 1 || (p.texgens[i].type == 0 && p.texgens[i].source_row < 5)) return true;
     return false;
 }
+bool transform_reads_normal_matrix(const TransformPipeline& p) { return uses_lighting_normal(p) || uses_emboss(p); }
+std::uint64_t transform_post_rows(const TransformPipeline& p) {
+    std::uint64_t rows = 0;
+    if (p.dual_texture)
+        for (unsigned i = 0; i < p.texgen_count; ++i)
+            if (p.texgens[i].type == 0) rows |= std::uint64_t{7} << p.texgens[i].post_row;
+    return rows;
+}
 unsigned transform_vertex_color_source(const TransformPipeline& p, unsigned channel) { return vertex_color_source(p, channel); }
 std::uint8_t transform_vertex_materials(TransformPipeline& p) {
     std::uint8_t moved = 0;
@@ -406,6 +418,33 @@ void direct_transform_uniforms(const State& s, TransformUniforms& u) {
         l.color = color(s.xf(base+3));
         row(base+4, 3, l.angle); row(base+7, 3, l.distance);
         row(base+10, 3, l.position); row(base+13, 3, l.direction);
+    }
+}
+
+void direct_transform_shared(const State& s, const TransformPipeline& p, TransformUniforms& u) {
+    for (unsigned i = 0; i < 6; ++i) u.projection[i/4][i%4] = as_float(s.xf(static_cast<std::uint16_t>(0x1020+i)));
+    u.projection[1][2] = u.projection[1][3] = 0.0f;
+    unsigned lights = 0;
+    auto lanes = [](TransformVector& to, const TransformVector& from, unsigned i) {
+        if (i < 2) { to[0] = from[0]; to[1] = from[1]; to[2] = from[2]; } else to[3] = from[3];
+    };
+    // Each channel's result is lane-wise in material and ambient; it keeps rgb or alpha.
+    for (unsigned i = 0; i < 4; ++i) {
+        const unsigned channel = i % 2;
+        if (!(p.computed_colors & (1u << channel)) || (i >= 2 && channel >= p.color_count)) continue;
+        const auto& c = p.channels[i];
+        if (!c.material_vertex) lanes(u.material[channel], color(s.xf(static_cast<std::uint16_t>(0x100c+channel))), i);
+        if (!c.enabled) continue;
+        if (!c.ambient_vertex) lanes(u.ambient[channel], color(s.xf(static_cast<std::uint16_t>(0x100a+channel))), i);
+        lights |= c.light_mask;
+    }
+    for (unsigned i = 0; i < p.texgen_count; ++i) if (p.texgens[i].type == 1) lights |= 1u << p.texgens[i].emboss_light;
+    const auto* xf = s.xf_data();
+    auto row = [xf](std::uint16_t base, TransformVector& v) { std::memcpy(v.data(), xf + base, 12); v[3] = 0.0f; };
+    for (unsigned i = 0; i < 8; ++i) if (lights & (1u << i)) {
+        auto& l = u.lights[i]; const auto base = static_cast<std::uint16_t>(0x600+i*16);
+        l.color = color(s.xf(base+3));
+        row(base+4, l.angle); row(base+7, l.distance); row(base+10, l.position); row(base+13, l.direction);
     }
 }
 
@@ -552,7 +591,7 @@ TransformShader generate_transform_glsl(const TransformPipeline& p, TransformAri
         r.status = fail(TransformError::unsupported_arithmetic, "unsupported transform arithmetic model"); return r;
     }
     r.status = validate(p); if (!r.status) return r;
-    r.key = {'G','X','X','F',1,static_cast<std::uint8_t>(model),p.color_count,p.texgen_count,
+    r.key = {'G','X','X','F',2,static_cast<std::uint8_t>(model),p.color_count,p.texgen_count,
              p.computed_colors,p.normal_components,static_cast<std::uint8_t>(p.orthographic),
              static_cast<std::uint8_t>(p.dual_texture), static_cast<std::uint8_t>(batched), affine, static_cast<std::uint8_t>(compact),
              static_cast<std::uint8_t>(p.latched_normal), static_cast<std::uint8_t>(instanced)};
@@ -607,21 +646,21 @@ layout(location=5) in vec4 a_color1;
     g << R"GLSL(layout(location=14) in uvec3 a_matrix;
 struct Light { vec4 color; vec4 angle; vec4 distance; vec4 position; vec4 direction; };
 layout(std140, binding=0) uniform GXTransform {
-    vec4 u_position[64];
-    vec4 u_normal[32];
-    vec4 u_post[64];
     vec4 u_projection[2];
     vec4 u_ambient[2];
     vec4 u_material[2];
     Light u_light[8];
-    vec4 u_viewport[2];
     vec4 u_latched_normal[3];
+};
+layout(std140, binding=2) uniform GXMatrices {
+    vec4 u_matrix[96];
 };
 out vec3 gx_eye;
 out vec3 gx_normal;
 out vec4 gx_clip;
 out vec4 gx_gles_clip;
 )GLSL";
+    if (transform_post_rows(p)) g << "layout(std140, binding=3) uniform GXPost {\n    vec4 u_post[64];\n};\n";
     if (instanced)
         g << "layout(std140, binding=1) uniform GXInstances {\n    vec4 u_instance[" << transform_instance_limit * transform_instance_rows
           << "];\n};\n";
@@ -667,7 +706,7 @@ void main() {
         g << "    int ib = gl_InstanceID*" << transform_instance_rows << ";\n"
              "    gx_eye = vec3(dot(u_instance[ib],position),dot(u_instance[ib+1],position),dot(u_instance[ib+2],position));\n";
     } else {
-        g << "    gx_eye = vec3(dot(u_position[pn],position),dot(u_position[pn+1],position),dot(u_position[pn+2],position));\n";
+        g << "    gx_eye = vec3(dot(u_matrix[pn],position),dot(u_matrix[pn+1],position),dot(u_matrix[pn+2],position));\n";
     }
     if (!batched) {
         if (p.latched_normal) g << "    vec3 normalIn = u_latched_normal[0].xyz;\n    vec3 binormalIn = u_latched_normal[1].xyz;\n"
@@ -681,8 +720,8 @@ void main() {
     for (unsigned i = 0; i < 8; ++i) g << "    gx_tex" << i << " = " << ((affine >> i) & 1 ? "vec2" : "vec3") << "(0.0);\n";
     if (uses_lighting_normal(p) && instanced) g << R"GLSL(    gx_normal = unitVector(vec3(dot(u_instance[ib+3].xyz,normalIn),dot(u_instance[ib+4].xyz,normalIn),dot(u_instance[ib+5].xyz,normalIn)));
 )GLSL";
-    else if (uses_lighting_normal(p)) g << R"GLSL(    int nr = pn % 32;
-    gx_normal = unitVector(vec3(dot(u_normal[nr].xyz,normalIn),dot(u_normal[nr+1].xyz,normalIn),dot(u_normal[nr+2].xyz,normalIn)));
+    else if (uses_lighting_normal(p)) g << R"GLSL(    int nr = int(a_matrix.x >> 24u);
+    gx_normal = unitVector(vec3(dot(u_matrix[nr].xyz,normalIn),dot(u_matrix[nr+1].xyz,normalIn),dot(u_matrix[nr+2].xyz,normalIn)));
 )GLSL";
     g << "    gx_clip = vec4(gx_eye.x*u_projection[0].x+";
     g << (p.orthographic ? "u_projection[0].y" : "gx_eye.z*u_projection[0].y");
@@ -722,9 +761,9 @@ void main() {
         if (t.type == 1) {
             const unsigned source = t.emboss_source;
             const bool source_flat = (affine >> source) & 1;
-            g << "    {\n        int er = pn % 32;\n        vec3 ray = unitVector(u_light[" << unsigned(t.emboss_light) << "].position.xyz - gx_eye);\n"
-                 "        vec3 sAxis = vec3(dot(u_normal[er].xyz,binormalIn),dot(u_normal[er+1].xyz,binormalIn),dot(u_normal[er+2].xyz,binormalIn));\n"
-                 "        vec3 tAxis = vec3(dot(u_normal[er].xyz,tangentIn),dot(u_normal[er+1].xyz,tangentIn),dot(u_normal[er+2].xyz,tangentIn));\n"
+            g << "    {\n        int er = int(a_matrix.x >> 24u);\n        vec3 ray = unitVector(u_light[" << unsigned(t.emboss_light) << "].position.xyz - gx_eye);\n"
+                 "        vec3 sAxis = vec3(dot(u_matrix[er].xyz,binormalIn),dot(u_matrix[er+1].xyz,binormalIn),dot(u_matrix[er+2].xyz,binormalIn));\n"
+                 "        vec3 tAxis = vec3(dot(u_matrix[er].xyz,tangentIn),dot(u_matrix[er+1].xyz,tangentIn),dot(u_matrix[er+2].xyz,tangentIn));\n"
                  "        vec2 offset = vec2(dot(sAxis,ray),dot(tAxis,ray));\n";
             if (flat) g << "        gx_tex" << i << " = gx_tex" << source << ".xy + offset;\n    }\n";
             else if (source_flat) g << "        gx_tex" << i << " = vec3(gx_tex" << source << " + offset,1.0);\n    }\n";
@@ -743,9 +782,9 @@ void main() {
             break;
         }
         g << ";\n        int tr = matrixIndex(" << i+1 << ");\n";
-        if (flat) { g << "        gx_tex" << i << " = vec2(dot(u_position[tr],source),dot(u_position[tr+1],source));\n    }\n"; continue; }
-        g << "        vec3 stq = vec3(dot(u_position[tr],source),dot(u_position[tr+1],source),";
-        g << (t.projected ? "dot(u_position[tr+2],source)" : "1.0") << ");\n";
+        if (flat) { g << "        gx_tex" << i << " = vec2(dot(u_matrix[tr],source),dot(u_matrix[tr+1],source));\n    }\n"; continue; }
+        g << "        vec3 stq = vec3(dot(u_matrix[tr],source),dot(u_matrix[tr+1],source),";
+        g << (t.projected ? "dot(u_matrix[tr+2],source)" : "1.0") << ");\n";
         if (p.dual_texture) {
             if (t.normalize) g << "        stq = unitVector(stq);\n";
             g << "        vec4 postSource = vec4(stq,1.0);\n        stq = vec3(dot(u_post[" << unsigned(t.post_row)
