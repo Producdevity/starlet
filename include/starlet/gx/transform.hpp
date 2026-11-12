@@ -102,6 +102,9 @@ TransformCapture capture_transform(const State&, const VertexSnapshot&, std::uin
 // without normals that needs them then reads those.
 TransformStatus capture_transform_pipeline(const State&, const VertexLayout&, std::uint8_t raster_colors,
                                            TransformPipeline&, std::uint8_t latched_components = 0);
+// Whether the pipeline reads object-space inputs besides the position: a lighting normal,
+// an emboss offset, or a texgen from position, normal, binormal or tangent.
+bool transform_reads_object_space(const TransformPipeline&);
 // The vertex colour (0 or 1) that channel's vertex material and ambient read; 2: white.
 unsigned transform_vertex_color_source(const TransformPipeline&, unsigned channel);
 // Batched pipelines: every unlit channel with a register material reads it from the vertex

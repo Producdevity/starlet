@@ -624,11 +624,9 @@ struct GlesDirect::Impl {
     }
     // Eye-space positions are exact for any pipeline that reads no object-space
     // normal or position input; TEV registers then travel per vertex.
+    // A layout may carry normals the program never reads; draw_batched drops them.
     static bool batchable(const DirectProgram& p) {
-        if (!p.fast || p.transform.normal_components) return false;
-        for (unsigned i = 0; i < p.transform.texgen_count; ++i)
-            if (p.transform.texgens[i].type < 2 && p.transform.texgens[i].source_row < 5) return false;
-        return true;
+        return p.fast && !p.transform.latched_normal && !transform_reads_object_space(p.transform);
     }
     Program* batched_program(Program& base, const State& state, const Draw& draw) {
         if (!base.batched) {
@@ -1730,7 +1728,7 @@ struct GlesDirect::Impl {
     bool draw_batched(Program& base, const State& state, const Draw& draw, MemoryReader& memory, TextureCmprModel cmpr) {
         const auto format = stream_format(draw.layout);
         const bool expanded = line_point(draw);
-        if (draw.merged() || (!expanded && draw.vertex_count > 64) || format.normal_vectors || format.matrices) return false;
+        if (draw.merged() || (!expanded && draw.vertex_count > 64) || format.matrices) return false;
         const unsigned pn = state.matrix_index(0);
         if (pn > 61) return false;
         const auto& transform = base.plan->transform;
@@ -1809,11 +1807,12 @@ struct GlesDirect::Impl {
             batch_uniform.registers = state.xf_register_revision(); batch_uniform.segment = segment;
             batch_uniform.keep = keep; batch_uniform.program = p;
         }
-        // The batched vertex: eye position, colours, texture coordinates, TEV registers. With
-        // vertex materials, colour c holds what channel c reads, its register material parts
-        // written over it.
+        // The batched vertex: eye position, colours, texture coordinates, TEV registers. Normals
+        // are dropped; with vertex materials, colour c holds what channel c reads, its register
+        // material parts written over it.
         const auto materials = p->plan->vertex_materials;
         auto batched = format;
+        batched.normal_vectors = 0;
         if (materials) batched.colors = 3;
         batched.registers = true;
         batched.stride = static_cast<std::uint16_t>(batched.texcoord_offset(8) + 32);

@@ -946,9 +946,56 @@ void direct_batched_draws() {
     renderer.wait_until_idle();
     check(renderer.stats().direct.batched_draws == 3, "position texgens keep the object-space path");
 }
+// Resident Evil 4 draws particles as unlit quads whose layout carries a normal; nbt: N, B and T.
+void use_normals(Fixture& f, bool nbt = false) {
+    f.cp(0x50, (1u << 9) | (1u << 11) | (1u << 13));
+    f.cp(0x70, 1u | (4u << 1) | (std::uint32_t{nbt} << 9) | (4u << 10) | (1u << 13) | (5u << 14) | (1u << 21) | (4u << 22));
+    std::vector<std::uint8_t> with;
+    for (unsigned v = 0; v < 4; ++v) {
+        with.insert(with.end(), f.vertices.begin() + v * 32, f.vertices.begin() + v * 32 + 12);
+        for (unsigned n = 0; n < (nbt ? 3u : 1u); ++n) for (unsigned k = 0; k < 3; ++k) append_float(with, k == (2 + n) % 3 ? 1.0f : 0.0f);
+        with.insert(with.end(), f.vertices.begin() + v * 32 + 12, f.vertices.begin() + v * 32 + 32);
+    }
+    f.vertices = std::move(with);
+}
 GlesLimits batching_limits() {
     GlesLimits limits; limits.direct.shading = DirectShading::fast; limits.direct.background_programs = false;
     return limits;
+}
+void direct_batched_normals() {
+    std::vector<std::uint8_t> plain;
+    {
+        GlesRenderer renderer(batching_limits()); Fixture f;
+        renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+        plain.assign(fake::submitted_vertices.begin(), fake::submitted_vertices.begin() + 4 * 64);
+    }
+    GlesRenderer renderer(batching_limits()); Fixture f; const auto original = f.vertices; use_normals(f);
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+    auto s = renderer.stats().direct;
+    check(s.batched_draws == 1 && s.vertex_bytes == 4 * 64, "an unlit layout carrying a normal is batched");
+    check(std::equal(plain.begin(), plain.end(), fake::submitted_vertices.begin()),
+          "its batched vertices drop the normal and equal those of the same draw without one");
+    const auto unbatched = [&](Fixture& from, const char* message) {
+        const auto before = renderer.stats().direct;
+        renderer.draw_direct(from.decoder.state(), from.command(), from.memory); renderer.wait_until_idle();
+        const auto after = renderer.stats().direct;
+        check(after.draws == before.draws + 1 && after.batched_draws == before.batched_draws, message);
+    };
+    f.xf(0x100e, 1u | 2u | (1u << 2) | (2u << 7)); // RGB0 lit by light 0, clamped diffuse.
+    unbatched(f, "a lit layout stays out of batches");
+    f.xf(0x100e, 1); f.xf(0x1040, (1u << 7) | (1u << 2)); // Texgen 0 from the normal (ABC1).
+    unbatched(f, "texgens from the normal stay out of batches");
+    f.xf(0x1040, 5u << 7);
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+    check(renderer.stats().direct.batched_draws == s.batched_draws + 1, "restored state batches again");
+    Fixture e; use_normals(e, true);
+    e.xf(0x1041, 1u << 4); // Texgen 1 embosses texgen 0 towards light 0.
+    unbatched(e, "emboss stays out of batches");
+    f.cp(0x50, (1u << 9) | (1u << 13));
+    f.cp(0x70, 1u | (4u << 1) | (1u << 13) | (5u << 14) | (1u << 21) | (4u << 22));
+    f.vertices = original;
+    f.xf(0x100e, 1u | 2u | (1u << 2) | (2u << 7));
+    unbatched(f, "a lit draw reading the latched normal stays out of batches");
 }
 void direct_batch_merging() {
     GlesRenderer renderer(batching_limits()); Fixture f;
@@ -1622,6 +1669,7 @@ int main() {
     format_after_depth_copy();
     copy_clear_invalidation();
         direct_batched_draws();
+        direct_batched_normals();
         direct_batch_merging();
         direct_batched_materials();
         direct_clip_culling();

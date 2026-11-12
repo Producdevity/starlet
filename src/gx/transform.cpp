@@ -354,6 +354,12 @@ TransformStatus capture_transform_pipeline(const State& s, const VertexLayout& l
     return validate(p);
 }
 
+bool transform_reads_object_space(const TransformPipeline& p) {
+    if (uses_lighting_normal(p)) return true;
+    for (unsigned i = 0; i < p.texgen_count; ++i)
+        if (p.texgens[i].type == 1 || (p.texgens[i].type == 0 && p.texgens[i].source_row < 5)) return true;
+    return false;
+}
 unsigned transform_vertex_color_source(const TransformPipeline& p, unsigned channel) { return vertex_color_source(p, channel); }
 std::uint8_t transform_vertex_materials(TransformPipeline& p) {
     std::uint8_t moved = 0;
@@ -553,10 +559,8 @@ TransformShader generate_transform_glsl(const TransformPipeline& p, TransformAri
     if (instanced)
         for (unsigned i = 0; i < p.texgen_count; ++i)
             if (p.texgens[i].type == 1) { r.status = fail(TransformError::unsupported_state, "instanced transform with an emboss texgen"); return r; }
-    if (batched) {
-        bool object_space = uses_lighting_normal(p);
-        for (unsigned i = 0; i < p.texgen_count; ++i) object_space |= p.texgens[i].type == 1 || (p.texgens[i].type == 0 && p.texgens[i].source_row < 5);
-        if (object_space) { r.status = fail(TransformError::unsupported_state, "batched transform consumes object-space inputs"); return r; }
+    if (batched && transform_reads_object_space(p)) {
+        r.status = fail(TransformError::unsupported_state, "batched transform consumes object-space inputs"); return r;
     }
     for (unsigned i = 0; i < 4; ++i) {
         const unsigned channel = i % 2;
