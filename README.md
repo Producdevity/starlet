@@ -20,6 +20,14 @@ and the disc handling and SDL services its ports share:
   serves them as the SDK's CARD calls (source ports) or as formatted card images
   (EXI card models). C++17, no other dependencies. `starlet::card_sdk` binds the
   SDK's CARD functions on `starlet::os`.
+- SDK-level services for decompilation ports (Linux; `include/starlet/sdk/` declares the SDK types
+  and calls they implement, and a port asserts its decompilation's layouts match):
+  `starlet::os` (guest threads, interrupts, alarms, time, game memory, crash reports),
+  `starlet::dvd` (the DVD calls over installed discs), `starlet::pad`, `starlet::ar` (ARAM),
+  `starlet::gx_fifo` (the write-gather pipe, FIFO, draw sync and VI over the GX renderer),
+  `starlet::ai` (audio DMA), `starlet::ax` (the AX voice library mixed natively),
+  `starlet::card_sdk` (the CARD calls over `starlet::card`). `include/starlet/compat/` holds the
+  big-endian field types and Gekko intrinsic replacements their ports compile against.
 - `starlet::host` (`starlet_host`) plays audio through the firmware's SDL2, reads
   its game controllers into a port's GameCube layout, and turns the frontend's
   SIGTERM into a prompt exit with the saves flushed. C++17 and SDL2.
