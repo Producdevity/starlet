@@ -48,6 +48,7 @@ void priorities() {
     static const char a = 'a', b = 'b';
     OSCreateThread(&thread_a, mark, const_cast<char*>(&a), stack_a + sizeof stack_a, sizeof stack_a, 10, 0);
     OSCreateThread(&thread_b, mark, const_cast<char*>(&b), stack_b + sizeof stack_b, sizeof stack_b, 20, 0);
+    expect(*thread_a.stackEnd == OS_THREAD_STACK_MAGIC, "stack end marked");
     OSResumeThread(&thread_b);
     trace += 'm';
     OSResumeThread(&thread_a);

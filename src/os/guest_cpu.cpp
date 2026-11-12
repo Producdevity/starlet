@@ -416,6 +416,9 @@ BOOL OSCreateThread(OSThread* thread, OSThreadStartFunction func, void* param, v
     thread->linkActive.next = thread->linkActive.prev = nullptr;
     thread->stackBase = static_cast<u8*>(stack);
     thread->stackEnd = reinterpret_cast<u32*>(static_cast<u8*>(stack) - stackSize);
+    // The SDK marks the end of the game's stack; games check it for overflows. The thread itself
+    // runs on a larger native stack, so the game's stack memory only carries the mark.
+    if (stack && stackSize >= sizeof(u32)) *thread->stackEnd = OS_THREAD_STACK_MAGIC;
     thread->error = 0;
     thread->specific[0] = thread->specific[1] = nullptr;
     host_allocation_scope host_;  // Scheduler containers must not take game memory.
