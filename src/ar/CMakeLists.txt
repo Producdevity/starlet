@@ -1,0 +1,6 @@
+add_library(starlet_ar STATIC ar.cpp)
+add_library(starlet::ar ALIAS starlet_ar)
+target_include_directories(starlet_ar PUBLIC "${PROJECT_SOURCE_DIR}/include")
+target_compile_features(starlet_ar PUBLIC cxx_std_17)
+set_target_properties(starlet_ar PROPERTIES CXX_EXTENSIONS OFF)
+target_link_libraries(starlet_ar PUBLIC starlet::os)

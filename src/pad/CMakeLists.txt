@@ -1,0 +1,6 @@
+add_library(starlet_pad STATIC pad.cpp)
+add_library(starlet::pad ALIAS starlet_pad)
+target_include_directories(starlet_pad PUBLIC "${PROJECT_SOURCE_DIR}/include")
+target_compile_features(starlet_pad PUBLIC cxx_std_17)
+set_target_properties(starlet_pad PROPERTIES CXX_EXTENSIONS OFF)
+target_link_libraries(starlet_pad PUBLIC starlet::os)
