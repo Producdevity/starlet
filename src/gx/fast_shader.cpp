@@ -147,7 +147,8 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
         const auto& stage = tev.stages[i];
         f << "    { // stage " << i << "\n";
         const bool z_lookup = z_code && i + 1u == tev.stage_count;
-        if (tev_input_use(stage).texture || z_lookup) {
+        const auto use = tev_input_use(stage);
+        if (use.texture || z_lookup) {
             const auto c = std::to_string(unsigned(stage.texture_coord));
             const auto& s = indirect.stages[i];
             std::string uv;
@@ -164,7 +165,7 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
             } else uv = uv_of(stage.texture_coord) + "*uGxCoordinateScale[" + std::to_string(i) + "]";
             if (z_lookup) f << "        gxZLookup=ivec4(" << sample(stage.texture_map, uv) << "*255.0+0.5);\n        vec4 tex=vec4(0.0);\n";
             else f << "        vec4 tex=" << sample(stage.texture_map, uv) << "." << swizzle(stage.texture_swap) << ";\n";
-        } else f << "        vec4 tex=vec4(0.0);\n";
+        } else f << "        vec4 tex=vec4(" << (use.constant_texture && tev.disabled_texture ? "1.0" : "0.0") << ");\n";
         f << "        vec4 ras=" << (stage.raster == TevRaster::zero ? std::string("vec4(0.0)")
                                      : "gx_color" + std::to_string(code(stage.raster)) + "." + swizzle(stage.raster_swap)) << ";\n"
           << "        vec3 kc=" << konst(stage.color_konst, false) << ";\n"

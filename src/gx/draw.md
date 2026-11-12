@@ -18,6 +18,11 @@ only beside color 0. A channel with no vertex color reads white (Deep Dark's
 star select draws one), following Dolphin's default for this case. A texgen whose
 TEXn source is absent from the vertex reads (0, 0, 1, 1) (Pikmin 2's Day 1 draws
 one); hardware behaviour is unverified, and Dolphin is the reference.
+A TEV stage reading TEXC, TEXA or texture alpha with its lookup disabled (TEV order
+bit 6 clear; Resident Evil 4 draws these) samples nothing and reads 255 in every
+component, or 0 when BP genMode enables no texture coordinates. This follows the
+observed behaviour Dolphin's PixelShaderGen.cpp and UberShaderPixel.cpp document;
+the no-coordinates case is marked unverified there.
 
 GX front faces are clockwise on screen. The SDK swaps its public cull-mode
 bits into BP hardware encoding; the renderer maps that encoding to GLES face

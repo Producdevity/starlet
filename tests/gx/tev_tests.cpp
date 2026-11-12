@@ -244,7 +244,7 @@ void alpha_tests_and_errors() {
     require(static_cast<bool>(generate_tev_shader(p,model)),"last stage may write any register");
     p=blank();require(evaluate_tev(p,{}, {},static_cast<TevArithmeticModel>(0)).status.error==TevError::unsupported_arithmetic,"no implicit arithmetic default");
     p.stages[0].color.inputs[3]=TevColorInput::texture_rgb;
-    require(evaluate_tev(p,{}, {},model).status.error==TevError::unsupported_state,"disabled texture input rejected");
+    require(eval(p).color==TevColor{{255,255,255,0}},"a disabled lookup needs no texture sample");
     p.stages[0].texture_enabled=true;require(evaluate_tev(p,{}, {},model).status.error==TevError::missing_input,"missing texture sample rejected");
     p=blank();p.stages[0].raster=TevRaster::color0;p.stages[0].alpha.inputs[3]=TevAlphaInput::raster;
     require(evaluate_tev(p,{}, {},model).status.error==TevError::missing_input,"missing raster sample rejected");
@@ -340,6 +340,46 @@ void emit_cases(const std::filesystem::path& directory) {
     }
     manifest<<"]}\n";require(static_cast<bool>(manifest),"write fixture manifest");
 }
+// A stage reading its texture with the lookup disabled reads a constant: 255 with texture
+// coordinates enabled in BP genMode, 0 without (draw.md).
+void disabled_lookup_constant() {
+    Memory memory; Sink sink; Decoder d(memory, sink);
+    bp(d, 0x00, 1); // One texgen, one stage.
+    bp(d, 0x28, 3u | (7u << 7)); // Map 3, coordinate 0, lookup disabled, no raster.
+    bp(d, 0xc0, 0x80000 | (15u << 12) | (15u << 8) | (15u << 4) | 8u); // D = TEXC.
+    bp(d, 0xc1, 0x80000 | (7u << 13) | (7u << 10) | (7u << 7) | (4u << 4) | (2u << 2)); // D = TEXA, swap table 2.
+    bp(d, 0xfa, 1); bp(d, 0xfb, 2); // Table 2 reorders components; a constant is unaffected.
+    auto white = capture_tev(d.state());
+    require(bool(white), white.status.message.c_str());
+    const auto& p = white.material->pipeline;
+    require(p.disabled_texture == 255, "texgens enabled: the disabled lookup reads 255");
+    const auto use = tev_input_use(p.stages[0]);
+    require(!use.texture && use.constant_texture && !tev_stage_samples(p, 0), "a disabled lookup samples nothing");
+    TevInputs in; in.texture[0] = {{1, 2, 3, 4}};
+    require(eval(p, {}, in).color == TevColor{{255, 255, 255, 255}}, "reference reads 255 without a sample");
+    in.texture_valid = 1;
+    require(eval(p, {}, in).color == TevColor{{255, 255, 255, 255}}, "a supplied sample is ignored");
+    const auto white_shader = generate_tev_shader(p, model);
+    require(bool(white_shader), white_shader.status.message.c_str());
+    require(white_shader.functions.find("ivec4 tex = ivec4(255);") != std::string::npos &&
+            white_shader.functions.find("textures[0]") == std::string::npos, "generated TEV reads the constant, not textures[0]");
+
+    bp(d, 0x00, 0); // No texgens.
+    auto black = capture_tev(d.state());
+    require(bool(black) && black.material->pipeline.disabled_texture == 0, "no texgens: the disabled lookup reads 0");
+    require(eval(black.material->pipeline, {}, in).color == TevColor{{0, 0, 0, 0}}, "reference reads 0");
+    const auto black_shader = generate_tev_shader(black.material->pipeline, model);
+    require(bool(black_shader) && black_shader.functions.find("ivec4 tex = ivec4(0);") != std::string::npos &&
+            black_shader.functions.find("textures[0]") == std::string::npos, "generated TEV reads zero");
+    require(black_shader.key != white_shader.key, "the constant is pipeline identity");
+
+    // Stages not reading their disabled lookup keep their keys and text.
+    auto unused = blank(), unused_black = blank(); unused_black.disabled_texture = 0;
+    const auto a = generate_tev_shader(unused, model), b = generate_tev_shader(unused_black, model);
+    require(a && b && a.key == b.key && a.fragment == b.fragment, "an unread disabled lookup is no identity");
+    unused.disabled_texture = 7;
+    require(!generate_tev_shader(unused, model), "only 0 and 255 are disabled-lookup values");
+}
 void generated_shader_contract() {
     for(const auto& c:shader_cases()) {
         const auto a=generate_tev_shader(c.pipeline,model),b=generate_tev_shader(c.pipeline,model);
@@ -352,7 +392,7 @@ void generated_shader_contract() {
 }
 int main(int argc,char** argv) {
     try {
-        decode_capture_and_keys();z_texture_stages();konst_selector_decode();every_selector_and_swaps();arithmetic_candidate();comparisons_and_stage_order();alpha_tests_and_errors();generated_shader_contract();
+        decode_capture_and_keys();z_texture_stages();konst_selector_decode();every_selector_and_swaps();arithmetic_candidate();comparisons_and_stage_order();alpha_tests_and_errors();disabled_lookup_constant();generated_shader_contract();
         if(argc==3 && std::string(argv[1])=="--emit-shaders")emit_cases(argv[2]);
         else require(argc==1,"usage: starlet_gx_tev_tests [--emit-shaders directory]");
         std::cout<<"GX TEV tests passed (fixed8_candidate_v1; original-GX precision unverified)\n";

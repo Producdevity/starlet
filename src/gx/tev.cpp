@@ -64,9 +64,9 @@ TevStatus validate(const TevPipeline& pipeline, TevArithmeticModel model) {
             std::any_of(stage.texture_swap.begin(), stage.texture_swap.end(), [](unsigned v) { return v > 3; }) ||
             std::any_of(stage.raster_swap.begin(), stage.raster_swap.end(), [](unsigned v) { return v > 3; }))
             return failure(TevError::invalid_pipeline, "invalid TEV stage field");
-        if (uses_texture(stage) && !stage.texture_enabled)
-            return failure(TevError::unsupported_state, "TEV texture input with disabled lookup is unsupported");
     }
+    if (pipeline.disabled_texture != 0 && pipeline.disabled_texture != 255)
+        return failure(TevError::invalid_pipeline, "invalid disabled-lookup texture value");
     if (pipeline.z_texture_op > 2 || pipeline.z_texture_type > 2 || (!pipeline.z_texture_op && pipeline.z_texture_type))
         return failure(TevError::invalid_pipeline, "invalid Z-texture op or type");
     if (pipeline.z_texture_op) {
@@ -221,7 +221,9 @@ std::vector<std::uint8_t> pipeline_key(const TevPipeline& pipeline, TevArithmeti
         equation(stage.color); equation(stage.alpha); konst(stage.color_konst); konst(stage.alpha_konst);
         for (auto swap : stage.texture_swap) put(swap);
         for (auto swap : stage.raster_swap) put(swap);
-        put(code(stage.raster)); put(stage.texture_enabled); put(stage.texture_map); put(stage.texture_coord);
+        // 2: the stage reads its disabled lookup as 0; earlier keys keep their bytes.
+        put(stage.texture_enabled ? 1 : uses_texture(stage) && !pipeline.disabled_texture ? 2 : 0);
+        put(stage.texture_map); put(stage.texture_coord);
     }
     if (pipeline.z_texture_op) { put('Z'); put(pipeline.z_texture_op); put(pipeline.z_texture_type); }
     return key;
@@ -290,13 +292,15 @@ std::string alpha_comparison_expression(TevCompare op, unsigned index) {
 } // namespace
 
 TevInputUse tev_input_use(const TevStage& stage) {
-    return {uses_texture(stage), static_cast<std::uint8_t>(uses_raster(stage) && stage.raster != TevRaster::zero
-        ? 1u << static_cast<unsigned>(stage.raster) : 0)};
+    const bool texture = uses_texture(stage);
+    return {texture && stage.texture_enabled, static_cast<std::uint8_t>(uses_raster(stage) && stage.raster != TevRaster::zero
+        ? 1u << static_cast<unsigned>(stage.raster) : 0), texture && !stage.texture_enabled};
 }
 
 bool tev_stage_samples(const TevPipeline& pipeline, unsigned stage) {
     return stage < pipeline.stage_count &&
-           (uses_texture(pipeline.stages[stage]) || (pipeline.z_texture_op && stage + 1u == pipeline.stage_count));
+           ((uses_texture(pipeline.stages[stage]) && pipeline.stages[stage].texture_enabled) ||
+            (pipeline.z_texture_op && stage + 1u == pipeline.stage_count));
 }
 
 TevUniforms capture_tev_uniforms(const State& state) {
@@ -318,6 +322,7 @@ TevCapture capture_tev(const State& state) {
     TevPipeline pipeline;
     auto uniforms = capture_tev_uniforms(state);
     pipeline.stage_count = field(state.bp(0x00), 10, 4) + 1;
+    pipeline.disabled_texture = field(state.bp(0x00), 0, 4) ? 255 : 0;
     ZTexture z;
     if (!decode_z_texture(state.bp(0xf4), state.bp(0xf5), z))
         return {failure(TevError::unsupported_state, "reserved Z-texture state"), {}};
@@ -372,13 +377,15 @@ TevEvaluation evaluate_tev(const TevPipeline& pipeline, const TevUniforms& unifo
     }
     for (unsigned i = 0; i < pipeline.stage_count; ++i) {
         const auto& stage = pipeline.stages[i];
-        if (uses_texture(stage) && !(inputs.texture_valid & (1u << i))) {
+        if (uses_texture(stage) && stage.texture_enabled && !(inputs.texture_valid & (1u << i))) {
             result.status = failure(TevError::missing_input, "required TEV texture sample is absent"); return result;
         }
         if (uses_raster(stage) && stage.raster != TevRaster::zero && !(inputs.raster_valid & (1u << code(stage.raster)))) {
             result.status = failure(TevError::missing_input, "required TEV raster color is absent"); return result;
         }
-        const IntColor texture = swapped(inputs.texture[i], stage.texture_swap);
+        const int disabled = pipeline.disabled_texture;
+        const IntColor texture = stage.texture_enabled ? swapped(inputs.texture[i], stage.texture_swap)
+                                                       : IntColor{{disabled, disabled, disabled, disabled}};
         const IntColor raster = stage.raster == TevRaster::zero ? IntColor{} : swapped(inputs.raster[code(stage.raster)], stage.raster_swap);
         const auto kc = constant(stage.color_konst, uniforms), ka = constant(stage.alpha_konst, uniforms);
         std::array<IntColor, 4> color{};
@@ -437,7 +444,9 @@ TevShader generate_tev_shader(const TevPipeline& pipeline, TevArithmeticModel mo
     for (unsigned i = 0; i < 4; ++i) glsl << "    ivec4 r" << i << " = uGxTevRegisters[" << i << "];\n";
     for (unsigned i = 0; i < pipeline.stage_count; ++i) {
         const auto& stage = pipeline.stages[i];
-        glsl << "    { // stage " << i << "\n        ivec4 tex = textures[" << i << "]." << swizzle(stage.texture_swap) << ";\n";
+        glsl << "    { // stage " << i << "\n        ivec4 tex = ";
+        if (stage.texture_enabled || !uses_texture(stage)) glsl << "textures[" << i << "]." << swizzle(stage.texture_swap) << ";\n";
+        else glsl << "ivec4(" << unsigned(pipeline.disabled_texture) << ");\n";
         glsl << "        ivec4 ras = " << (stage.raster == TevRaster::zero ? "ivec4(0)"
             : "raster[" + std::to_string(code(stage.raster)) + "]." + swizzle(stage.raster_swap)) << ";\n";
         glsl << "        ivec3 kc = " << konst_expression(stage.color_konst, false) << ";\n";

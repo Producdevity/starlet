@@ -54,7 +54,9 @@ struct TevStage {
     bool texture_enabled = false;
 };
 
-struct TevInputUse { bool texture = false; std::uint8_t raster_mask = 0; };
+// texture: the stage samples its texture map. constant_texture: it reads a texture input with
+// its lookup disabled, which yields TevPipeline::disabled_texture and samples nothing.
+struct TevInputUse { bool texture = false; std::uint8_t raster_mask = 0; bool constant_texture = false; };
 // For a validated stage; alpha comparison A/B operands using the color compare
 // result do not consume their encoded alpha inputs.
 TevInputUse tev_input_use(const TevStage&);
@@ -67,6 +69,9 @@ struct TevPipeline {
     // BP 0xF5 while its op is active (ZTexture): op 1 add, 2 replace; type 0 Z8, 1 Z16, 2 Z24X8.
     // The last stage's lookup is the Z texel and is unavailable as a TEV input (GX manual 9.12).
     std::uint8_t z_texture_op = 0, z_texture_type = 0;
+    // Every component of a texture input whose stage has its lookup disabled: 255, or 0 when BP
+    // genMode enables no texture coordinates (draw.md).
+    std::uint8_t disabled_texture = 255;
 };
 // Whether stage i's texture lookup is consumed: by its TEV inputs, or as the Z texel.
 bool tev_stage_samples(const TevPipeline&, unsigned stage);
@@ -113,7 +118,7 @@ TevUniforms capture_tev_uniforms(const State& state);
 enum class TevArithmeticModel : std::uint8_t { fixed8_candidate_v1 = 1 };
 
 struct TevInputs {
-    std::array<TevColor, 16> texture{}; // sampled RGBA8 before the stage's swap.
+    std::array<TevColor, 16> texture{}; // sampled RGBA8 before the stage's swap; unused without a lookup.
     std::array<TevColor, 2> raster{};   // interpolated/quantized RGBA8 before swap.
     std::uint16_t texture_valid = 0;
     std::uint8_t raster_valid = 0;

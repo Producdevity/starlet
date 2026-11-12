@@ -353,7 +353,9 @@ void shared_maps_and_dead_inputs() {
     stage.alpha.operation = TevOperation::r8_gt;
     stage.alpha.inputs[0] = TevAlphaInput::texture; stage.alpha.inputs[1] = TevAlphaInput::raster;
     check(!tev_input_use(stage).texture && !tev_input_use(stage).raster_mask, "color comparison replaces alpha A/B inputs");
-    stage.alpha.inputs[2] = TevAlphaInput::texture; check(tev_input_use(stage).texture, "alpha C still consumed");
+    stage.alpha.inputs[2] = TevAlphaInput::texture;
+    check(!tev_input_use(stage).texture && tev_input_use(stage).constant_texture, "alpha C reads the disabled lookup's constant");
+    stage.texture_enabled = true; check(tev_input_use(stage).texture, "alpha C still consumed");
 }
 void rejection_and_limits() {
     Fixture f;
@@ -515,10 +517,32 @@ void fast_program_rebuilds() {
     check(!direct_program_state(words, state, layout), "words without the fast flag are refused");
     latched_normal_program_rebuild();
 }
+// The default fixture's stage reads TEXC from map 3; with its lookup disabled the draw binds and
+// samples no texture and reads the constant (draw.md).
+void disabled_lookup_draws() {
+    for (const bool texgens : {true, false}) {
+        Fixture f; f.bp(0x28, 0x0b);
+        if (!texgens) f.bp(0x00, 0x10);
+        const auto captured = f.capture(); const auto& draw = packet(captured);
+        check(draw.texture_mask == 0, "a disabled lookup captures no texture");
+        const auto planned = plan_gles_draw(draw); const auto& gpu = pipeline(planned);
+        check(gpu.fragment.find("uGxTexture") == std::string::npos &&
+              gpu.fragment.find(texgens ? "ivec4 tex = ivec4(255);" : "ivec4 tex = ivec4(0);") != std::string::npos,
+              "exact program reads the constant and declares no sampler");
+        const auto command = f.command();
+        const auto fast = plan_direct_program(f.decoder.state(), command.layout, FramebufferFetch::none, DirectShading::fast);
+        check(bool(fast), fast.status.message.c_str());
+        check(fast.program->maps == 0 && fast.program->fragment.find("uGxTexture") == std::string::npos &&
+              fast.program->fragment.find(texgens ? "vec4 tex=vec4(1.0);" : "vec4 tex=vec4(0.0);") != std::string::npos,
+              "fast program reads the constant and binds no map");
+        fast_program_rebuild(f, "disabled-lookup program rebuilds from its words");
+    }
+}
 int main(int argc, char** argv) {
     try {
         direct_parity_cases();
         fast_program_rebuilds();
+        disabled_lookup_draws();
         clipped_texture_projection(); clip_disabled_draws(); offscreen_clip_disabled_draws(); deferred_shader_source(); mipmap_lod_controls(); perspective_integration(); inactive_indirect_inputs(); indirect_lookup_and_offsets(); rgb8_full_replacement(); rgb8_alpha_update(); rgba6_fetch_boundary(); depth_shader_order(); routing_ownership_and_keys(); automatic_repeat_coordinates(); shared_maps_and_dead_inputs(); rejection_and_limits();
         if (argc == 2) {
             Fixture f; const auto c = f.capture(); const auto p = plan_gles_draw(packet(c));
