@@ -1,4 +1,7 @@
 #include "api.hpp"
+#ifdef STARLET_THP_SDK_TESTS
+#include "starlet/os/os_core.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -321,10 +324,39 @@ void synthetic() {
     malformed(encode(progressive), 16, 16);
 }
 } // namespace
+#ifdef STARLET_THP_SDK_TESTS
+std::vector<std::pair<const void *, std::size_t>> reported;
+
+// THPVideoDecode reports the planes it wrote, as the SDK's DMA bypassed the data cache, and
+// nothing when it decodes no frame.
+void sdk_reports_planes() {
+    Frame frame{32, 16};
+    for (int i = 0; i < 12; ++i)
+        frame.blocks.push_back(detailed(i * 9 - 50, 1));
+    auto bytes = encode(frame);
+    bytes.resize(bytes.size() + 65536); // the SDK's call gets no length; keep its reads in bounds
+    std::vector<std::uint8_t> y(32 * 16), u(16 * 8), v(16 * 8), work(64);
+    starlet::os::set_cpu_write_observer(
+        [](const void *data, std::size_t size) { reported.emplace_back(data, size); });
+    check(THPInit() != 0, "THPInit failed");
+    check(THPVideoDecode(bytes.data(), y.data(), u.data(), v.data(), work.data()) == 0, "THPVideoDecode failed");
+    const std::vector<std::pair<const void *, std::size_t>> planes{
+        {y.data(), y.size()}, {u.data(), u.size()}, {v.data(), v.size()}};
+    check(reported == planes, "THPVideoDecode must report each plane it wrote");
+    reported.clear();
+    check(THPVideoDecode(bytes.data(), y.data(), u.data(), v.data(), nullptr) != 0, "missing work area accepted");
+    check(reported.empty(), "a frame not decoded must report no writes");
+    starlet::os::set_cpu_write_observer(nullptr);
+}
+#endif
+
 int main() {
     try {
         bounds();
         synthetic();
+#ifdef STARLET_THP_SDK_TESTS
+        sdk_reports_planes();
+#endif
         std::puts("THP video: bounds and synthetic frames passed");
     } catch (const std::exception &e) {
         std::fprintf(stderr, "THP video: %s\n", e.what());

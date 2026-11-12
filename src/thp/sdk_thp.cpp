@@ -1,5 +1,6 @@
 // The SDK's THPInit, THPVideoDecode and THPAudioDecode on starlet::thp, for ports whose player is
 // the SDK's. Frames and audio records are as read from the disc.
+#include "starlet/os/os_core.hpp"
 #include "starlet/thp/thp.hpp"
 #include <cstdio>
 
@@ -33,6 +34,11 @@ starlet::sdk::s32 THPVideoDecode(void* file, void* tileY, void* tileU, void* til
         std::fprintf(stderr, "THP video frame not decoded: %s\n", error.what());
         return 1;
     }
+    // The SDK's locked-cache DMA wrote the planes to memory behind the data cache; GX texture
+    // caches must see the new frame.
+    starlet::os::report_cpu_write(tileY, luma);
+    starlet::os::report_cpu_write(tileU, luma / 4);
+    starlet::os::report_cpu_write(tileV, luma / 4);
     return 0;
 }
 

@@ -21,7 +21,8 @@ read from the disc (big-endian). Moved from the Super Mario Galaxy port's platfo
 
 Malformed input throws `starlet::thp::Error`. A port with its own player links `starlet::thp`;
 `starlet::thp_sdk` adds the SDK's `THPInit`, `THPVideoDecode` and `THPAudioDecode` for ports that
-keep the SDK's player. `THPVideoDecode` gets no frame length, as in the SDK: the frame ends with its
+keep the SDK's player (Linux, on `starlet::os`); `THPVideoDecode` reports the planes it writes
+with `report_cpu_write`, as the SDK's DMA bypassed the data cache. `THPVideoDecode` gets no frame length, as in the SDK: the frame ends with its
 scan, bounded at 4 MiB.
 
 Tests: `tests/thp` (bounds, every Huffman path, zero runs, restarts, partial MCU rows and malformed
