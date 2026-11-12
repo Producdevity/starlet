@@ -31,7 +31,9 @@ inline constexpr std::uint32_t batched_program_word = 0xba7c4ed1u;
 inline constexpr std::uint32_t instanced_program_word = 0x1a57a2c1u;
 // Options of a batched variant, appended after batched_program_word when any is set.
 // batched_zero_alpha: fragments failing the alpha test keep alpha 0 instead of being discarded.
-inline constexpr std::uint32_t batched_zero_alpha = 1, batched_options_mask = 1;
+// batched_vertex_fog: each vertex computes the fog factor at its window depth (needs fog
+// without range adjustment or a Z texture).
+inline constexpr std::uint32_t batched_zero_alpha = 1, batched_vertex_fog = 2, batched_options_mask = 3;
 // Fast-shading words only: a State and layout whose words equal words, so the program
 // can be planned before a draw needs it. False for any other words. latched_normal
 // receives the latched-normal components the words record, for plan_direct_program;

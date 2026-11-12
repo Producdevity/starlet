@@ -220,12 +220,15 @@ DirectProgramResult plan_direct_program(const State& state, const VertexLayout& 
         p->constant_alpha = p->rgba6 && (state.bp(0x42) & 0x100);
         p->fog = fast_fog(state);
         p->affine = affine_coordinates(state, p->transform);
+        const bool vertex_fog = batched_options & batched_vertex_fog;
+        if (vertex_fog && (!(p->fog & 7) || (p->fog & 16) || p->z_texture.op))
+            return fail(DrawError::unsupported_state, "vertex fog needs fog without range adjustment or a Z texture");
         const auto vertex = generate_transform_glsl(p->transform, TransformArithmetic::float32_candidate_v1, true, batched, p->affine, true,
-                                                    instanced);
+                                                    instanced, vertex_fog ? p->fog : 0);
         if (!vertex) return fail(DrawError::transform, vertex.status.message);
         p->vertex = vertex.source;
         p->fragment = fast_fragment_source(p->tev, p->indirect, p->maps, p->early_depth, p->constant_alpha, batched, p->affine, p->fog,
-                                           wide_registers(state), p->z_texture, (batched_options & batched_zero_alpha) != 0);
+                                           wide_registers(state), p->z_texture, (batched_options & batched_zero_alpha) != 0, vertex_fog);
         return {{}, std::move(p)};
     }
     if (p->rgba6) {

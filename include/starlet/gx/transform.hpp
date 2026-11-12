@@ -190,10 +190,13 @@ struct TransformShader {
 // instance from GXInstances (binding 1), transform_instance_rows vec4s per instance:
 // three position rows, then three normal rows; everything else from GXTransform. Emboss
 // texgens (which read the normal matrix themselves) are rejected.
+// fog (batched only, type | orthographic << 3 as for fast_fragment_source, no range
+// adjustment): the vertex evaluates fast_fog_glsl at its own window depth into flat highp
+// gx_fog, reading uGxFog and gl_DepthRange.
 inline constexpr unsigned transform_instance_limit = 128;
 inline constexpr unsigned transform_instance_rows = 6;
 TransformShader generate_transform_glsl(const TransformPipeline&, TransformArithmetic, bool include_source = true,
                                         bool batched = false, std::uint8_t affine = 0, bool compact = false,
-                                        bool instanced = false);
+                                        bool instanced = false, std::uint8_t fog = 0);
 
 } // namespace starlet::gx

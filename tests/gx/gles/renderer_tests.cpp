@@ -1077,11 +1077,12 @@ void direct_batched_materials() {
     check(lit.batched_draws == s.batched_draws + 2 && lit.uniform_blocks == s.uniform_blocks + 2 && lit.submissions == s.submissions + 2,
           "a lit channel's register material splits batches");
 }
-// The fragment source of the last batched program compiled since sources.
-std::string last_batched_fragment(std::size_t sources) {
+// The fragment or vertex source of the last batched program compiled since sources.
+std::string last_batched_fragment(std::size_t sources, bool vertex = false) {
     std::string found;
     for (auto i = sources; i < fake::shader_sources.size(); ++i)
-        if (fake::shader_sources[i].find("flat in mediump vec4 gx_register0") != std::string::npos) found = fake::shader_sources[i];
+        if (fake::shader_sources[i].find(vertex ? "flat out mediump vec4 gx_register0" : "flat in mediump vec4 gx_register0") != std::string::npos)
+            found = fake::shader_sources[i];
     return found;
 }
 void direct_batched_zero_alpha() {
@@ -1123,6 +1124,51 @@ void direct_batched_zero_alpha() {
     const auto plain = renderer.stats().direct.zero_alpha_draws;
     draw(); renderer.wait_until_idle();
     check(renderer.stats().direct.zero_alpha_draws == plain, "draws without an alpha test take no variant");
+}
+void direct_batched_vertex_fog() {
+    auto limits = batching_limits(); limits.direct.vertex_fog = true;
+    GlesRenderer renderer(limits); Fixture f;
+    const auto draw = [&] { renderer.draw_direct(f.decoder.state(), f.command(), f.memory); };
+    const auto has = [](const std::string& source, const char* text) { return source.find(text) != std::string::npos; };
+    auto sources = fake::shader_sources.size();
+    f.bp(0xf1, 4u << 21); // Exponential fog; every fixture vertex has eye depth -0.5.
+    draw(); f.f(3, 10.0f); draw(); renderer.wait_until_idle();
+    auto s = renderer.stats().direct;
+    check(s.vertex_fog_draws == 2 && s.batched_draws == 2 && s.submissions == 1, "batched draws of one depth fog per vertex and merge");
+    auto vertex = last_batched_fragment(sources, true), fragment = last_batched_fragment(sources);
+    check(has(vertex, "flat out highp float gx_fog;") && has(vertex, "gl_DepthRange") && has(vertex, "gx_fog=1.0-exp2(-8.0*fogX);") &&
+          has(vertex, "uGxFog.x/max(uGxFog.y-gxFogZ*uGxFog.z,1e-9)"), "the vertex evaluates the fog factor at its window depth");
+    check(has(fragment, "color.rgb=mix(color.rgb,uGxFogColor,gx_fog);") && !has(fragment, "uGxFog;") && !has(fragment, "gl_FragCoord.z"),
+          "the fragment mixes with the flat factor");
+    const auto per_fragment = [&](const char* message) {
+        const auto before = renderer.stats().direct;
+        sources = fake::shader_sources.size();
+        draw(); renderer.wait_until_idle();
+        const auto after = renderer.stats().direct;
+        fragment = last_batched_fragment(sources);
+        check(after.batched_draws == before.batched_draws + 1 && after.vertex_fog_draws == before.vertex_fog_draws &&
+              (fragment.empty() || has(fragment, "gl_FragCoord.z")), message);
+    };
+    f.vertices[2 * 32 + 8] ^= 0x01; // One vertex at another depth.
+    per_fragment("a draw whose vertices differ in depth fogs per fragment");
+    f.vertices[2 * 32 + 8] ^= 0x01;
+    f.bp(0xe8, 1u << 10); per_fragment("range adjustment fogs per fragment");
+    f.bp(0xe8, 0);
+    f.bp(0xf3, (4u << 16) | (7u << 19));
+    sources = fake::shader_sources.size();
+    draw(); renderer.wait_until_idle();
+    fragment = last_batched_fragment(sources);
+    check(renderer.stats().direct.vertex_fog_draws == s.vertex_fog_draws + 1 && renderer.stats().direct.zero_alpha_draws == 1 &&
+          has(fragment, "gx_fog") && has(fragment, "color.a=0.0"), "vertex fog and zero alpha combine");
+
+    GlesRenderer plain(batching_limits()); Fixture g; g.bp(0xf1, 4u << 21);
+    plain.draw_direct(g.decoder.state(), g.command(), g.memory); plain.wait_until_idle();
+    check(plain.stats().direct.batched_draws == 1 && plain.stats().direct.vertex_fog_draws == 0, "vertex fog is opt-in");
+    check(bool(plan_direct_program(f.decoder.state(), f.command().layout, FramebufferFetch::none, DirectShading::fast, true, 0, false,
+                                   batched_vertex_fog)), "the variant plans with fog");
+    f.bp(0xf1, 0);
+    check(!plan_direct_program(f.decoder.state(), f.command().layout, FramebufferFetch::none, DirectShading::fast, true, 0, false,
+                               batched_vertex_fog), "the variant needs fog");
 }
 void direct_clip_culling() {
     for (const auto shading : {DirectShading::exact, DirectShading::fast}) {
@@ -1720,6 +1766,7 @@ int main() {
         direct_batch_merging();
         direct_batched_materials();
         direct_batched_zero_alpha();
+        direct_batched_vertex_fog();
         direct_clip_culling();
         direct_indexed_clip_culling();
         direct_submission_thread();

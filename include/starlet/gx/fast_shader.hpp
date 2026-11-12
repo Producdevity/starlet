@@ -23,11 +23,17 @@ namespace starlet::gx {
 // shift, c), uGxFogColor and, with range adjustment, uGxFogCenter/uGxFogTable[10]. A Z texture
 // (z_texture_glsl) adds uGxZBias; its Z writes gl_FragDepth with depth and replaces the window
 // depth in fog. zero_alpha writes fragments that fail the alpha test with alpha 0 instead of
-// discarding them; see batched_zero_alpha_exact.
+// discarding them; see batched_zero_alpha_exact. vertex_fog reads the fog factor from the flat
+// gx_fog input (generate_transform_glsl) and keeps only uGxFogColor.
 std::string fast_fragment_source(const TevPipeline&, const IndirectSnapshot&, std::uint8_t maps,
                                  bool early_depth, bool constant_alpha, bool batched = false, std::uint8_t affine = 0,
                                  std::uint8_t fog = 0, std::uint8_t wide_registers = 0, const ZTextureProgram& = {},
-                                 bool zero_alpha = false);
+                                 bool zero_alpha = false, bool vertex_fog = false);
+// The fast model's GX fog factor at window depth z, a highp float expression: statements that
+// set highp fogX from uGxFog (with range adjustment also from gl_FragCoord.x, uGxFogCenter and
+// uGxFogTable), and the factor as an expression in fogX. fog as for fast_fragment_source.
+struct FastFogGlsl { std::string statements, factor; };
+FastFogGlsl fast_fog_glsl(std::uint8_t fog, const std::string& z);
 // Whether the fast fragment program tests alpha: false when both comparisons always pass.
 bool fast_alpha_test(const TevPipeline&);
 

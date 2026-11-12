@@ -1,4 +1,5 @@
 #include "starlet/gx/transform.hpp"
+#include "starlet/gx/fast_shader.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -545,7 +546,7 @@ TransformStatus validate_transform_vertices(const TransformSnapshot& snapshot, c
 }
 
 TransformShader generate_transform_glsl(const TransformPipeline& p, TransformArithmetic model, bool include_source, bool batched,
-                                        std::uint8_t affine, bool compact, bool instanced) {
+                                        std::uint8_t affine, bool compact, bool instanced, std::uint8_t fog) {
     TransformShader r;
     if (model != TransformArithmetic::float32_candidate_v1) {
         r.status = fail(TransformError::unsupported_arithmetic, "unsupported transform arithmetic model"); return r;
@@ -556,6 +557,10 @@ TransformShader generate_transform_glsl(const TransformPipeline& p, TransformAri
              static_cast<std::uint8_t>(p.dual_texture), static_cast<std::uint8_t>(batched), affine, static_cast<std::uint8_t>(compact),
              static_cast<std::uint8_t>(p.latched_normal), static_cast<std::uint8_t>(instanced)};
     if (batched && instanced) { r.status = fail(TransformError::unsupported_state, "a transform is batched or instanced"); return r; }
+    if (fog && (!batched || (fog & ~15u) || (fog & 7) < 2 || (fog & 7) == 3)) {
+        r.status = fail(TransformError::unsupported_state, "vertex fog needs a batched transform and a fog type without range adjustment");
+        return r;
+    }
     if (instanced)
         for (unsigned i = 0; i < p.texgen_count; ++i)
             if (p.texgens[i].type == 1) { r.status = fail(TransformError::unsupported_state, "instanced transform with an emboss texgen"); return r; }
@@ -582,6 +587,7 @@ TransformShader generate_transform_glsl(const TransformPipeline& p, TransformAri
         if (t.source_row >= 5 && !(p.vertex_texcoords & (1u << (t.source_row-5)))) r.key.push_back(0xff); // Absent ST.
         if (p.dual_texture) r.key.insert(r.key.end(), {std::uint8_t(t.normalize), t.post_row});
     }
+    if (fog) r.key.push_back(fog);
     if (!include_source) return r;
     std::ostringstream g;
     g << R"GLSL(#version 310 es
@@ -620,6 +626,7 @@ out vec4 gx_gles_clip;
         g << "layout(std140, binding=1) uniform GXInstances {\n    vec4 u_instance[" << transform_instance_limit * transform_instance_rows
           << "];\n};\n";
     g << (compact ? "out mediump vec4 gx_color0;\nout mediump vec4 gx_color1;\n" : "out vec4 gx_color0;\nout vec4 gx_color1;\n");
+    if (fog) g << "uniform highp vec4 uGxFog;\nflat out highp float gx_fog;\n";
     for (unsigned i = 0; i < 8; ++i) g << "out " << ((affine >> i) & 1 ? "vec2" : "vec3") << " gx_tex" << i << ";\n";
     g << R"GLSL(int matrixIndex(int indexSlot) {
     return int((a_matrix[indexSlot/3] >> uint((indexSlot%3)*8)) & 63u);
@@ -685,6 +692,12 @@ void main() {
     // No gl_PointSize: only triangles are rasterized, and Mali r20 makes every triangle
     // draw of a point-size-writing stage cost ~3x the CPU time in the driver.
     g << "    gx_gles_clip = vec4(gx_clip.xy,2.0*gx_clip.z+gx_clip.w,gx_clip.w);\n    gl_Position = gx_gles_clip;\n";
+    if (fog) {
+        // The window depth GL maps this vertex to: gl_FragCoord.z wherever the draw's depth is constant.
+        const auto fog_glsl = fast_fog_glsl(fog, "gxFogZ");
+        g << "    {\n    highp float gxFogZ=gx_gles_clip.z/gx_gles_clip.w*(gl_DepthRange.diff*0.5)+(gl_DepthRange.near+gl_DepthRange.far)*0.5;\n"
+          << fog_glsl.statements << "    gx_fog=" << fog_glsl.factor << ";\n    }\n";
+    }
     for (unsigned i = 0; i < 4; ++i) {
         const unsigned channel = i%2;
         if (!(p.computed_colors & (1u << channel)) || (i >= 2 && channel >= p.color_count)) continue;

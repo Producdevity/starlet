@@ -57,6 +57,9 @@ struct GlesDirectLimits {
     // and last included) and are sampled or materialized only while every stamp is
     // intact. A game that reuses the memory breaks a stamp, and its bytes then stay.
     bool stamp_resident_copies = false;
+    // Fast shading: batched draws whose vertices share one eye depth compute fog per vertex
+    // (batched_vertex_fog); see direct.md. Off keeps every fog per fragment.
+    bool vertex_fog = false;
 };
 // An EFB texture copy held only on the GPU: texture holds the texels the copy's
 // sample format decodes, so memory at destination is stale until materialized.
@@ -108,6 +111,8 @@ struct GlesDirectStats {
     std::uint64_t instanced_draws = 0;
     // Batched draws whose alpha test keeps failing fragments with alpha 0 (batched_zero_alpha).
     std::uint64_t zero_alpha_draws = 0;
+    // Batched draws that computed fog per vertex (batched_vertex_fog).
+    std::uint64_t vertex_fog_draws = 0;
     // Texture resolutions (cache lookups, validation, decoding) the draws needed.
     std::uint64_t texture_lookups = 0;
     GlesProgramCacheStats program_cache;

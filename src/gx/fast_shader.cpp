@@ -77,6 +77,24 @@ std::string alpha_test(TevCompare op, unsigned index) {
 }
 }
 
+FastFogGlsl fast_fog_glsl(std::uint8_t fog, const std::string& z) {
+    const unsigned fog_type = fog & 7;
+    std::ostringstream f;
+    // Depths behind the B plane are fully fogged, as the hardware's divide saturates.
+    f << "    highp float fogDepth=" << (fog & 8 ? "uGxFog.x*" + z
+                                           : "uGxFog.x/max(uGxFog.y-" + z + "*uGxFog.z,1e-9)") << ";\n";
+    // Range adjustment: sample i is the factor (i+1)*32 pixels from the center (GXInitFogAdjTable);
+    // the hardware interpolates two samples, and the factor is 1 at the center itself.
+    if (fog & 16)
+        f << "    highp float fogStep=min(abs(gl_FragCoord.x-uGxFogCenter)/32.0,10.0);\n    int fogIndex=int(fogStep);\n"
+             "    highp float fogBelow=fogIndex==0?1.0:uGxFogTable[min(fogIndex-1,9)];\n"
+             "    fogDepth*=mix(fogBelow,uGxFogTable[min(fogIndex,9)],fogStep-float(fogIndex));\n";
+    f << "    highp float fogX=clamp(fogDepth-uGxFog.w,0.0,1.0);\n";
+    const char* factor = fog_type == 2 ? "fogX" : fog_type == 4 ? "1.0-exp2(-8.0*fogX)" : fog_type == 5 ? "1.0-exp2(-8.0*fogX*fogX)"
+                         : fog_type == 6 ? "exp2(-8.0*(1.0-fogX))" : "exp2(-8.0*(1.0-fogX)*(1.0-fogX))";
+    return {f.str(), factor};
+}
+
 bool fast_alpha_test(const TevPipeline& tev) {
     return !(tev.alpha_compare[0] == TevCompare::always && tev.alpha_compare[1] == TevCompare::always &&
              tev.alpha_logic == TevAlphaLogic::and_);
@@ -85,7 +103,7 @@ bool fast_alpha_test(const TevPipeline& tev) {
 std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot& indirect, std::uint8_t maps,
                                  bool early_depth, bool constant_alpha, bool batched, std::uint8_t affine,
                                  std::uint8_t fog, std::uint8_t wide_registers, const ZTextureProgram& z_texture,
-                                 bool zero_alpha) {
+                                 bool zero_alpha, bool vertex_fog) {
     std::ostringstream f;
     f << "#version 310 es\n";
     if (early_depth) f << "layout(early_fragment_tests) in;\n";
@@ -114,8 +132,9 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
     const bool z_code = z_texture.op && (z_texture.depth || fog_type);
     const auto z_glsl = z_code ? z_texture_glsl(z_texture, "gxZLookup") : ZTextureGlsl{};
     f << z_glsl.globals;
-    if (fog_type) f << "uniform highp vec4 uGxFog;\nuniform mediump vec3 uGxFogColor;\n";
-    if (fog_type && (fog & 16)) f << "uniform highp float uGxFogCenter;\nuniform highp float uGxFogTable[10];\n";
+    if (fog_type && vertex_fog) f << "flat in highp float gx_fog;\nuniform mediump vec3 uGxFogColor;\n";
+    else if (fog_type) f << "uniform highp vec4 uGxFog;\nuniform mediump vec3 uGxFogColor;\n";
+    if (fog_type && (fog & 16) && !vertex_fog) f << "uniform highp float uGxFogCenter;\nuniform highp float uGxFogTable[10];\n";
     if (indirect_coordinates(indirect)) f << "uniform highp vec2 uGxImageSize[16];\n";
     if (indirect.lookup_mask) f << "uniform highp vec4 uGxIndirectScale[4];\n"
                                    "uniform highp ivec4 uGxIndirectRows[6];\n" << indirect_offset_glsl();
@@ -234,22 +253,12 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
           << alpha_test(tev.alpha_compare[1], 1) << ")) " << (zero_alpha ? "color.a=0.0" : "discard") << ";\n";
     if (constant_alpha) f << "    float blendAlpha=color.a;\n    color.a=uGxConstantAlpha.y>0.5?blendAlpha:uGxConstantAlpha.x;\n";
     f << z_glsl.depth;
-    if (fog_type) {
+    if (fog_type && vertex_fog) f << "    color.rgb=mix(color.rgb,uGxFogColor,gx_fog);\n";
+    else if (fog_type) {
         const std::string z = z_code ? "gxDepth" : "gl_FragCoord.z";
         if (z_code) f << "    highp float gxDepth=float(gxZ)/16777216.0;\n";
-        // Depths behind the B plane are fully fogged, as the hardware's divide saturates.
-        f << "    highp float fogDepth=" << (fog & 8 ? "uGxFog.x*" + z
-                                               : "uGxFog.x/max(uGxFog.y-" + z + "*uGxFog.z,1e-9)") << ";\n";
-        // Range adjustment: sample i is the factor (i+1)*32 pixels from the center (GXInitFogAdjTable);
-        // the hardware interpolates two samples, and the factor is 1 at the center itself.
-        if (fog & 16)
-            f << "    highp float fogStep=min(abs(gl_FragCoord.x-uGxFogCenter)/32.0,10.0);\n    int fogIndex=int(fogStep);\n"
-                 "    highp float fogBelow=fogIndex==0?1.0:uGxFogTable[min(fogIndex-1,9)];\n"
-                 "    fogDepth*=mix(fogBelow,uGxFogTable[min(fogIndex,9)],fogStep-float(fogIndex));\n";
-        f << "    highp float fogX=clamp(fogDepth-uGxFog.w,0.0,1.0);\n";
-        const char* factor = fog_type == 2 ? "fogX" : fog_type == 4 ? "1.0-exp2(-8.0*fogX)" : fog_type == 5 ? "1.0-exp2(-8.0*fogX*fogX)"
-                             : fog_type == 6 ? "exp2(-8.0*(1.0-fogX))" : "exp2(-8.0*(1.0-fogX)*(1.0-fogX))";
-        f << "    color.rgb=mix(color.rgb,uGxFogColor," << factor << ");\n";
+        const auto fog_glsl = fast_fog_glsl(fog, z);
+        f << fog_glsl.statements << "    color.rgb=mix(color.rgb,uGxFogColor," << fog_glsl.factor << ");\n";
     }
     if (constant_alpha) f << "    color.rgb*=uGxConstantAlpha.z>1.5?1.0-blendAlpha:(uGxConstantAlpha.z>0.5?blendAlpha:1.0);\n";
     f << "    gxFragmentColor=color;\n}\n";

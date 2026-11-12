@@ -1870,6 +1870,10 @@ struct GlesDirect::Impl {
         auto& target = expanded ? expansion : vertices;
         const auto at = expanded ? 0 : vertices.size();
         target.resize(at + std::size_t{result.vertices} * batched.stride);
+        // Fog per vertex is exact only where every fragment sees the vertices' depth.
+        const auto& fog = p->plan->fog;
+        bool one_depth = limits.vertex_fog && !expanded && (fog & 7) && !(fog & 16) && !p->plan->z_texture.op;
+        std::uint32_t depth = 0;
         for (std::uint32_t v = 0; v < result.vertices; ++v) {
             auto* out = target.data() + at + std::size_t{v} * batched.stride;
             const auto* in = batch_vertices.data() + std::size_t{v} * format.stride;
@@ -1879,6 +1883,12 @@ struct GlesDirect::Impl {
             for (unsigned k = 0; k < 3; ++k)
                 eye[k] = m[k * 4] * position[0] + m[k * 4 + 1] * position[1] + m[k * 4 + 2] * position[2] + m[k * 4 + 3];
             std::memcpy(out, eye, sizeof eye);
+            if (one_depth) {
+                std::uint32_t bits;
+                std::memcpy(&bits, &eye[2], 4);
+                if (!v) depth = bits;
+                else one_depth = bits == depth;
+            }
             if (!materials) std::memcpy(out + batched.color_offset(0), in + format.color_offset(0), color_bytes);
             else for (unsigned c = 0; c < 2; ++c) {
                 auto* color = out + batched.color_offset(c);
@@ -1900,7 +1910,7 @@ struct GlesDirect::Impl {
             added_indices = quads.indices;
         }
         const auto first = expanded ? vertex_end : at;
-        Program* drawn = batched_variant(*p, state, draw, batch.options);
+        Program* drawn = batched_variant(*p, state, draw, batch.options | (one_depth ? batched_vertex_fog : 0u));
         static constexpr float identity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         if (added_indices && outside_clip(state, identity, bounds(vertices.data() + first, added, batched.stride))) {
             vertices.resize(first);
@@ -1913,6 +1923,7 @@ struct GlesDirect::Impl {
         stats.vertex_bytes += std::size_t{added} * batched.stride;
         ++stats.draws; ++stats.batched_draws;
         if (batch.options & batched_zero_alpha) ++stats.zero_alpha_draws;
+        if (one_depth) ++stats.vertex_fog_draws;
         auto latches = stream_matrix_latches(state);
         latches[0] &= ~0xffu; // The PN row is unused.
         if (added_indices) push_record(*drawn, nullptr, static_cast<std::uint32_t>(indices.size() - added_indices), added_indices,

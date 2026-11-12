@@ -102,6 +102,22 @@ the test instead, for a reference of 0 or 1, is not exact: a failing fragment ke
 below 0.5/255 or 1.5/255, and GL only prefers rounding to nearest when it stores the blended
 value. A variant's options follow `batched_program_word` in its words.
 
+With `GlesDirectLimits::vertex_fog`, a batched draw whose vertices all have the same eye
+depth (bit for bit) computes its fog factor in the vertex stage (`batched_vertex_fog`) and
+passes it to the fragment as a flat input; the fragment still mixes the TEV colour with the
+fog colour after the alpha test, as before. GX projections have no x or y term in their z and
+w rows, perspective or orthographic, so such vertices share one clip z and w and one window
+depth. The rasterizer then interpolates a constant depth: `gl_FragCoord.z` equals that
+window depth at every fragment, and the factor, the same expression of it (`fast_fog_glsl`),
+is the per-fragment one. Range adjustment (a function of the fragment's x), Z textures (a
+per-texel depth) and draws with several depths (the factor is not linear in depth) keep
+per-fragment fog, as do lines and points. The vertex derives its window depth from its own
+clip position and `gl_DepthRange`; a GPU whose viewport transform rounds differently can
+differ in the last bit of the depth. It is off by default until each game's captures are
+compared. In Resident Evil 4's village (rooms 100 and 104) only one or two fogged batched
+draws per frame have one eye depth; most particle quads span depths, by more than 0.1 % in
+about half of them, so they keep per-fragment fog.
+
 In fast mode, consecutive draws of the same resident geometry with the same program,
 state plan, textures and matrix latches, whose transform blocks differ only in the
 position matrix rows pn..pn+2 and normal matrix rows pn % 32..+2 of the draw's PN index,
