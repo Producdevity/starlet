@@ -8,6 +8,7 @@ add_library(starlet_os STATIC
     host_allocation.cpp
     os_misc.cpp
     os_core.cpp
+    profiler.cpp
 )
 add_library(starlet::os ALIAS starlet_os)
 target_include_directories(starlet_os PUBLIC "${PROJECT_SOURCE_DIR}/include")
