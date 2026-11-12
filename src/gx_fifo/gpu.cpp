@@ -344,7 +344,7 @@ public:
             view.stride = info.stride;
         }
         const auto& dumps = diagnostics_.efb_dumps;
-        if (std::find(dumps.begin(), dumps.end(), retraces_ + 1) != dumps.end()) dump_efb(retraces_ + 1);
+        if (std::find(dumps.begin(), dumps.end(), retraces_ + 1) != dumps.end()) dump_pending_ = retraces_ + 1;
         const bool presented = renderer_.present(view, width, height, view.bytes.data == nullptr);
         ++retraces_;
         if (diagnostics_.stats && retraces_ % 300 == 0) {
@@ -433,6 +433,7 @@ private:
         auto* destination = static_cast<std::uint8_t*>(os::physical_to_native(address));
         const bool clear = (value >> 11) & 1;
         if ((value >> 14) & 1) {
+            if (dump_pending_) { dump_efb(dump_pending_); dump_pending_ = 0; }
             const auto plan = plan_display_copy(
                 state, {word(0x49, state.bp(0x49)), word(0x4a, state.bp(0x4a)), word(0x4d, state.bp(0x4d)),
                         // The copy template without its execute bits (clear, to-XFB).
@@ -514,6 +515,8 @@ private:
         if (failure_.empty()) failure_ = message;
     }
 
+    // A requested EFB dump waits for the next display copy, which may clear the EFB.
+    unsigned dump_pending_ = 0;
     GpuSetup setup_;
     Renderer& renderer_;
     const Diagnostics& diagnostics_;

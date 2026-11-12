@@ -22,7 +22,8 @@ struct VideoFrame;
 struct Diagnostics {
     // Renderer and decoder counters every 300 retraces.
     bool stats = false;
-    // The EFB written as <capture_dir>/efb-<retrace>.ppm at these retraces. The renderer's GL work
+    // The EFB written as <capture_dir>/efb-<retrace>.ppm just before the first display copy after
+    // these retraces. The renderer's GL work
     // must run on the GPU thread (no submission thread) for the read-back.
     std::vector<unsigned> efb_dumps;
     std::string capture_dir = "/tmp";
