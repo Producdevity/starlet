@@ -301,12 +301,15 @@ s32 DVDReadPrio(DVDFileInfo* fileInfo, void* addr, s32 length, s32 offset, s32 p
 // middle of such a loop; here a poll that finds the drive busy waits for the next interrupt.
 s32 DVDGetCommandBlockStatus(const DVDCommandBlock* block) {
     if (block->state == DVD_STATE_BUSY) starlet::os::wait_for_interrupt();
+    else starlet::os::checkpoint();
     return block->state;
 }
 s32 DVDGetFileInfoStatus(const DVDFileInfo* fileInfo) { return DVDGetCommandBlockStatus(&fileInfo->cb); }
 s32 DVDGetTransferredSize(DVDFileInfo* fileInfo) { return s32(fileInfo->cb.transferredSize); }
 s32 DVDGetDriveStatus() {
+    // Other interrupts (an ARAM transfer the same loop waits for) are delivered here too.
     if (drive().busy()) starlet::os::wait_for_interrupt();
+    else starlet::os::checkpoint();
     return drive().busy() ? DVD_STATE_BUSY : DVD_STATE_END;
 }
 
