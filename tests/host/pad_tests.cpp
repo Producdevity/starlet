@@ -390,17 +390,26 @@ int controllers() {
     (void)second_index;
 
     lines.clear();
-    SDL_JoystickClose(first);
     detach(index);
+    // SDL 2.0.14's virtual driver detaches by its own, newest-first order, so the device index
+    // of the first joystick removes the second there; SDL 2.26 and the handhelds' 2.28 and
+    // 2.32 remove the first. The slot of whichever left must empty and the other stay.
+    SDL_JoystickUpdate();
+    const bool first_left = !SDL_JoystickGetAttached(first), second_left = !SDL_JoystickGetAttached(second);
+    require(first_left != second_left, "one virtual joystick leaves");
+    const unsigned gone = first_left ? 0 : 1;
+    SDL_JoystickClose(first_left ? first : second);
+    SDL_Joystick* kept = first_left ? second : first;
     pads.update();
-    require(!pads.state(0).connected && pads.state(1).connected && logged("Controller 1: removed"),
+    const std::string slot_name = "Controller " + std::to_string(gone + 1) + ": ";
+    require(!pads.state(gone).connected && pads.state(1 - gone).connected && logged(slot_name + "removed"),
             "a removed controller empties its slot and keeps the others");
     SDL_Joystick* third = nullptr;
     const int third_index = plug(third);
     pads.update();
-    require(pads.state(0).connected && logged("Controller 1: "), "a new controller fills the empty slot");
+    require(pads.state(gone).connected && logged(slot_name), "a new controller fills the empty slot");
 
-    SDL_JoystickClose(second);
+    SDL_JoystickClose(kept);
     SDL_JoystickClose(third);
     for (int i = SDL_NumJoysticks() - 1; i >= 0; --i) detach(i);
     pads.update();
