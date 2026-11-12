@@ -104,6 +104,31 @@ struct Span {
     bool directory = false;
 };
 
+// True when reference holds exactly the span's bytes.
+bool same_as_reference(GameVolume& volume, const Span& span, const std::string& reference, std::vector<std::uint8_t>& block) {
+    const int fd = ::open(reference.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat info {};
+    bool same = ::fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && std::uint64_t(info.st_size) == span.size;
+    std::vector<std::uint8_t> other(block.size());
+    for (std::uint64_t at = 0; same && at < span.size;) {
+        const auto take = static_cast<std::size_t>(std::min<std::uint64_t>(block.size(), span.size - at));
+        volume.read(span.offset + at, block.data(), take);
+        std::size_t got = 0;
+        while (got < take) {
+            const auto count = ::pread(fd, other.data() + got, take - got, off_t(at + got));
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) break;
+            got += std::size_t(count);
+        }
+        same = got == take && !std::memcmp(block.data(), other.data(), take);
+        at += take;
+    }
+    ::close(fd);
+    return same;
+}
+
+
 SupportedDisc check_disc(DiscImage& image, const Game& game, std::uint64_t& dol_size) {
     std::uint8_t header[0x20];
     if (image.size() < sizeof header) throw DiscError("not a GameCube or Wii disc image");
@@ -138,7 +163,7 @@ Manifest parse_manifest(const std::string& text) {
     return manifest;
 }
 
-std::string find_disc_image(const std::string& directory, unsigned accepted, const std::string& title) {
+std::vector<std::string> find_disc_images(const std::string& directory, unsigned accepted, const std::string& title) {
     if (!(accepted & formats::all)) throw DiscError("no disc image format is accepted");
     DIR* dir = ::opendir(directory.c_str());
     if (!dir) throw DiscError(directory + " is missing");
@@ -165,12 +190,18 @@ std::string find_disc_image(const std::string& directory, unsigned accepted, con
     std::sort(other.begin(), other.end());
     std::sort(unknown.begin(), unknown.end());
     const auto list = format_list(accepted);
-    if (supported.size() > 1) throw DiscError("put only one disc image in " + directory);
     if (supported.empty() && !other.empty()) throw DiscError(other.front() + ": only " + list + " disc images are supported");
     if (supported.empty())
         throw DiscError("copy your " + title + " disc image (" + list + ") to " + directory +
                         (unknown.empty() ? std::string(", then launch the game again") : "; " + unknown.front() + " is not a disc image"));
-    return supported.front();
+    std::sort(supported.begin(), supported.end());
+    return supported;
+}
+
+std::string find_disc_image(const std::string& directory, unsigned accepted, const std::string& title) {
+    const auto images = find_disc_images(directory, accepted, title);
+    if (images.size() > 1) throw DiscError("put only one disc image in " + directory);
+    return images.front();
 }
 
 SupportedDisc identify_disc(DiscImage& image, const Game& game) {
@@ -232,6 +263,12 @@ Extracted extract(DiscImage& image, const std::string& work, const Game& game, c
                 make_directory(path);
                 continue;
             }
+            if (!options.reference_files.empty() && span.path.compare(0, 6, "files/") == 0 &&
+                same_as_reference(volume, span, options.reference_files + span.path.substr(5), block)) {
+                done += span.size;
+                if (options.progress) options.progress(done, total);
+                continue;
+            }
             Output out(path);
             for (std::uint64_t at = 0; at < span.size;) {
                 const auto take = static_cast<std::size_t>(std::min<std::uint64_t>(block.size(), span.size - at));
@@ -253,7 +290,8 @@ Extracted extract(DiscImage& image, const std::string& work, const Game& game, c
                 result.bytes += span.size;
             }
         }
-        if (manifest && written != manifest->size()) throw DiscError("disc image lacks files listed in the reference");
+        if (manifest && options.reference_files.empty() && written != manifest->size())
+            throw DiscError("disc image lacks files listed in the reference");
         if (options.hook) options.hook(image, result.disc, work);
     } catch (...) {
         discard(work);
@@ -271,8 +309,10 @@ bool is_prepared(const std::string& port, const Game& game) {
     if (!in) return false;
     std::ostringstream text;
     text << in.rdbuf();
-    return std::any_of(game.discs.begin(), game.discs.end(),
-                       [&](const SupportedDisc& disc) { return text.str() == prepared_marker(game, disc); });
+    std::string all;
+    for (const auto& disc : game.discs) all += prepared_marker(game, disc);
+    return text.str() == all || std::any_of(game.discs.begin(), game.discs.end(),
+                                            [&](const SupportedDisc& disc) { return text.str() == prepared_marker(game, disc); });
 }
 
 Extracted install(DiscImage& image, const std::string& port, const Game& game, const SetupOptions& options) {
@@ -310,6 +350,63 @@ Extracted install(DiscImage& image, const std::string& port, const Game& game, c
         throw;
     }
     return result;
+}
+
+std::vector<Extracted> install_discs(const std::vector<DiscImage*>& images, const std::string& port, const Game& game,
+                                     const SetupOptions& options) {
+    if (!options.outputs.empty()) throw DiscError("setup outputs are not supported for several discs");
+    std::vector<std::pair<SupportedDisc, DiscImage*>> found;
+    for (auto* image : images) {
+        const auto disc = identify_disc(*image, game);
+        for (const auto& other : found)
+            if (other.first.disc == disc.disc) throw DiscError("two images of disc " + std::to_string(disc.disc + 1) + " of " + game.title);
+        found.emplace_back(disc, image);
+    }
+    for (const auto& disc : game.discs) {
+        if (std::none_of(found.begin(), found.end(), [&](const auto& f) { return f.first.disc == disc.disc; }))
+            throw DiscError("disc " + std::to_string(disc.disc + 1) + " of " + game.title + " is missing");
+    }
+    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first.disc < b.first.disc; });
+    const auto work = port + "/.setup-work";
+    remove_tree(work);
+    std::vector<Extracted> results;
+    try {
+        results.push_back(extract(*found.front().second, work, game, options));
+        for (std::size_t i = 1; i < found.size(); ++i) {
+            const auto number = std::to_string(found[i].first.disc + 1);
+            const auto part = port + "/.setup-work-disc" + number;
+            remove_tree(part);
+            auto later = options;
+            later.reference_files = work + "/gamedata/files";
+            results.push_back(extract(*found[i].second, part, game, later));
+            if (::rename((part + "/gamedata").c_str(), (work + "/gamedata/disc" + number).c_str()))
+                throw DiscError("cannot move disc " + number + " into place: " + std::strerror(errno));
+            remove_tree(part);
+        }
+        Output marker(work + "/gamedata/.prepared");
+        std::string text;
+        for (const auto& result : results) text += prepared_marker(game, result.disc);
+        marker.write(text.data(), text.size());
+        marker.close();
+        ::sync();
+        const auto target = port + "/gamedata", old = port + "/.setup-old-gamedata";
+        remove_tree(old);
+        const bool replacing = exists(target);
+        if (replacing && ::rename(target.c_str(), old.c_str())) throw DiscError("cannot replace " + target + ": " + std::strerror(errno));
+        if (::rename((work + "/gamedata").c_str(), target.c_str())) {
+            const auto error = errno;
+            if (replacing) ::rename(old.c_str(), target.c_str());
+            throw DiscError("cannot publish " + target + ": " + std::strerror(error));
+        }
+        remove_tree(old);
+        remove_tree(work);
+        ::sync();
+    } catch (...) {
+        discard(work);
+        for (const auto& disc : game.discs) discard(port + "/.setup-work-disc" + std::to_string(disc.disc + 1));
+        throw;
+    }
+    return results;
 }
 
 } // namespace starlet::disc

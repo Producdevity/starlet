@@ -58,6 +58,9 @@ struct SetupOptions {
     Hook hook;
     // Directories the hook writes in work, which install publishes beside gamedata.
     std::vector<std::string> outputs;
+    // An installed earlier disc's gamedata/files: a file with the same path, size and bytes there is
+    // checked against the disc and not written again.
+    std::string reference_files;
 };
 
 struct Extracted {
@@ -76,7 +79,15 @@ Extracted extract(DiscImage&, const std::string& work, const Game&, const SetupO
 // output and keeps the previous data.
 Extracted install(DiscImage&, const std::string& port, const Game&, const SetupOptions& = {});
 
-// "<ID> revision <n>, setup <n>\n", the text of gamedata/.prepared.
+// A game on several discs (all of game.discs, any order): the first disc goes to port/gamedata as
+// install() puts it, each later disc N to port/gamedata/disc<N>/{sys,files}, where files holds only
+// what differs from the first disc's. Published together, with one marker for all discs.
+std::vector<Extracted> install_discs(const std::vector<DiscImage*>& images, const std::string& port, const Game&,
+                                     const SetupOptions& = {});
+// Every accepted disc image in directory, sorted by name; errors as find_disc_image's when none.
+std::vector<std::string> find_disc_images(const std::string& directory, unsigned accepted, const std::string& title);
+
+// "<ID> revision <n>, setup <n>\n", the text of gamedata/.prepared (one line per disc for install_discs).
 std::string prepared_marker(const Game&, const SupportedDisc&);
 // Whether port/gamedata/.prepared holds the marker of one of the game's discs.
 bool is_prepared(const std::string& port, const Game&);
