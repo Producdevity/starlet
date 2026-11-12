@@ -47,7 +47,24 @@ bool GlesResidentCopy::stamped(std::size_t block) const {
     return std::memcmp(destination + block * 32, &word, sizeof word) == 0;
 }
 bool GlesResidentCopy::intact() const {
-    return !stamp || sampled_blocks(bytes / 32, [this](std::size_t block) { return stamped(block); });
+    return !stamp || sampled_blocks(bytes / 32, [this](std::size_t block) {
+        return covers(block * 32, block * 32 + 32) || stamped(block);
+    });
+}
+bool GlesResidentCopy::covers(std::size_t begin, std::size_t end) const {
+    for (const auto& r : covered)
+        if (r.first <= begin && end <= r.second) return true;
+    return false;
+}
+bool GlesResidentCopy::cover(std::size_t begin, std::size_t end) {
+    auto it = covered.begin();
+    while (it != covered.end() && it->second < begin) ++it;
+    while (it != covered.end() && it->first <= end) {
+        begin = std::min(begin, it->first); end = std::max(end, it->second);
+        it = covered.erase(it);
+    }
+    covered.insert(it, {begin, end});
+    return covered.size() == 1 && covered[0].first == 0 && covered[0].second >= bytes;
 }
 namespace {
 // The array still holds its numbers in the encoding a span was converted from.
@@ -363,6 +380,9 @@ struct GlesDirect::Impl {
     std::unordered_multimap<std::uint64_t, Texture*> texture_index;
     std::vector<std::pair<std::uint32_t, GLuint>> samplers;
     std::map<std::uint32_t, GlesResidentCopy> copies;
+    // Older copies that newer ones partly replaced, oldest first; their uncovered bytes
+    // are disjoint from each other and from every copy in copies.
+    std::vector<GlesResidentCopy> shadowed;
     std::uint64_t stamps = 0;
     // Copy targets are reused only once the GPU has retired their last frame of use:
     // rendering into a texture that pending draws still sample makes the driver wait.
@@ -468,6 +488,7 @@ struct GlesDirect::Impl {
                 for (const auto& t : textures) if (t->name) glDeleteTextures(1, &t->name);
                 for (const auto& s : samplers) glDeleteSamplers(1, &s.second);
                 for (const auto& c : copies) { glDeleteFramebuffers(1, &c.second.framebuffer); glDeleteTextures(1, &c.second.texture); }
+                for (const auto& c : shadowed) { glDeleteFramebuffers(1, &c.framebuffer); glDeleteTextures(1, &c.texture); }
                 for (const auto& s : spare_targets) { glDeleteFramebuffers(1, &s.framebuffer); glDeleteTextures(1, &s.texture); }
                 for (const auto& c : crops) { glDeleteFramebuffers(1, &c.framebuffer); glDeleteTextures(1, &c.texture); }
                 for (const auto& a : arenas) if (a.buffer) glDeleteBuffers(1, &a.buffer);
@@ -877,7 +898,7 @@ struct GlesDirect::Impl {
             key.palette_hash = hash_bytes(scratch.data(), scratch.size());
         }
         if (d.format == TextureFormat::cmpr) key.model = cmpr;
-        if (!copies.empty()) if (const auto name = resident(d, key.levels)) return name;
+        if (!copies.empty() || !shadowed.empty()) if (const auto name = resident(d, key.levels)) return name;
         const std::uint64_t fields[] = {key.address, key.image, key.levels, key.palette, key.palette_hash,
                                         static_cast<std::uint64_t>(key.model)};
         const auto key_hash = hash_bytes(reinterpret_cast<const std::uint8_t*>(fields), sizeof fields);
@@ -944,20 +965,33 @@ struct GlesDirect::Impl {
             if (std::uint64_t{it->first} + it->second.bytes > begin) found.push_back(it);
         return found;
     }
+    // Whether a shadowed copy still owns a byte of [begin, begin + bytes).
+    static bool owns_any(const GlesResidentCopy& c, std::uint32_t begin, std::size_t bytes) {
+        const auto from = std::max<std::uint64_t>(begin, c.token), to = std::min<std::uint64_t>(std::uint64_t{begin} + bytes, std::uint64_t{c.token} + c.bytes);
+        return from < to && !c.covers(std::size_t(from - c.token), std::size_t(to - c.token));
+    }
+    void materialize(const GlesResidentCopy& c) {
+        target.materialize(c);
+        ++stats.materialized;
+        retire_texture(c.texture);
+        retire_framebuffer(c.framebuffer);
+        invalidate_pointer(c.destination, c.bytes);
+    }
     void materialize(std::map<std::uint32_t, GlesResidentCopy>::iterator it) {
         drop_crops(it->first);
-        target.materialize(it->second);
-        ++stats.materialized;
-        retire_texture(it->second.texture);
-        retire_framebuffer(it->second.framebuffer);
-        invalidate_pointer(it->second.destination, it->second.bytes);
+        materialize(it->second);
         copies.erase(it);
     }
     GLuint resident(const TextureDescriptor& d, unsigned levels) {
         const auto bytes = texture_source_bytes(d, levels);
         auto found = overlapping(d.address, bytes);
-        if (found.empty()) return 0;
-        if (found.size() == 1) {
+        bool older = false;
+        for (auto it = shadowed.begin(); it != shadowed.end();) {
+            if (!owns_any(*it, d.address, bytes)) { ++it; continue; }
+            materialize(*it); it = shadowed.erase(it); older = true;
+        }
+        if (found.empty()) { if (older) textures_changed(); return 0; }
+        if (found.size() == 1 && !older) {
             const auto& c = found[0]->second;
             const auto& p = c.plan;
             const unsigned tile_width = d.format == TextureFormat::i8 ? 8 : 4, tile_bytes = d.format == TextureFormat::rgba8 ? 64 : 32;
@@ -1021,14 +1055,25 @@ struct GlesDirect::Impl {
             spare_targets.erase(spare_targets.begin());
         }
     }
+    void retire_shadowed(const GlesResidentCopy& c) {
+        retire_target(int(c.plan.destination_width()), int(c.plan.destination_height()), c.texture, c.framebuffer);
+    }
     GlesDirect::ResidentTarget resident_copy(const TextureCopy& p, std::uint32_t token, std::uint8_t* destination, std::size_t capacity) {
         const auto bytes = texture_copy_bytes(p);
+        // Overlapped copies keep the bytes outside this one on the GPU until a lookup needs them.
         for (auto it : overlapping(token, bytes)) {
-            const auto& c = it->second;
-            if (it->first >= token && std::uint64_t{it->first} + c.bytes <= std::uint64_t{token} + bytes) {
-                retire_target(c); copies.erase(it);
-            } else materialize(it);
+            drop_crops(it->first);
+            shadowed.push_back(std::move(it->second));
+            copies.erase(it);
         }
+        const std::uint64_t end = std::uint64_t{token} + bytes;
+        for (auto it = shadowed.begin(); it != shadowed.end();) {
+            const auto from = std::max<std::uint64_t>(token, it->token), to = std::min<std::uint64_t>(end, std::uint64_t{it->token} + it->bytes);
+            if (from >= to || !it->cover(std::size_t(from - it->token), std::size_t(to - it->token))) { ++it; continue; }
+            retire_shadowed(*it); it = shadowed.erase(it);
+        }
+        // Bounds the GPU memory older copies hold.
+        while (shadowed.size() > 8) { materialize(shadowed.front()); shadowed.erase(shadowed.begin()); }
         const auto t = target_of(p.destination_width(), p.destination_height());
         auto& entry = copies[token];
         entry = {token, bytes, t.texture, t.framebuffer, p, destination, capacity};
@@ -1062,6 +1107,10 @@ struct GlesDirect::Impl {
     }
     void release(std::uint32_t token, std::size_t bytes) {
         for (auto it : overlapping(token, bytes)) { retire_target(it->second); copies.erase(it); }
+        for (auto it = shadowed.begin(); it != shadowed.end();) {
+            if (it->token < std::uint64_t{token} + bytes && token < std::uint64_t{it->token} + it->bytes) { retire_shadowed(*it); it = shadowed.erase(it); }
+            else ++it;
+        }
         textures_changed();
     }
     void evict_textures() {

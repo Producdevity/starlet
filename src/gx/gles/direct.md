@@ -160,6 +160,20 @@ every stamp is intact; a game reusing the memory overwrites it wholesale and
 breaks one, and the memory then keeps the game's bytes. Stamping every block
 cost a cache miss per block, several milliseconds per frame on the H700.
 
+A copy that overlaps part of an older one takes over only those bytes: the older
+copy keeps its texture and records the ranges newer copies own (`covered`), and
+is retired once they cover all of it. A lookup reaching its remaining bytes
+materializes it, writing only those bytes, together with the current copies the
+lookup overlaps. This is exact: the texture is never rendered into again, so it
+writes what materializing at the overlap would have written, and every lookup
+checks older copies before reading memory. Remaining bytes are disjoint from
+every other copy's, so materialization order does not matter. Releases and
+stamps apply as to any resident copy; stamps in covered ranges are the newer
+copies' and are not checked. Beyond eight older copies the oldest is
+materialized. Resident Evil 4 writes its 256x196 RGBA8 refraction copy and then
+a 256x224, 128x112 and 64x56 I8 downsample chain at the same address, each
+covering the start of the previous one; this removes three readbacks per frame.
+
 Display copies render YUYV into a per-XFB texture that VI presentation samples,
 so XFB memory is not written. Because no CPU-visible GX result remains pending, `wait_until_idle`
 only submits records; presentation still waits for the previous frame.

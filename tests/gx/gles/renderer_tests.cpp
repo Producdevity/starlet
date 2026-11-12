@@ -656,6 +656,80 @@ void resident_copy_crops() {
     s=renderer.stats().direct;
     check(s.materialized==1 && s.resident_crops==2 && fake::read_pixels==reads+1,"a lookup with another stride still materializes");
 }
+// A downsample chain into memory holding an earlier copy: each copy replaces the start
+// of the previous one, whose remaining bytes stay on the GPU until a lookup needs them.
+void resident_copy_chain() {
+    Fixture f; f.memory.bytes.resize(512,0xa5);
+    TextureCopy rgba; rgba.width=16; rgba.height=8; rgba.format=6; rgba.stride=256; // 512 bytes
+    TextureCopy wide; wide.width=16; wide.height=4; wide.format=1; wide.luminance=true; wide.stride=64; // 64 bytes
+    TextureCopy narrow; narrow.width=8; narrow.height=4; narrow.format=1; narrow.luminance=true; narrow.stride=32; // 32 bytes
+    const auto lookup=[&](GlesRenderer& r,std::uint32_t image){f.bp(0x8b,image);r.draw_direct(f.decoder.state(),f.command(),f.memory);r.wait_until_idle();};
+    const std::uint32_t rgba_16x8=15u|(7u<<10)|(6u<<20), i8_16x4=0x100c0f, i8_8x4=0x100c07, rgba_8x4=7u|(3u<<10)|(6u<<20);
+    // What a readback of a copy returns from the fake, stored as the CPU encoder stores it.
+    const auto stored=[](const TextureCopy& p){
+        const unsigned width=p.destination_width(),height=p.destination_height();
+        std::vector<std::uint8_t> pixels(std::size_t(width)*height*4);
+        for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x)for(unsigned k=0;k<4;++k)
+            pixels[(std::size_t(y)*width+x)*4+k]=std::uint8_t(((std::size_t(y)*width+x)*4+k)%251);
+        alignas(32) std::array<std::uint8_t,512> out{};
+        store_texture_copy(p,{pixels.data(),pixels.size()},out.data(),out.size());
+        return out;
+    };
+    {
+        GlesRenderer renderer; lookup(renderer,i8_8x4);
+        alignas(32) std::array<std::uint8_t,512> bytes{};
+        const auto reads=fake::read_pixels;
+        renderer.copy_texture_resident(rgba,bytes.data(),bytes.size(),0x8000);
+        lookup(renderer,rgba_16x8);
+        renderer.copy_texture_resident(wide,bytes.data(),bytes.size(),0x8000);
+        lookup(renderer,i8_16x4);
+        renderer.copy_texture_resident(narrow,bytes.data(),bytes.size(),0x8000);
+        lookup(renderer,i8_8x4);
+        auto s=renderer.stats().direct;
+        check(s.resident_hits==3 && s.materialized==0 && fake::read_pixels==reads && bytes==std::array<std::uint8_t,512>{},
+              "copies replacing the start of earlier copies neither read back nor write memory");
+        renderer.copy_texture_resident(rgba,bytes.data(),bytes.size(),0x8000);
+        lookup(renderer,rgba_8x4);
+        s=renderer.stats().direct;
+        check(s.materialized==1 && fake::read_pixels==reads+1,"a copy covering the chain retires it: a lookup materializes the new copy alone");
+    }
+    fake::map_pattern=true; fake::read_pattern_row=16;
+    for(const bool stamps:{false,true}){
+        GlesLimits limits; limits.direct.stamp_resident_copies=stamps;
+        GlesRenderer renderer(limits); lookup(renderer,i8_8x4);
+        alignas(32) std::array<std::uint8_t,512> bytes{};
+        renderer.copy_texture_resident(rgba,bytes.data(),bytes.size(),0x8000);
+        renderer.copy_texture_resident(wide,bytes.data(),bytes.size(),0x8000);
+        const auto reads=fake::read_pixels;
+        lookup(renderer,rgba_16x8);
+        const auto older=stored(rgba),newer=stored(wide);
+        check(renderer.stats().direct.materialized==2 && fake::read_pixels==reads+2 &&
+              std::equal(bytes.begin(),bytes.begin()+64,newer.begin()) && std::equal(bytes.begin()+64,bytes.end(),older.begin()+64),
+              "a lookup of the earlier copy's surviving bytes gets them exactly, beside the newer copy's");
+        lookup(renderer,rgba_16x8);
+        check(renderer.stats().direct.materialized==2,"materialized surviving bytes are ordinary memory afterwards");
+    }
+    {
+        GlesLimits limits; limits.direct.stamp_resident_copies=true;
+        GlesRenderer renderer(limits); lookup(renderer,i8_8x4);
+        alignas(32) std::array<std::uint8_t,512> bytes{};
+        renderer.copy_texture_resident(rgba,bytes.data(),bytes.size(),0x8000);
+        renderer.copy_texture_resident(wide,bytes.data(),bytes.size(),0x8000);
+        std::fill(bytes.begin()+256,bytes.begin()+288,0x11);
+        const auto before=bytes;
+        lookup(renderer,rgba_16x8);
+        check(renderer.stats().direct.materialized==2 && std::equal(bytes.begin()+64,bytes.end(),before.begin()+64) &&
+              std::equal(bytes.begin(),bytes.begin()+64,stored(wide).begin()),
+              "a CPU write over the earlier copy's surviving bytes keeps the game's memory there");
+        renderer.copy_texture_resident(rgba,bytes.data(),bytes.size(),0x8000);
+        renderer.copy_texture_resident(wide,bytes.data(),bytes.size(),0x8000);
+        renderer.release_resident(0x8000,512);
+        const auto reads=fake::read_pixels;
+        lookup(renderer,rgba_16x8);
+        check(renderer.stats().direct.materialized==2 && fake::read_pixels==reads,"released ranges drop earlier copies too");
+    }
+    fake::map_pattern=false; fake::read_pattern_row=0;
+}
 void stamped_resident_copies() {
     GlesLimits limits; limits.direct.stamp_resident_copies=true;
     GlesRenderer renderer(limits); Fixture f; f.memory.bytes.resize(64,0xa5); f.bp(0x8b,0x100c0f);
@@ -1385,7 +1459,7 @@ int main() {
         rejected_program_skips_draws();
         unready_program_policy();
         program_reuse_across_tev_colours();
-        resident_copies(); resident_copy_crops(); stamped_resident_copies();
+        resident_copies(); resident_copy_crops(); resident_copy_chain(); stamped_resident_copies();
         z_texture_clear();
         direct_geometry_cache();
         direct_instancing();

@@ -1154,6 +1154,14 @@ void main(){
         glBindSampler(0, 0);
         gl_check("resident EFB texture copy");
     }
+    // Newer copies own the covered ranges: their bytes stay.
+    static void store_uncovered(const GlesResidentCopy& c, const std::vector<std::uint8_t>& pixels) {
+        std::vector<std::uint8_t> kept;
+        for (const auto& r : c.covered) kept.insert(kept.end(), c.destination + r.first, c.destination + r.second);
+        store_texture_copy(c.plan, {pixels.data(), pixels.size()}, c.destination, c.capacity);
+        auto from = kept.data();
+        for (const auto& r : c.covered) { std::memcpy(c.destination + r.first, from, r.second - r.first); from += r.second - r.first; }
+    }
     void materialize(const GlesResidentCopy& c) {
         // A broken stamp means the game reused the memory: the copy no longer exists there.
         if (!c.intact()) return;
@@ -1166,7 +1174,7 @@ void main(){
             glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
             glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
             gl_check("resident texture-copy materialization");
-            store_texture_copy(c.plan, {pixels.data(), pixels.size()}, c.destination, c.capacity);
+            store_uncovered(c, pixels);
             return;
         }
         const auto bytes = GLsizeiptr(width) * height * 4;
@@ -1189,7 +1197,7 @@ void main(){
         // Panfrost maps buffers write-combined: one bulk copy, then the encoder reads cached memory.
         std::vector<std::uint8_t> pixels(mapped, mapped + bytes);
         glUnmapBuffer(GL_COPY_READ_BUFFER); glBindBuffer(GL_COPY_READ_BUFFER, 0);
-        store_texture_copy(c.plan, {pixels.data(), pixels.size()}, c.destination, c.capacity);
+        store_uncovered(c, pixels);
         gl_check("resident texture-copy materialization");
     }
     void bound_frames() {

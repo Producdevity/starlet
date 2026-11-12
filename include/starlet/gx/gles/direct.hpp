@@ -9,6 +9,7 @@
 #include <chrono>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace starlet::gx {
@@ -69,11 +70,18 @@ struct GlesResidentCopy {
     std::size_t capacity = 0;
     // Nonzero when the destination is stamped; see GlesDirectLimits::stamp_resident_copies.
     std::uint64_t stamp = 0;
+    // Sorted, disjoint byte ranges [first, second) from destination that newer copies
+    // replaced: the copy neither owns nor writes them.
+    std::vector<std::pair<std::size_t, std::size_t>> covered;
     void write_stamps() const;
     // Whether the destination's 32-byte block still holds its stamp.
     bool stamped(std::size_t block) const;
-    // Unstamped, or every stamped block still holds its stamp.
+    // Unstamped, or every stamped block outside the covered ranges still holds its stamp.
     bool intact() const;
+    // Whether [begin, end) from destination is covered.
+    bool covers(std::size_t begin, std::size_t end) const;
+    // Adds [begin, end) from destination to the covered ranges; true once they span the copy.
+    bool cover(std::size_t begin, std::size_t end);
 };
 struct GlesDirectStats {
     std::uint64_t draws = 0, zero_area = 0, submissions = 0, segments = 0, vertex_bytes = 0;
@@ -123,8 +131,8 @@ public:
         unsigned color_framebuffer = 0;
         // Converts the EFB backing to the requested pixel format; true if GL state changed.
         std::function<bool(bool rgba6)> format;
-        // Writes a resident copy's exact bytes to its destination memory, after all
-        // previously submitted GL work.
+        // Writes a resident copy's exact bytes to its destination memory, outside its
+        // covered ranges, after all previously submitted GL work.
         std::function<void(const GlesResidentCopy&)> materialize;
         // Runs GL work on the context's thread after previously submitted work, waiting
         // for it when asked. Unset: inline on the calling thread.
@@ -143,7 +151,7 @@ public:
     void invalidate(const void* data, std::size_t size);
     // Registers the copy at token as GPU-resident and returns its destination-sized
     // RGBA8 texture and a framebuffer with it attached, for the caller to render into. Overlapped resident copies are
-    // replaced, or materialized first when only partly covered. Call after flush(),
+    // replaced; partly overlapped ones keep their other bytes on the GPU (see direct.md). Call after flush(),
     // and flush() again before rendering into the target: its creation is queued.
     struct ResidentTarget { unsigned texture = 0, framebuffer = 0; };
     ResidentTarget resident_copy(const TextureCopy&, std::uint32_t token, std::uint8_t* destination, std::size_t capacity);
