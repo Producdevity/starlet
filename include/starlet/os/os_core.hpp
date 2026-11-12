@@ -1,8 +1,12 @@
 #pragma once
 
-#include "starlet/sdk/os.h"
-
 #include <cstddef>
+
+// Declared only: a port can include this beside its decompilation's SDK headers, which declare
+// the same functions and, with their own C++ library, define TRUE and FALSE.
+namespace starlet::sdk {
+struct OSBootInfo;
+}
 
 namespace starlet::os {
 
