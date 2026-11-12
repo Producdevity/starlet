@@ -44,6 +44,8 @@ implement. CP state, XF writes, four indexed XF arrays, VCD/VAT vertex sizing,
 TLUT loads and vertex-cache invalidation are decoded here. Unsupported opcodes,
 CP addresses, formats and out-of-range transfers fail with an error.
 
+The TLUT source (BP 0x64) is bits 0-20 in 32-byte units; the console ignores
+bits 21-23, which SDKs can leave set from stale register contents.
 Palette offsets are relative to TMEM `0x80000`. A load creates immutable blocks
 and advances generations even if the address and BP command repeat within the
 same frame. A texture cache key must include its palette range generation and

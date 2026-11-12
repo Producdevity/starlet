@@ -82,7 +82,8 @@ bool Decoder::load_palette(std::uint32_t control) {
         return fail(Error::invalid_input, "GX TLUT load exceeds palette memory or generation range");
     }
     std::vector<std::uint8_t> bytes(size);
-    if (size && !read_memory(state_.bp_[0x64] << 5, bytes.data(), size)) {
+    // The source is 21 bits of 32-byte units; the console ignores register bits 21-23.
+    if (size && !read_memory((state_.bp_[0x64] & 0x1fffff) << 5, bytes.data(), size)) {
         return false;
     }
     const auto generation = ++state_.palette_generation_;

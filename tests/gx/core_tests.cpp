@@ -285,6 +285,11 @@ void palettes_snapshot_and_reload() {
     bp(d, 0x65, 0x0401);
     require(d.state().read_palette(512, bytes.data(), 512) && bytes[0] == 0x99 && bytes[31] == 0x99 && bytes[32] == 0x77,
             "short reload preserves untouched palette entries");
+    memory.regions[0x2000].assign(512, 0x5a);
+    bp(d, 0x64, 0xe00100); // Bits 21-23 set: not part of the source address.
+    bp(d, 0x65, 0x0401);
+    require(d.state().read_palette(512, bytes.data(), 32) && bytes[0] == 0x5a && bytes[31] == 0x5a,
+            "TLUT source ignores register bits 21-23");
 }
 
 void lists_mutation_and_shared_state() {
