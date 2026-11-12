@@ -1,6 +1,7 @@
 #include "starlet/gx/transform.hpp"
 #include <GLES3/gl32.h>
 #include <algorithm>
+#include <deque>
 #include <map>
 #include <array>
 #include <string>
@@ -86,8 +87,9 @@ void glBindBuffer(GLenum target, GLuint buffer) {
 }
 void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {}
 void* glMapBufferRange(GLenum, GLintptr offset, GLsizeiptr length, GLbitfield) {
-    static std::vector<unsigned char> mapped;
-    mapped.assign(length, 0);
+    // Each mapping keeps its own bytes: renderers hold several snapshot buffers mapped at once.
+    static std::deque<std::vector<unsigned char>> mappings;
+    auto& mapped = mappings.emplace_back(std::size_t(length), 0);
     if (fake::map_pattern) for (GLsizeiptr i = 0; i < length; ++i) mapped[i] = static_cast<unsigned char>((offset + i) % 251);
     return mapped.data();
 }
