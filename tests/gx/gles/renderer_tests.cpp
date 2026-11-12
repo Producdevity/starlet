@@ -1077,6 +1077,53 @@ void direct_batched_materials() {
     check(lit.batched_draws == s.batched_draws + 2 && lit.uniform_blocks == s.uniform_blocks + 2 && lit.submissions == s.submissions + 2,
           "a lit channel's register material splits batches");
 }
+// The fragment source of the last batched program compiled since sources.
+std::string last_batched_fragment(std::size_t sources) {
+    std::string found;
+    for (auto i = sources; i < fake::shader_sources.size(); ++i)
+        if (fake::shader_sources[i].find("flat in mediump vec4 gx_register0") != std::string::npos) found = fake::shader_sources[i];
+    return found;
+}
+void direct_batched_zero_alpha() {
+    GlesRenderer renderer(batching_limits()); Fixture f;
+    const auto draw = [&] { renderer.draw_direct(f.decoder.state(), f.command(), f.memory); };
+    auto sources = fake::shader_sources.size();
+    f.bp(0xf3, (4u << 16) | (7u << 19)); // Alpha greater than 0, the fixture's source-alpha blend without depth or alpha writes.
+    draw(); f.f(3, 10.0f); draw(); renderer.wait_until_idle();
+    auto s = renderer.stats().direct;
+    auto fragment = last_batched_fragment(sources);
+    check(s.zero_alpha_draws == 2 && s.batched_draws == 2 && s.submissions == 1, "alpha-tested source-alpha draws batch with zero alpha");
+    check(fragment.find(")) color.a=0.0;") != std::string::npos && fragment.find("discard") == std::string::npos,
+          "their alpha test keeps failing fragments with alpha 0 instead of discarding them");
+    f.bp(0x41, 0xf429); // Destination factor one.
+    draw(); renderer.wait_until_idle();
+    check(renderer.stats().direct.zero_alpha_draws == s.zero_alpha_draws + 1, "additive source-alpha blending keeps zero alpha");
+    const auto discards = [&](const char* message) {
+        const auto before = renderer.stats().direct;
+        sources = fake::shader_sources.size();
+        draw(); renderer.wait_until_idle();
+        const auto after = renderer.stats().direct;
+        fragment = last_batched_fragment(sources);
+        check(after.batched_draws == before.batched_draws + 1 && after.zero_alpha_draws == before.zero_alpha_draws &&
+              (fragment.empty() || fragment.find(")) discard;") != std::string::npos), message);
+    };
+    f.bp(0x41, 0xf4a9); f.bp(0x40, 0x17); // Depth tested and written.
+    discards("a depth-writing draw discards");
+    f.bp(0x40, 0x16); // Written without the test: GL writes no depth.
+    draw(); renderer.wait_until_idle();
+    check(renderer.stats().direct.zero_alpha_draws == s.zero_alpha_draws + 2, "depth writes without the depth test keep zero alpha");
+    f.bp(0x40, 0x06);
+    f.bp(0x41, 0xf1a9); discards("a source factor other than source alpha discards");
+    f.bp(0x41, 0xf469); discards("a destination factor reading the source colour discards");
+    f.bp(0x41, 0xfca9); discards("subtraction discards");
+    f.bp(0x41, 0xf4a9); f.bp(0x43, 1); f.bp(0x41, 0xf4b9); discards("alpha writes discard");
+    f.bp(0x41, 0xf4a9); draw(); renderer.wait_until_idle();
+    check(renderer.stats().direct.zero_alpha_draws == s.zero_alpha_draws + 3, "an alpha EFB without alpha writes keeps zero alpha");
+    f.bp(0x43, 0); f.bp(0xf3, 0x3f0000);
+    const auto plain = renderer.stats().direct.zero_alpha_draws;
+    draw(); renderer.wait_until_idle();
+    check(renderer.stats().direct.zero_alpha_draws == plain, "draws without an alpha test take no variant");
+}
 void direct_clip_culling() {
     for (const auto shading : {DirectShading::exact, DirectShading::fast}) {
         GlesLimits limits; limits.direct.shading = shading;
@@ -1672,6 +1719,7 @@ int main() {
         direct_batched_normals();
         direct_batch_merging();
         direct_batched_materials();
+        direct_batched_zero_alpha();
         direct_clip_culling();
         direct_indexed_clip_culling();
         direct_submission_thread();

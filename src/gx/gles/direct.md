@@ -92,6 +92,16 @@ draws each particle as its own unlit quad whose layout carries a normal, with a 
 matrix and a material colour, and particles and layout panes otherwise cost a driver
 draw each.
 
+A batched draw with an alpha test uses a variant that keeps failing fragments with alpha 0
+instead of discarding them (`batched_zero_alpha`) when that cannot change the EFB: blending
+adds, the source factor is source alpha, the destination factor is one or one minus source
+alpha, constant alpha is off, and neither alpha nor depth is written (GL writes depth only
+while it tests depth). Such a fragment blends to 0 * source + 1 * destination, which every
+blend unit stores as the destination it read; fragments that pass are unchanged. Dropping
+the test instead, for a reference of 0 or 1, is not exact: a failing fragment keeps an alpha
+below 0.5/255 or 1.5/255, and GL only prefers rounding to nearest when it stores the blended
+value. A variant's options follow `batched_program_word` in its words.
+
 In fast mode, consecutive draws of the same resident geometry with the same program,
 state plan, textures and matrix latches, whose transform blocks differ only in the
 position matrix rows pn..pn+2 and normal matrix rows pn % 32..+2 of the draw's PN index,

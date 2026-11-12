@@ -188,6 +188,12 @@ void GlesProgramBuilder::plan() {
             if (stop_) return;
             if (!seen.insert(words).second) continue;
             ++listed_;
+            // A batched variant with options ends with them after the batched word.
+            std::uint32_t options = 0;
+            if (words.size() == 103 && words[101] == batched_program_word && words[102] && !(words[102] & ~batched_options_mask)) {
+                options = words.back();
+                words.pop_back();
+            }
             const bool batched = words.size() == 102 && words.back() == batched_program_word;
             const bool instanced = words.size() == 102 && words.back() == instanced_program_word;
             if (batched || instanced) words.pop_back();
@@ -201,13 +207,13 @@ void GlesProgramBuilder::plan() {
                 // Batched variants plan without the latch, as the renderer plans them.
                 if (!direct_program_state(words, state, layout, &latched) ||
                     !(planned = plan_direct_program(state, layout, fetch_, DirectShading::fast, batched, batched ? 0 : latched,
-                                                    instanced))) {
+                                                    instanced, options))) {
                     ++rejected_;
                     continue;
                 }
                 const auto& p = *planned.program;
                 if (sources.insert(source_key(p.vertex, p.fragment)).second && !cache_.contains(p.vertex, p.fragment))
-                    todo_.push_back({std::move(words), batched, instanced});
+                    todo_.push_back({std::move(words), batched, instanced, options});
             } catch (const std::exception&) {
                 ++rejected_;
             }
@@ -252,7 +258,7 @@ void GlesProgramBuilder::work(unsigned index) {
             DirectProgramResult planned;
             if (direct_program_state(todo_[at].words, state, layout, &latched) &&
                 (planned = plan_direct_program(state, layout, fetch_, DirectShading::fast, todo_[at].batched,
-                                               todo_[at].batched ? 0 : latched, todo_[at].instanced)))
+                                               todo_[at].batched ? 0 : latched, todo_[at].instanced, todo_[at].options)))
                 build(planned.program->vertex, planned.program->fragment, built_);
         } catch (const std::exception&) {
             ++failed_;

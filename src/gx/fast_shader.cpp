@@ -77,9 +77,15 @@ std::string alpha_test(TevCompare op, unsigned index) {
 }
 }
 
+bool fast_alpha_test(const TevPipeline& tev) {
+    return !(tev.alpha_compare[0] == TevCompare::always && tev.alpha_compare[1] == TevCompare::always &&
+             tev.alpha_logic == TevAlphaLogic::and_);
+}
+
 std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot& indirect, std::uint8_t maps,
                                  bool early_depth, bool constant_alpha, bool batched, std::uint8_t affine,
-                                 std::uint8_t fog, std::uint8_t wide_registers, const ZTextureProgram& z_texture) {
+                                 std::uint8_t fog, std::uint8_t wide_registers, const ZTextureProgram& z_texture,
+                                 bool zero_alpha) {
     std::ostringstream f;
     f << "#version 310 es\n";
     if (early_depth) f << "layout(early_fragment_tests) in;\n";
@@ -216,8 +222,7 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
         low_current[code(ce.destination)] = low_current[code(ae.destination)] = false;
     }
     const char* logic[] = {" && ", " || ", " != ", " == "};
-    const bool test = !(tev.alpha_compare[0] == TevCompare::always && tev.alpha_compare[1] == TevCompare::always &&
-                        tev.alpha_logic == TevAlphaLogic::and_);
+    const bool test = fast_alpha_test(tev);
     // The last stage's results leave the TEV, whichever registers it wrote.
     const auto& last = tev.stages[tev.stage_count - 1];
     const unsigned rgb = code(last.color.destination), alpha = code(last.alpha.destination);
@@ -226,7 +231,7 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
     else f << "    vec4 color=vec4(" << output(rgb, unit_color[rgb]) << ".rgb," << output(alpha, unit_alpha[alpha]) << ".a);\n";
     if (test)
         f << "    int alpha=int(color.a*255.0+0.5);\n    if (!(" << alpha_test(tev.alpha_compare[0], 0) << logic[code(tev.alpha_logic)]
-          << alpha_test(tev.alpha_compare[1], 1) << ")) discard;\n";
+          << alpha_test(tev.alpha_compare[1], 1) << ")) " << (zero_alpha ? "color.a=0.0" : "discard") << ";\n";
     if (constant_alpha) f << "    float blendAlpha=color.a;\n    color.a=uGxConstantAlpha.y>0.5?blendAlpha:uGxConstantAlpha.x;\n";
     f << z_glsl.depth;
     if (fog_type) {

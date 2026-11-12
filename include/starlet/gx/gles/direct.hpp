@@ -106,6 +106,8 @@ struct GlesDirectStats {
     std::uint64_t program_wait_max_ms = 0, fallback_links = 0, fallback_link_max_ms = 0;
     // Draws added as instances to the previous resident draw; see the instancing notes in direct.md.
     std::uint64_t instanced_draws = 0;
+    // Batched draws whose alpha test keeps failing fragments with alpha 0 (batched_zero_alpha).
+    std::uint64_t zero_alpha_draws = 0;
     // Texture resolutions (cache lookups, validation, decoding) the draws needed.
     std::uint64_t texture_lookups = 0;
     GlesProgramCacheStats program_cache;

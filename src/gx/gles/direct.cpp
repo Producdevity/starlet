@@ -209,6 +209,8 @@ struct GlesDirect::Impl {
         // Small draws of a batchable program use its batched variant; see draw_batched.
         bool batchable = false;
         Program* batched = nullptr;
+        // A batched program's variants by their options (batched_options_mask).
+        std::array<Program*, batched_options_mask + 1> variants{};
         // Resident draws that differ only in their position and normal matrix share one
         // instanced draw of this variant; see join_instances.
         bool instanceable = false;
@@ -455,7 +457,8 @@ struct GlesDirect::Impl {
     // Batched draws share state, textures and uniform block while only TEV color
     // registers, material colours and their own position matrix change between them.
     struct { bool valid = false; std::uint64_t bp = 0, xf = 0, segment = 0, frame = 0; const Program* program = nullptr;
-             std::uint32_t state = 0; std::array<GLuint, 8> textures{}, samplers{}; bool expanded = false; } batch;
+             std::uint32_t state = 0; std::array<GLuint, 8> textures{}, samplers{}; bool expanded = false;
+             std::uint32_t options = 0; } batch;
     // What the batch's state plan read: BP values with the konst bank in place of E0-E7 (the
     // colour bank travels per vertex), texture extents, the XF viewport and CI palettes.
     struct {
@@ -645,6 +648,27 @@ struct GlesDirect::Impl {
         }
         base.batched->used = ++sequence; base.batched->segment = segment;
         return base.batched;
+    }
+    // The variant of a batched program with options; p itself without any.
+    Program* batched_variant(Program& p, const State& state, const Draw& draw, std::uint32_t options) {
+        if (!options) return &p;
+        auto& variant = p.variants[options];
+        if (!variant) {
+            words = p.words;
+            words.push_back(options);
+            const auto hash = hash_words(words);
+            Program* found = nullptr;
+            const auto range = program_index.equal_range(hash);
+            for (auto it = range.first; it != range.second; ++it) if (it->second->words == words) { found = it->second; break; }
+            if (!found) {
+                auto planned = plan_direct_program(state, draw.layout, fetch, limits.shading, true, 0, false, options);
+                if (!planned) throw std::runtime_error(planned.status.message);
+                found = &create_program(hash, std::move(planned.program));
+            }
+            variant = found;
+        }
+        variant->used = ++sequence; variant->segment = segment;
+        return variant;
     }
     // Fast programs without emboss texgens, which read the normal matrix outside the
     // instanced rows; see generate_transform_glsl.
@@ -857,6 +881,7 @@ struct GlesDirect::Impl {
             for (auto it = range.first; it != range.second; ++it) if (it->second == oldest->get()) { program_index.erase(it); break; }
             for (auto& other : programs) {
                 if (other->batched == oldest->get()) other->batched = nullptr;
+                for (auto& variant : other->variants) if (variant == oldest->get()) variant = nullptr;
                 if (other->instanced == oldest->get()) other->instanced = nullptr;
             }
             if (batch.program == oldest->get()) batch.valid = false;
@@ -1761,7 +1786,8 @@ struct GlesDirect::Impl {
                 samplers_used[map] = sampler(planned.textures[map].sampler);
             }
             batch = {true, state.bp_state_revision(), state.xf_register_revision(), segment, frame, p,
-                     static_cast<std::uint32_t>(states.size() - 1), names, samplers_used, expanded};
+                     static_cast<std::uint32_t>(states.size() - 1), names, samplers_used, expanded,
+                     batched_zero_alpha_exact(*p->plan, planned) ? batched_zero_alpha : 0u};
             record_batch_inputs(state, *p, planned);
         }
         const auto& batched_transform = p->plan->transform;
@@ -1874,20 +1900,22 @@ struct GlesDirect::Impl {
             added_indices = quads.indices;
         }
         const auto first = expanded ? vertex_end : at;
+        Program* drawn = batched_variant(*p, state, draw, batch.options);
         static constexpr float identity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         if (added_indices && outside_clip(state, identity, bounds(vertices.data() + first, added, batched.stride))) {
             vertices.resize(first);
             indices.resize(indices.size() - added_indices);
             ++stats.culled_draws;
-            warm(*p);
+            warm(*drawn);
             return true;
         }
         run.vertices += added;
         stats.vertex_bytes += std::size_t{added} * batched.stride;
         ++stats.draws; ++stats.batched_draws;
+        if (batch.options & batched_zero_alpha) ++stats.zero_alpha_draws;
         auto latches = stream_matrix_latches(state);
         latches[0] &= ~0xffu; // The PN row is unused.
-        if (added_indices) push_record(*p, nullptr, static_cast<std::uint32_t>(indices.size() - added_indices), added_indices,
+        if (added_indices) push_record(*drawn, nullptr, static_cast<std::uint32_t>(indices.size() - added_indices), added_indices,
                                        low, low + added - 1, latches, batch.state, batch_uniform.offset,
                                        batch.textures, batch.samplers);
         check_segment();

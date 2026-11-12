@@ -29,6 +29,9 @@ std::uint32_t direct_program_register_word(const State&, DirectShading);
 // Appended to a program's words for its batched or instanced variant.
 inline constexpr std::uint32_t batched_program_word = 0xba7c4ed1u;
 inline constexpr std::uint32_t instanced_program_word = 0x1a57a2c1u;
+// Options of a batched variant, appended after batched_program_word when any is set.
+// batched_zero_alpha: fragments failing the alpha test keep alpha 0 instead of being discarded.
+inline constexpr std::uint32_t batched_zero_alpha = 1, batched_options_mask = 1;
 // Fast-shading words only: a State and layout whose words equal words, so the program
 // can be planned before a draw needs it. False for any other words. latched_normal
 // receives the latched-normal components the words record, for plan_direct_program;
@@ -44,6 +47,7 @@ struct DirectProgram {
     bool rgba6 = false, needs_fetch = false, early_depth = false, fast = false, constant_alpha = false;
     // Fast program for eye-space positions and per-vertex TEV registers; see generate_transform_glsl.
     bool batched = false;
+    std::uint32_t batched_options = 0;
     // Batched: channels (RGB0, RGB1, A0, A1) whose register material travels in vertex colour
     // RGB or alpha; see transform_vertex_materials.
     std::uint8_t vertex_materials = 0;
@@ -61,7 +65,8 @@ struct DirectProgramResult {
     explicit operator bool() const { return static_cast<bool>(status); }
 };
 DirectProgramResult plan_direct_program(const State&, const VertexLayout&, FramebufferFetch, DirectShading = DirectShading::exact,
-                                        bool batched = false, std::uint8_t latched_normal = 0, bool instanced = false);
+                                        bool batched = false, std::uint8_t latched_normal = 0, bool instanced = false,
+                                        std::uint32_t batched_options = 0);
 
 struct DirectDrawState {
     GlesRasterPlan raster;
@@ -77,5 +82,11 @@ struct DirectDrawState {
 };
 DrawStatus plan_direct_state(const State&, const DirectProgram&, TextureCmprModel, DirectDrawState&,
                              GuardBand = GuardBand::reject, FractionalViewport = FractionalViewport::reject);
+// Whether a fast program's alpha test can keep failing fragments with alpha 0 instead of
+// discarding them without changing the EFB: blending adds the source times its alpha to the
+// destination times one or one minus source alpha, and neither depth (GL writes it only while
+// testing) nor alpha is written.
+// Such a fragment then blends to exactly the destination (direct.md).
+bool batched_zero_alpha_exact(const DirectProgram&, const DirectDrawState&);
 
 } // namespace starlet::gx

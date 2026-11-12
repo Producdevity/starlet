@@ -164,7 +164,7 @@ bool direct_program_state(const std::vector<std::uint32_t>& words, State& state,
 }
 
 DirectProgramResult plan_direct_program(const State& state, const VertexLayout& layout, FramebufferFetch fetch, DirectShading shading,
-                                        bool batched, std::uint8_t latched_normal, bool instanced) {
+                                        bool batched, std::uint8_t latched_normal, bool instanced, std::uint32_t batched_options) {
     auto fail = [](DrawError error, const std::string& message) { return DirectProgramResult{reject(error, message), {}}; };
     auto p = std::make_shared<DirectProgram>();
     const auto tev = capture_tev(state);
@@ -211,6 +211,9 @@ DirectProgramResult plan_direct_program(const State& state, const VertexLayout& 
     p->early_depth = (state.bp(0x40) & 1) && (state.bp(0x43) & 64) && !p->tev.z_texture_op;
     p->z_texture = {p->tev.z_texture_op, p->tev.z_texture_type, (state.bp(0x40) & 1) != 0};
     if ((batched || instanced) && !p->fast) return fail(DrawError::unsupported_state, "batched and instanced programs require fast shading");
+    if (batched_options && (!batched || (batched_options & ~batched_options_mask)))
+        return fail(DrawError::unsupported_state, "invalid batched program options");
+    p->batched_options = batched_options;
     p->batched = batched;
     p->instanced = instanced;
     if (p->fast) {
@@ -222,7 +225,7 @@ DirectProgramResult plan_direct_program(const State& state, const VertexLayout& 
         if (!vertex) return fail(DrawError::transform, vertex.status.message);
         p->vertex = vertex.source;
         p->fragment = fast_fragment_source(p->tev, p->indirect, p->maps, p->early_depth, p->constant_alpha, batched, p->affine, p->fog,
-                                           wide_registers(state), p->z_texture);
+                                           wide_registers(state), p->z_texture, (batched_options & batched_zero_alpha) != 0);
         return {{}, std::move(p)};
     }
     if (p->rgba6) {
@@ -323,6 +326,13 @@ DrawStatus plan_direct_state(const State& state, const DirectProgram& program, T
         }
     }
     return {};
+}
+
+bool batched_zero_alpha_exact(const DirectProgram& program, const DirectDrawState& s) {
+    const auto& r = s.raster;
+    return program.fast && !program.constant_alpha && fast_alpha_test(program.tev) && r.blend && !r.subtract && !r.premultiply &&
+           r.source_factor == 4 && (r.destination_factor == 1 || r.destination_factor == 5) && !(r.depth_test && r.depth_write) &&
+           !s.alpha_write;
 }
 
 } // namespace starlet::gx

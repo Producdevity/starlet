@@ -22,9 +22,13 @@ namespace starlet::gx {
 // orthographic << 3 | range << 4, see GlesRasterPlan::Fog) adds uGxFog (a, b,
 // shift, c), uGxFogColor and, with range adjustment, uGxFogCenter/uGxFogTable[10]. A Z texture
 // (z_texture_glsl) adds uGxZBias; its Z writes gl_FragDepth with depth and replaces the window
-// depth in fog.
+// depth in fog. zero_alpha writes fragments that fail the alpha test with alpha 0 instead of
+// discarding them; see batched_zero_alpha_exact.
 std::string fast_fragment_source(const TevPipeline&, const IndirectSnapshot&, std::uint8_t maps,
                                  bool early_depth, bool constant_alpha, bool batched = false, std::uint8_t affine = 0,
-                                 std::uint8_t fog = 0, std::uint8_t wide_registers = 0, const ZTextureProgram& = {});
+                                 std::uint8_t fog = 0, std::uint8_t wide_registers = 0, const ZTextureProgram& = {},
+                                 bool zero_alpha = false);
+// Whether the fast fragment program tests alpha: false when both comparisons always pass.
+bool fast_alpha_test(const TevPipeline&);
 
 } // namespace starlet::gx
