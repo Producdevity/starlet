@@ -101,6 +101,29 @@ struct Ptr32 {
     }
 };
 
+/* A 32-bit address slot in file data that the game relocates in place: it holds a big-endian file
+ * offset until the game adds the base, then a big-endian pointer, as on the console (addresses with
+ * the sign bit set are pointers). Reads as T*, casts explicitly to the 32-bit value, stores pointers
+ * back big-endian. Game memory lies below 4 GiB, so every address fits. */
+template <typename T>
+struct BEPtr {
+    uint32_t raw;
+
+    uint32_t address() const { return starlet_compat::from_big_endian(raw); }
+    operator T*() const { return reinterpret_cast<T*>(static_cast<uintptr_t>(address())); }
+    T* operator->() const { return *this; }
+    template <typename U> explicit operator U*() const { return reinterpret_cast<U*>(static_cast<uintptr_t>(address())); }
+    explicit operator uint32_t() const { return address(); }
+    explicit operator int32_t() const { return static_cast<int32_t>(address()); }
+    explicit operator bool() const { return raw != 0; }
+    BEPtr& operator=(T* pointer)
+    {
+        raw = starlet_compat::to_big_endian(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pointer)));
+        return *this;
+    }
+};
+static_assert(sizeof(BEPtr<int>) == 4, "an address slot is 32 bits");
+
 /* A big-endian word read from file data at an arbitrary (possibly unaligned) address. */
 template <typename T> inline T read_be(const void* address)
 {
