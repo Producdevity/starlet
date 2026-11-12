@@ -32,6 +32,11 @@ GLuint framebuffer = 0;
 std::map<GLuint, GLuint> color_attachments;
 std::map<GLuint, GLuint> depth_attachments;
 unsigned uniform_ranges = 0, read_pixels = 0;
+// Compute dispatches, and the last int and ivec4 uniforms: for texel stores the buffer
+// offset and source x, y, width and row stride, in texels.
+unsigned dispatches = 0;
+GLint last_int = 0;
+std::array<GLint, 4> last_ivec4{};
 // Instanced draws: count, last instance count, the binding-1 range and the uniform buffer's bytes.
 unsigned instanced_draws = 0, instance_count = 0;
 GLintptr instance_offset = 0;
@@ -302,7 +307,7 @@ void glTexSubImage2D(GLenum target, GLint, GLint, GLint, GLsizei width, GLsizei 
 void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {}
 void glTexParameteri(GLenum target, GLenum pname, GLint param) {}
 void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height) {}
-void glUniform1i(GLint location, GLint v0) {}
+void glUniform1i(GLint location, GLint v0) { fake::last_int = v0; }
 void glUniform2f(GLint location, GLfloat v0, GLfloat v1) { uniform(location,{v0,v1,0,0}); }
 void glUniform2fv(GLint location, GLsizei count, const GLfloat* v) { for (GLsizei i = 0; i < count; ++i) uniform(location + i,{v[i*2],v[i*2+1],0,0}); }
 void glUniform1fv(GLint location, GLsizei count, const GLfloat* v) { for (GLsizei i = 0; i < count; ++i) uniform(location + i,{v[i],0,0,0}); }
@@ -311,7 +316,15 @@ void glUniform4fv(GLint location, GLsizei count, const GLfloat* v) { for (GLsize
 void glUniform3i(GLint location, GLint v0, GLint v1, GLint v2) { uniform(location,{double(v0),double(v1),double(v2),0}); }
 void glUniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2) { uniform(location,{v0,v1,v2,0}); }
 void glUniform2i(GLint location, GLint v0, GLint v1) { uniform(location,{double(v0),double(v1),0,0}); }
-void glUniform4i(GLint location, GLint v0, GLint v1, GLint v2, GLint v3) { uniform(location,{double(v0),double(v1),double(v2),double(v3)}); }
+void glUniform4i(GLint location, GLint v0, GLint v1, GLint v2, GLint v3) { fake::last_ivec4={v0,v1,v2,v3}; uniform(location,{double(v0),double(v1),double(v2),double(v3)}); }
+void glDispatchCompute(GLuint x, GLuint y, GLuint) {
+    ++fake::dispatches;
+    // Bytes up to the last texel a store writes, as glReadPixels reports them.
+    const auto& r = fake::last_ivec4;
+    if (x * 64 >= GLuint(r[2]))
+        fake::pack_required = (std::size_t(fake::last_int) + (y - 1) * std::size_t(r[3]) + r[2]) * 4;
+}
+void glMemoryBarrier(GLbitfield) {}
 void glUniform4ui(GLint l,GLuint a,GLuint b,GLuint c,GLuint d) { uniform(l,{double(a),double(b),double(c),double(d)}); }
 void glUniform1ui(GLint l,GLuint a) { uniform(l,{double(a),0,0,0}); }
 void glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding) {}

@@ -74,6 +74,7 @@ public:
     int snapshot_efb() override;
     int snapshot_efb(const EfbRegion&) override;
     bool snapshot_ready(int) const override;
+    void wait_snapshot(int) override;
     bool peek_depth_snapshot(int index, int x, int y, std::uint32_t& value) const override;
     bool peek_color_snapshot(int index, int x, int y, std::uint32_t& value) const override;
     void select_snapshot(int) override;

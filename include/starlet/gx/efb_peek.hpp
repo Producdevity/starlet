@@ -25,6 +25,8 @@ public:
     virtual int snapshot_efb(const EfbRegion&) { return snapshot_efb(); }
     // Any thread: peeks against the snapshot answer without waiting for queued GPU work.
     virtual bool snapshot_ready(int) const { return true; }
+    // Recording thread: waits until snapshot_ready(index), without reading a pixel.
+    virtual void wait_snapshot(int) {}
     // Any thread, while the snapshot at index is retained: its value at (x, y) once
     // ready and inside the read-back region, or false, leaving the read to peek_depth or
     // peek_color.

@@ -2,6 +2,7 @@
 #include "draw_fixture.hpp"
 #include "jfw_clear_fixture.hpp"
 #include <GLES3/gl31.h>
+#include <cmath>
 #include <iostream>
 #include <mutex>
 #include <memory>
@@ -32,6 +33,8 @@ extern std::size_t pack_required, unpack_required;
 extern std::map<GLuint, GLuint> color_attachments;
 extern std::map<GLuint, GLuint> depth_attachments;
 extern unsigned uniform_ranges, read_pixels;
+extern unsigned dispatches;
+extern const char* renderer_name;
 extern unsigned instanced_draws, instance_count;
 extern GLintptr instance_offset;
 extern GLsizeiptr instance_size;
@@ -978,6 +981,37 @@ void full_resolution_snapshots() {
     try { GlesRenderer invalid(bad); } catch (const std::invalid_argument&) { refused = true; }
     check(refused, "snapshot scales other than 1, 2 and 4 are refused");
 }
+// Panfrost reads back through compute passes into buffers, at the offsets glReadPixels uses.
+void panfrost_readback() {
+    const char* name = fake::renderer_name;
+    fake::renderer_name = "Mali-G31 (Panfrost)";
+    {
+        GlesLimits limits; limits.direct.shading = DirectShading::fast; limits.direct.snapshot_scale = 1;
+        GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
+        renderer.draw_direct(f.decoder.state(), command, f.memory);
+        auto reads = fake::read_pixels, dispatches = fake::dispatches;
+        const int index = renderer.snapshot_efb(EfbRegion{100, 200, 16, 8});
+        check(index >= 0 && fake::read_pixels == reads && fake::dispatches == dispatches + 2 &&
+              fake::pack_required == ((455 - 200) * 1280 + 640 + 100 + 15) * 4 + 4,
+              "a region snapshot is stored by two compute passes, one per block");
+        renderer.wait_snapshot(index);
+        check(renderer.snapshot_ready(index) && fake::read_pixels == reads, "its readback is collected without glReadPixels");
+        renderer.release_snapshots();
+    }
+    {
+        GlesRenderer renderer; Fixture f; f.memory.bytes.resize(64,0xa5);
+        renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+        TextureCopy p; p.width=8; p.height=4; p.format=1; p.luminance=true; p.stride=32;
+        alignas(32) std::array<std::uint8_t,64> bytes{};
+        renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+        f.bp(0x8b,0x400c07);
+        const auto reads=fake::read_pixels, dispatches=fake::dispatches;
+        renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+        check(renderer.stats().direct.materialized==1 && fake::read_pixels==reads && fake::dispatches==dispatches+1 &&
+              fake::pack_required==8*4*4, "a materialized copy is stored by one compute pass");
+    }
+    fake::renderer_name = name;
+}
 void region_snapshots() {
     GlesLimits limits; limits.direct.shading = DirectShading::fast; limits.direct.snapshot_scale = 1;
     GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
@@ -994,10 +1028,16 @@ void region_snapshots() {
         const auto byte = [&](std::uint32_t k) { return std::uint32_t((at + k) % 251); };
         return byte(3) << 24 | byte(0) << 16 | byte(1) << 8 | byte(2);
     };
-    renderer.select_snapshot(index);
-    const auto misses = renderer.stats().region_misses;
-    check(renderer.peek_color(3, 455) == whole(3, 455) && renderer.snapshot_ready(index),
+    const auto reads = fake::read_pixels, misses = renderer.stats().region_misses;
+    renderer.wait_snapshot(index);
+    check(renderer.snapshot_ready(index) && fake::read_pixels == reads && renderer.stats().region_misses == misses,
+          "waiting for a snapshot collects its readback without reading a pixel");
+    const int second = renderer.snapshot_efb(EfbRegion{300, 100, 4, 4});
+    renderer.select_snapshot(second);
+    check(renderer.peek_color(3, 455) == whole(3, 455) && renderer.snapshot_ready(second),
           "a first peek outside the region still collects the region's readback");
+    renderer.release_snapshot(second);
+    renderer.select_snapshot(index);
     check(renderer.peek_color(107, 203) == whole(107, 203) && renderer.peek_color(115, 207) == whole(115, 207) &&
           renderer.stats().region_misses == misses + 1,
           "peeks inside the region read the readback, as a whole snapshot would");
@@ -1265,7 +1305,7 @@ int main() {
         shared_depth_snapshots();
         snapshot_layout();
         full_resolution_snapshots();
-        region_snapshots();
+        region_snapshots(); panfrost_readback();
         texture_generations();
         present_mapping(); no_blits_on_the_frame_path();
         std::cout << "GLES dispatch boundary tests passed (not GPU rendering proof)\n";

@@ -171,6 +171,17 @@ memory; live peeks and materialization wait for the queue. A snapshot taken
 with an `EfbRegion` retains the whole EFB on the GPU but reads back only that
 rectangle; a peek outside it waits for the readback and the queue, then reads
 the retained snapshot, so it stays exact (`GlesStats::region_misses`).
+`wait_snapshot` waits for a snapshot's readback without reading a pixel, for a
+port that delivers a token once its snapshot is ready.
+
+Readbacks into memory (snapshots and materialization) use `glReadPixels`, except
+on Panfrost. Its Mesa driver serves `glReadPixels` on the CPU, into a buffer too
+(`texture_transfer_modes` 0): each call flushes, blits to a linear staging
+copy, waits for the GPU and converts per pixel. There a compute pass stores the
+texels into a buffer as `packUnorm4x8` of the fetched RGBA8 texel, the bytes
+`glReadPixels` returns, and materialization copies the write-combined mapping
+to cached memory before encoding. On Mali's vendor driver (r20p0) the compute
+path halved Sunshine's frame rate, so it stays on `glReadPixels`.
 
 These are recording-thread budgets (textures, programs, geometry) of GL objects,
 excluding driver allocations.

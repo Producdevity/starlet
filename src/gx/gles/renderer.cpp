@@ -58,6 +58,25 @@ GLuint link_program(const GlesDrawPipeline& pipeline) {
         throw;
     }
 }
+GLuint link_compute(const std::string& source) {
+    GLuint shader = 0, program = 0;
+    try {
+        shader = compile_shader(GL_COMPUTE_SHADER, source);
+        program = glCreateProgram();
+        if (!program) throw std::runtime_error("GLES program allocation failed");
+        glAttachShader(program, shader); glLinkProgram(program);
+        GLint ok = 0; glGetProgramiv(program, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            char log[4096]{}; glGetProgramInfoLog(program, sizeof log, nullptr, log);
+            throw std::runtime_error(std::string("GLES link: ") + log);
+        }
+        glDeleteShader(shader); return program;
+    } catch (...) {
+        if (shader) glDeleteShader(shader);
+        if (program) glDeleteProgram(program);
+        throw;
+    }
+}
 struct GpuVertex {
     std::array<float, 3> position;
     std::array<float, 9> normal;
@@ -276,6 +295,13 @@ struct GlesRenderer::Impl {
     GLint format_source = -1;
     GLuint depth_read_program = 0;
     GLint depth_read_position = -1;
+    // Panfrost serves glReadPixels on the CPU, into a buffer too (Mesa's texture_transfer_modes
+    // 0), waiting for the GPU at each call; there readbacks go through a compute pass instead.
+    // Mali's driver reads back faster than that pass and the wait for it.
+    bool compute_readback = false;
+    GLuint store_program = 0, materialize_buffer = 0;
+    GLint store_source = -1, store_offset = -1;
+    GLsizeiptr materialize_bytes = 0;
     GLuint copy_program = 0, present_program = 0, copy_framebuffer = 0, copy_texture = 0;
     GLint copy_geometry = -1, copy_filter = -1, present_source = -1, present_destination = -1;
     // Fast shading keeps XFB copies in RGB: the copy filter still applies, but the
@@ -493,6 +519,8 @@ struct GlesRenderer::Impl {
         if (vao) glDeleteVertexArrays(1, &vao);
         if (depth) glDeleteTextures(1, &depth);
         if (depth_read_program) glDeleteProgram(depth_read_program);
+        if (store_program) glDeleteProgram(store_program);
+        if (materialize_buffer) glDeleteBuffers(1, &materialize_buffer);
         if (color) glDeleteTextures(1, &color);
         if (framebuffer) glDeleteFramebuffers(1, &framebuffer);
         if (color_framebuffer) glDeleteFramebuffers(1, &color_framebuffer);
@@ -551,6 +579,8 @@ struct GlesRenderer::Impl {
             if (name && !std::strcmp(name,"GL_ARM_shader_framebuffer_fetch") && fetch==FramebufferFetch::none)
                 fetch = FramebufferFetch::arm;
         }
+        if (const auto* name = reinterpret_cast<const char*>(glGetString(GL_RENDERER)))
+            compute_readback = std::strstr(name, "Panfrost") != nullptr;
         glGetIntegerv(GL_MAX_VIEWPORT_DIMS, max_viewport.data());
         glGenFramebuffers(1, &framebuffer); glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
         glGenTextures(1, &color); glBindTexture(GL_TEXTURE_2D, color);
@@ -713,6 +743,44 @@ struct GlesRenderer::Impl {
     // Packs D24 depth as RGB8 into target; with_color appends the EFB colour as a
     // second block of width columns.
     void pack_efb(GLuint target, int x, int y, int width, int height, int scale = 1, bool with_color = false);
+    // Stores width x height RGBA8 texels of texture from (x, y) into buffer as bytes, rows
+    // stride texels apart from texel offset, as glReadPixels would pack them.
+    void store_texels(GLuint texture, GLuint buffer, int x, int y, int width, int height, int offset, int stride) {
+        if (!store_program) {
+            store_program = link_compute(R"GLSL(#version 310 es
+precision highp float;precision highp int;
+layout(local_size_x=64)in;
+uniform highp sampler2D uImage;
+uniform ivec4 uSource;
+uniform int uOffset;
+layout(std430,binding=0)writeonly buffer Pack{highp uint texels[];};
+void main(){
+ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(p.x>=uSource.z)return;
+texels[uOffset+p.y*uSource.w+p.x]=packUnorm4x8(texelFetch(uImage,uSource.xy+p,0));
+})GLSL");
+            ++stats.shader_compiles;
+            glUseProgram(store_program);
+            glUniform1i(glGetUniformLocation(store_program, "uImage"), 0);
+            store_source = glGetUniformLocation(store_program, "uSource");
+            store_offset = glGetUniformLocation(store_program, "uOffset");
+        }
+        glUseProgram(store_program);
+        glUniform1i(store_offset, offset);
+        glUniform4i(store_source, x, y, width, stride);
+        glActiveTexture(GL_TEXTURE0); glBindSampler(0, 0); glBindTexture(GL_TEXTURE_2D, texture);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+        glDispatchCompute(GLuint(width + 63) / 64, GLuint(height), 1);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
+        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    }
+    // The snapshot's rows from row0, its depth and then colour columns from column0, into its
+    // buffer at the offsets a whole readback would use.
+    void store_snapshot(const Snapshot& snapshot, int row0, int row_count, int column0, int column_count) {
+        const int columns = efb_width / snapshot_scale();
+        for (int block = 0; block < 2; ++block)
+            store_texels(snapshot.texture, snapshot.pack, block * columns + column0, row0, column_count, row_count,
+                         row0 * 2 * columns + block * columns + column0, 2 * columns);
+    }
     // Fast shading keeps draw-sync snapshots at quarter resolution unless the limits ask
     // for another; the deferred callbacks peek single pixels and read the nearest sample.
     int snapshot_scale() const {
@@ -1090,14 +1158,39 @@ void main(){
         // A broken stamp means the game reused the memory: the copy no longer exists there.
         if (!c.intact()) return;
         const auto width = c.plan.destination_width(), height = c.plan.destination_height();
-        std::vector<std::uint8_t> pixels(std::size_t(width) * height * 4);
-        glBindFramebuffer(GL_FRAMEBUFFER, c.framebuffer);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-        glPixelStorei(GL_PACK_ALIGNMENT, 1); glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-        glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
-        glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-        gl_check("resident texture-copy materialization");
+        if (!compute_readback) {
+            std::vector<std::uint8_t> pixels(std::size_t(width) * height * 4);
+            glBindFramebuffer(GL_FRAMEBUFFER, c.framebuffer);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1); glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+            glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+            gl_check("resident texture-copy materialization");
+            store_texture_copy(c.plan, {pixels.data(), pixels.size()}, c.destination, c.capacity);
+            return;
+        }
+        const auto bytes = GLsizeiptr(width) * height * 4;
+        if (bytes > materialize_bytes) {
+            if (!materialize_buffer) glGenBuffers(1, &materialize_buffer);
+            glBindBuffer(GL_COPY_READ_BUFFER, materialize_buffer);
+            glBufferData(GL_COPY_READ_BUFFER, bytes, nullptr, GL_STREAM_READ);
+            materialize_bytes = bytes;
+        }
+        store_texels(c.texture, materialize_buffer, 0, 0, width, height, 0, width);
+        const auto done = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (!done) throw std::runtime_error("resident texture-copy fence allocation failed");
+        const auto wait = glClientWaitSync(done, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000);
+        glDeleteSync(done);
+        if (wait != GL_ALREADY_SIGNALED && wait != GL_CONDITION_SATISFIED)
+            throw std::runtime_error("resident texture-copy materialization did not retire within one second");
+        glBindBuffer(GL_COPY_READ_BUFFER, materialize_buffer);
+        const auto* mapped = static_cast<const std::uint8_t*>(glMapBufferRange(GL_COPY_READ_BUFFER, 0, bytes, GL_MAP_READ_BIT));
+        if (!mapped) throw std::runtime_error("resident texture-copy materialization map failed");
+        // Panfrost maps buffers write-combined: one bulk copy, then the encoder reads cached memory.
+        std::vector<std::uint8_t> pixels(mapped, mapped + bytes);
+        glUnmapBuffer(GL_COPY_READ_BUFFER); glBindBuffer(GL_COPY_READ_BUFFER, 0);
         store_texture_copy(c.plan, {pixels.data(), pixels.size()}, c.destination, c.capacity);
+        gl_check("resident texture-copy materialization");
     }
     void bound_frames() {
         if (!frames.empty()) {
@@ -1870,22 +1963,27 @@ int GlesRenderer::snapshot_efb(const EfbRegion& requested) {
             }
             glBindBuffer(GL_PIXEL_PACK_BUFFER, snapshot.pack);
             if (g.snapshot_pixels[index]) { glUnmapBuffer(GL_PIXEL_PACK_BUFFER); g.snapshot_pixels[index] = nullptr; }
-            const int columns = g.efb_width / scale;
-            glPixelStorei(GL_PACK_ALIGNMENT, 1);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, snapshot.framebuffer);
-            if (column_count == columns && row_count == g.efb_height / scale) {
-                glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
-                glReadPixels(0, 0, 2 * columns, row_count, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            if (g.compute_readback) {
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+                g.store_snapshot(snapshot, row0, row_count, column0, column_count);
             } else {
-                // Into the buffer at the same offsets as a whole readback: depth, then colour.
-                glPixelStorei(GL_PACK_ROW_LENGTH, 2 * columns); glPixelStorei(GL_PACK_SKIP_ROWS, row0);
-                for (int block = 0; block < 2; ++block) {
-                    glPixelStorei(GL_PACK_SKIP_PIXELS, block * columns + column0);
-                    glReadPixels(block * columns + column0, row0, column_count, row_count, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                const int columns = g.efb_width / scale;
+                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, snapshot.framebuffer);
+                if (column_count == columns && row_count == g.efb_height / scale) {
+                    glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+                    glReadPixels(0, 0, 2 * columns, row_count, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                } else {
+                    // Into the buffer at the same offsets as a whole readback: depth, then colour.
+                    glPixelStorei(GL_PACK_ROW_LENGTH, 2 * columns); glPixelStorei(GL_PACK_SKIP_ROWS, row0);
+                    for (int block = 0; block < 2; ++block) {
+                        glPixelStorei(GL_PACK_SKIP_PIXELS, block * columns + column0);
+                        glReadPixels(block * columns + column0, row0, column_count, row_count, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                    }
+                    glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
                 }
-                glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
             }
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
             glBindFramebuffer(GL_READ_FRAMEBUFFER, g.framebuffer);
             snapshot.ready = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
             if (!snapshot.ready) throw std::runtime_error("EFB snapshot fence allocation failed");
@@ -1896,6 +1994,14 @@ int GlesRenderer::snapshot_efb(const EfbRegion& requested) {
     return static_cast<int>(index);
 }
 bool GlesRenderer::snapshot_ready(int index) const { return impl_->snapshot_ready(index); }
+void GlesRenderer::wait_snapshot(int index) {
+    auto& g = *impl_; g.check_owner();
+    if (index < 0 || index >= static_cast<int>(g.snapshot_busy.size()) || !g.snapshot_busy[std::size_t(index)])
+        throw std::out_of_range("unknown EFB snapshot");
+    if (g.snapshot_ready(index)) return;
+    ++g.stats.peek_waits;
+    g.execute([&] { try { g.collect_snapshots(index); } catch (...) { g.failed = true; throw; } }, true);
+}
 namespace {
 std::uint32_t packed_depth(const std::uint8_t* p) { return (std::uint32_t(p[0]) << 16) | (std::uint32_t(p[1]) << 8) | p[2]; }
 std::uint32_t argb(const std::uint8_t* p) { return (std::uint32_t(p[3]) << 24) | packed_depth(p); }
