@@ -417,10 +417,11 @@ struct GlesDirect::Impl {
     // BP 0xe0-0xe7 keep only the last colour or konst write; both register sets are kept here.
     std::array<std::uint32_t, 16> planned_tev{};
     bool same_bp_values(const State& state) const {
-        for (unsigned a = 0; a < 256; ++a) if (state.bp(static_cast<std::uint8_t>(a)) != planned_bp[a]) return false;
-        for (unsigned i = 0; i < 16; ++i)
-            if (state.tev_register(i >= 8, static_cast<std::uint8_t>(i & 7)) != planned_tev[i]) return false;
-        return true;
+        // Usually equal: no early exit, so the comparison vectorizes.
+        std::uint32_t differ = 0;
+        for (unsigned a = 0; a < 256; ++a) differ |= state.bp(static_cast<std::uint8_t>(a)) ^ planned_bp[a];
+        for (unsigned i = 0; i < 16; ++i) differ |= state.tev_register(i >= 8, static_cast<std::uint8_t>(i & 7)) ^ planned_tev[i];
+        return !differ;
     }
     bool same_palettes(const State& state, const Program& p) const {
         const auto& planned = states[last_state.index];
