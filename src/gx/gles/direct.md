@@ -31,6 +31,11 @@ FIFO bytes match exactly and every consumed array span is unchanged. A draw's FI
 bytes match without reading them when `MemoryReader::source_identity` names the same
 source at the same write generation as the entry: a display list read in place, or
 one the host copied into its FIFO and named with the write stamp it had when copied.
+An entry is named by its source, geometry key and payload size, so a list drawn from
+several vertex arrays finds the entry for its arrays in one lookup. A source whose new
+entries go unused until its next insert, twice in a row, is streamed and retried every 64
+frames: Resident Evil 4 draws skinned models from arrays the CPU rewrites at another
+address every frame, and caching those inserted about 25 entries a frame that never hit.
 A span whose source reports no CPU write since conversion (the game's cache store or
 flush, reported through `MemoryArrayView::generation`) is accepted, and every entry
 is also compared byte for byte against a retained copy once every 64 frames. A span

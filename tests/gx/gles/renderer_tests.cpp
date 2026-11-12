@@ -1316,6 +1316,61 @@ void direct_range_generations() {
     s = renderer.stats().direct;
     check(s.geometry_misses == 2 && s.geometry_hits == 9, "a new range generation with the same bytes compares and hits");
 }
+// Display-list payloads named by their source: one list drawn from several vertex arrays
+// keeps an entry per array, and a list whose arrays move every frame is streamed.
+void direct_source_geometry() {
+    struct Sourced : test::Memory {
+        std::vector<std::uint8_t> arrays;
+        MemoryArrayView array_view(std::uint32_t address) override {
+            if (address < 0x9000 || address >= 0x9000 + arrays.size()) return {};
+            return {{arrays.data() + (address - 0x9000), arrays.size() - (address - 0x9000)}, 0};
+        }
+        SourceIdentity source_identity(const void* data, std::size_t) override { return {data, 1}; }
+    };
+    Fixture f; Sourced memory; memory.bytes = f.memory.bytes;
+    for (unsigned block = 0; block < 64; ++block)
+        for (unsigned i = 0; i < 8; ++i) {
+            for (float c : {100.0f + 25 * i + block, 100.0f + 10 * i, -0.5f}) append_float(memory.arrays, c);
+            if (i == 7) memory.arrays.resize((block + 1) * 0x100u);
+        }
+    f.cp(0x50, (2u << 9) | (1u << 13)); f.cp(0xb0, 12);
+    auto list = [](std::uint8_t tag) {
+        std::vector<std::uint8_t> fifo;
+        for (unsigned i = 0; i < 8; ++i) {
+            fifo.push_back(static_cast<std::uint8_t>(i));
+            fifo.insert(fifo.end(), {255, 32, 64, tag});
+            append_float(fifo, .25f); append_float(fifo, .75f); append_float(fifo, i & 1 ? 1 : 0); append_float(fifo, i & 2 ? 1 : 0);
+        }
+        return fifo;
+    };
+    const auto shared = list(255), moving = list(254);
+    Draw draw; draw.primitive = 0x80; draw.vertex_count = 8;
+    std::string error; check(f.decoder.state().vertex_layout(0, draw.layout, error), error.c_str());
+    GlesRenderer renderer;
+    auto draw_at = [&](const std::vector<std::uint8_t>& fifo, std::uint32_t base) {
+        f.cp(0xa0, base);
+        Draw d = draw; d.vertices = {fifo.data(), fifo.size()};
+        renderer.draw_direct(f.decoder.state(), d, memory);
+    };
+    for (unsigned frame = 0; frame < 4; ++frame) {
+        for (unsigned instance = 0; instance < 3; ++instance) draw_at(shared, 0x9000 + instance * 0x100);
+        renderer.wait_until_idle(); renderer.present(640, 480);
+    }
+    auto s = renderer.stats().direct;
+    check(s.geometry_misses == 3 && s.geometry_hits == 9, "one list drawn from three arrays keeps an entry for each");
+    for (unsigned frame = 0; frame < 6; ++frame) {
+        draw_at(moving, 0x9400 + frame * 0x100);
+        renderer.wait_until_idle(); renderer.present(640, 480);
+    }
+    const auto streamed = renderer.stats().direct;
+    check(streamed.geometry_misses == s.geometry_misses + 3 && streamed.draws == s.draws + 6 &&
+          streamed.vertex_bytes > s.vertex_bytes, "a list whose arrays move every frame streams after two unreused entries");
+    for (unsigned frame = 0; frame < 64; ++frame) renderer.present(640, 480);
+    draw_at(moving, 0x9000 + 40 * 0x100); renderer.wait_until_idle();
+    check(renderer.stats().direct.geometry_misses == streamed.geometry_misses + 1, "a streamed source is cached again after 64 frames");
+    draw_at(shared, 0x9000); renderer.wait_until_idle();
+    check(renderer.stats().direct.geometry_hits == streamed.geometry_hits + 1, "other sources keep hitting");
+}
 int main() {
     explicit_completion();
     try {
@@ -1335,6 +1390,7 @@ int main() {
         direct_geometry_cache();
         direct_instancing();
         direct_range_generations();
+        direct_source_geometry();
     format_after_depth_copy();
     copy_clear_invalidation();
         direct_batched_draws();

@@ -227,7 +227,7 @@ struct GlesDirect::Impl {
     // Converted indexed geometry resident in its own GL buffers; only the FIFO
     // bytes and source-span hashes stay on the CPU for validation.
     struct Geometry {
-        std::uint64_t hash = 0;
+        std::uint64_t hash = 0, key_hash = 0;
         std::vector<std::uint32_t> key;
         std::vector<std::uint8_t> fifo;
         struct Span { unsigned array; std::uint32_t base; std::size_t first, end; std::uint8_t native_unit; bool host_order;
@@ -247,6 +247,7 @@ struct GlesDirect::Impl {
         std::uint64_t segment = 0, inserted = 0;
         std::size_t bytes = 0;
         // Display-list payload identity: unchanged while its source reports no write.
+        // Set while the entry is the one geometry_pointers names for its source, key and size.
         const void* fifo_pointer = nullptr; // The payload's source key (MemoryReader::source_identity).
         std::uint64_t fifo_generation = 0;
         // Object-space position bounds (min xyz, max xyz) of single-matrix geometry.
@@ -274,9 +275,25 @@ struct GlesDirect::Impl {
     std::vector<std::uint8_t> geometry_vertices;
     std::vector<std::uint32_t> geometry_indices;
     std::unordered_multimap<std::uint64_t, std::list<Geometry>::iterator> geometry_index;
-    std::unordered_multimap<const void*, std::list<Geometry>::iterator> geometry_pointers;
+    // One entry per payload source, geometry key and payload size: a model's list drawn
+    // from several vertex arrays has an entry per array base under one source.
+    struct SourceKey {
+        const void* pointer; std::uint64_t key; std::size_t size;
+        bool operator==(const SourceKey& o) const { return pointer == o.pointer && key == o.key && size == o.size; }
+    };
+    struct SourceKeyHash {
+        std::size_t operator()(const SourceKey& k) const {
+            return static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(k.pointer) * 0x9e3779b97f4a7c15ull) ^ k.key ^ (k.size << 40));
+        }
+    };
+    std::unordered_map<SourceKey, std::list<Geometry>::iterator, SourceKeyHash> geometry_pointers;
+    // Sources whose new entries are not reused in later frames, such as a model's list drawn
+    // from vertex arrays the CPU rewrites at another address every frame, are streamed.
+    struct SourceUse { std::uint64_t inserted = 0, hit = 0; std::uint8_t unreused = 0; };
+    std::unordered_map<const void*, SourceUse> source_uses;
     MemoryReader::SourceIdentity source; // The current draw's payload source (find_geometry_by_pointer).
     std::vector<std::uint32_t> geometry_key;
+    std::uint64_t geometry_key_hash = 0;
     StreamArraySpans spans;
     // Resident geometry as drawn: copied at record time, since packing moves entries
     // while earlier segments may still be executing.
@@ -1070,7 +1087,7 @@ struct GlesDirect::Impl {
         return false;
     }
     std::uint64_t geometry_hash(const Draw& draw) const {
-        return hash_bytes(draw.vertices.data, draw.vertices.size) ^ (hash_words(geometry_key) * 0x9e3779b97f4a7c15ull);
+        return hash_bytes(draw.vertices.data, draw.vertices.size) ^ (geometry_key_hash * 0x9e3779b97f4a7c15ull);
     }
     void build_geometry_key(const State& state, const Draw& draw, const StreamFormat& format) {
         auto& k = geometry_key; k.clear();
@@ -1084,6 +1101,7 @@ struct GlesDirect::Impl {
             k.push_back(state.cp(static_cast<std::uint8_t>(0xb0 + i)) & 255);
         }
         if (format.matrices) for (auto w : stream_matrix_latches(state)) k.push_back(w);
+        geometry_key_hash = hash_words(k);
     }
     // Unchanged reported-write generations prove the span unchanged, except on the
     // entry's periodic full comparison, which also detects unreported writers.
@@ -1105,18 +1123,38 @@ struct GlesDirect::Impl {
     Geometry* find_geometry_by_pointer(const Draw& draw, MemoryReader& memory) {
         source = memory.source_identity(draw.vertices.data, draw.vertices.size);
         if (!source.generation) return nullptr;
-        const auto range = geometry_pointers.equal_range(source.key);
-        if (range.first == range.second) return nullptr;
-        const auto generation = source.generation;
-        for (auto it = range.first; it != range.second; ++it) {
-            const auto entry = it->second;
-            if (entry->fifo_generation != generation || entry->fifo.size() != draw.vertices.size || entry->key != geometry_key) continue;
-            // The periodic full comparison also covers list bytes rewritten without a reported write.
-            if (((frame + entry->phase) & full_check_period) == 0 && std::memcmp(entry->fifo.data(), draw.vertices.data, draw.vertices.size)) continue;
-            const auto index = geometry_index.equal_range(entry->hash);
-            for (auto at = index.first; at != index.second; ++at) if (at->second == entry) return validate_geometry(at, memory, entry->hash);
-        }
+        const auto found = geometry_pointers.find({source.key, geometry_key_hash, draw.vertices.size});
+        if (found == geometry_pointers.end()) return nullptr;
+        const auto entry = found->second;
+        if (entry->fifo_generation != source.generation || entry->key != geometry_key) return nullptr;
+        // The periodic full comparison also covers list bytes rewritten without a reported write.
+        if (((frame + entry->phase) & full_check_period) == 0 && std::memcmp(entry->fifo.data(), draw.vertices.data, draw.vertices.size))
+            return nullptr;
+        const auto index = geometry_index.equal_range(entry->hash);
+        for (auto at = index.first; at != index.second; ++at) if (at->second == entry) return validate_geometry(at, memory, entry->hash);
         return nullptr;
+    }
+    // Two inserts for a source in later frames, each without a hit in between, stream it;
+    // it is tried again once every 64 frames.
+    bool unreused_source() const {
+        if (!source.generation) return false;
+        const auto found = source_uses.find(source.key);
+        return found != source_uses.end() && found->second.unreused >= 2 && frame - found->second.inserted < 64;
+    }
+    void source_hit() {
+        if (!source.generation) return;
+        const auto found = source_uses.find(source.key);
+        if (found != source_uses.end()) found->second.hit = frame;
+    }
+    void source_inserted() {
+        if (!source.generation) return;
+        if (source_uses.size() > 4096) source_uses.clear();
+        auto& use = source_uses[source.key];
+        if (use.inserted && use.inserted < frame) {
+            if (use.hit < use.inserted) { if (use.unreused < 255) ++use.unreused; }
+            else use.unreused = 0;
+        }
+        use.inserted = frame;
     }
     Geometry* validate_geometry(std::unordered_multimap<std::uint64_t, std::list<Geometry>::iterator>::iterator it,
                                 MemoryReader& memory, std::uint64_t hash) {
@@ -1149,22 +1187,24 @@ struct GlesDirect::Impl {
         }
         return nullptr;
     }
+    // The entry now holds the bytes at source; an entry named there before holds older
+    // bytes (an earlier generation, or an unreported write) and is found by hash only.
     void name_geometry(std::list<Geometry>::iterator g) {
-        if (g->fifo_pointer == source.key) { g->fifo_generation = source.generation; return; }
-        if (g->fifo_pointer) {
-            const auto range = geometry_pointers.equal_range(g->fifo_pointer);
-            for (auto at = range.first; at != range.second; ++at) if (at->second == g) { geometry_pointers.erase(at); break; }
-        }
-        g->fifo_pointer = source.key;
         g->fifo_generation = source.generation;
-        geometry_pointers.emplace(source.key, g);
+        if (g->fifo_pointer == source.key) return;
+        unname_geometry(*g);
+        const auto [at, added] = geometry_pointers.try_emplace(SourceKey{source.key, g->key_hash, g->fifo.size()}, g);
+        if (!added) { at->second->fifo_pointer = nullptr; at->second = g; }
+        g->fifo_pointer = source.key;
+    }
+    void unname_geometry(Geometry& g) {
+        if (!g.fifo_pointer) return;
+        geometry_pointers.erase(SourceKey{g.fifo_pointer, g.key_hash, g.fifo.size()});
+        g.fifo_pointer = nullptr;
     }
     // Pending records may still name the entry, so its buffers retire after the segment.
     void erase_geometry(std::unordered_multimap<std::uint64_t, std::list<Geometry>::iterator>::iterator it) {
-        if (it->second->fifo_pointer) {
-            const auto range = geometry_pointers.equal_range(it->second->fifo_pointer);
-            for (auto at = range.first; at != range.second; ++at) if (at->second == it->second) { geometry_pointers.erase(at); break; }
-        }
+        unname_geometry(*it->second);
         stats.geometry_bytes -= it->second->bytes;
         retired_geometries.splice(retired_geometries.end(), geometries, it->second);
         geometry_index.erase(it);
@@ -1306,10 +1346,8 @@ struct GlesDirect::Impl {
                               const StreamFormat& format, const StreamResult& result) {
         if (!spans.viewed) return nullptr;
         Geometry g;
-        g.hash = hash; g.key = geometry_key; g.format = format;
+        g.hash = hash; g.key = geometry_key; g.key_hash = geometry_key_hash; g.format = format;
         g.fifo.assign(draw.vertices.data, draw.vertices.data + draw.vertices.size);
-        g.fifo_generation = source.generation;
-        if (g.fifo_generation) g.fifo_pointer = source.key;
         g.vertex_count = result.vertices; g.index_count = result.indices;
         for (unsigned a = 0; a < 12; ++a) {
             const auto& s = spans.arrays[a];
@@ -1374,7 +1412,8 @@ struct GlesDirect::Impl {
         stats.geometry_bytes += geometries.front().bytes;
         ++stats.geometry_misses;
         loose.push_back(&geometries.front()); loose_bytes += geometries.front().payload;
-        if (geometries.front().fifo_pointer) geometry_pointers.emplace(geometries.front().fifo_pointer, geometries.begin());
+        if (source.generation) name_geometry(geometries.begin());
+        source_inserted();
         evict_geometry();
         return &geometries.front();
     }
@@ -1689,8 +1728,9 @@ struct GlesDirect::Impl {
         if (limits.geometries && cacheable(draw)) {
             build_geometry_key(state, draw, format);
             cached = find_geometry_by_pointer(draw, memory);
-            cache = cached || !unstable(hash = geometry_hash(draw));
+            cache = cached || (!unreused_source() && !unstable(hash = geometry_hash(draw)));
             if (cache && !cached) cached = find_geometry(draw, memory, hash);
+            if (cached) source_hit();
             if (cached && cached->boxed && outside_clip(state, state.matrix_index(0), cached->box)) { ++stats.culled_draws; warm(p); return; }
         }
         if (last_state.valid && last_state.bp != state.bp_revision() && last_state.xf == state.xf_register_revision() &&
