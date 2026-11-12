@@ -51,6 +51,7 @@ void* hardware_to_native(starlet::sdk::u32 address, starlet::sdk::u32 bytes) {
     if (address < 0x80000000u || offset + bytes > fake_ai::memory.size()) return nullptr;
     return fake_ai::memory.data() + offset;
 }
+void before_dma_read(const void*, starlet::sdk::u32) {}
 void panic(const char* message) {
     std::fprintf(stderr, "panic: %s\n", message);
     std::abort();

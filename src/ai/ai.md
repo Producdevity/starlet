@@ -7,7 +7,7 @@ the Pikmin 2 port's AI model. It knows nothing of AX or JAudio: the game, or
 ## DMA
 
 `AIInitDMA` (guest address) and `starlet::ai::init_dma` (host pointer) copy the
-block they program. Blocks are native s16 stereo, right channel first, 32-byte
+block they program, after `before_dma_read`. Blocks are native s16 stereo, right channel first, 32-byte
 aligned, a multiple of 32 bytes. `AIStartDMA` plays the programmed block. When
 the playing block finishes, the DMA latches the programmed block and raises the
 AI interrupt on the guest CPU, which calls the DMA callback; the game then

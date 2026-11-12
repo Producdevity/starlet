@@ -48,8 +48,10 @@ void transfer(u32 type, u32 main, u32 aram, u32 length) {
         std::abort();
     }
     if (type == ARAM_DIR_MRAM_TO_ARAM) {
+        before_dma_read(host, length);
         std::memcpy(storage().data() + aram, host, length);
     } else {
+        before_dma_write(host, length);
         std::memcpy(host, storage().data() + aram, length);
         report_cpu_write(host, length);
     }

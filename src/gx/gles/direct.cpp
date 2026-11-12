@@ -384,6 +384,9 @@ struct GlesDirect::Impl {
     // are disjoint from each other and from every copy in copies.
     std::vector<GlesResidentCopy> shadowed;
     std::uint64_t stamps = 0;
+    // Destination and size of every copy in copies and shadowed, for resident_in on other threads.
+    mutable std::mutex published_mutex;
+    std::vector<std::pair<std::uintptr_t, std::size_t>> published;
     // Copy targets are reused only once the GPU has retired their last frame of use:
     // rendering into a texture that pending draws still sample makes the driver wait.
     struct SpareTarget { int width, height; GLuint texture, framebuffer; std::uint64_t frame; };
@@ -990,7 +993,7 @@ struct GlesDirect::Impl {
             if (!owns_any(*it, d.address, bytes)) { ++it; continue; }
             materialize(*it); it = shadowed.erase(it); older = true;
         }
-        if (found.empty()) { if (older) textures_changed(); return 0; }
+        if (found.empty()) { if (older) { textures_changed(); publish(); } return 0; }
         if (found.size() == 1 && !older) {
             const auto& c = found[0]->second;
             const auto& p = c.plan;
@@ -1007,7 +1010,62 @@ struct GlesDirect::Impl {
         }
         for (auto it : found) materialize(it);
         textures_changed();
+        publish();
         return 0;
+    }
+    void publish() {
+        std::lock_guard<std::mutex> lock(published_mutex);
+        published.clear();
+        for (const auto& c : copies) published.emplace_back(reinterpret_cast<std::uintptr_t>(c.second.destination), c.second.bytes);
+        for (const auto& c : shadowed) published.emplace_back(reinterpret_cast<std::uintptr_t>(c.destination), c.bytes);
+    }
+    bool resident_in(std::uintptr_t begin, std::size_t size) const {
+        std::lock_guard<std::mutex> lock(published_mutex);
+        for (const auto& r : published) if (begin < r.first + r.second && r.first < begin + size) return true;
+        return false;
+    }
+    // The bytes [from, to) of c that [begin, begin + size) reaches; false when it reaches none.
+    static bool reached(const GlesResidentCopy& c, std::uintptr_t begin, std::size_t size, std::size_t& from, std::size_t& to) {
+        const auto destination = reinterpret_cast<std::uintptr_t>(c.destination);
+        const auto first = std::max(begin, destination), last = std::min(begin + size, destination + c.bytes);
+        if (first >= last) return false;
+        from = first - destination; to = last - destination;
+        return true;
+    }
+    void before_read(std::uintptr_t begin, std::size_t size) {
+        bool changed = false;
+        std::size_t from = 0, to = 0;
+        for (auto it = shadowed.begin(); it != shadowed.end();) {
+            if (!reached(*it, begin, size, from, to) || it->covers(from, to)) { ++it; continue; }
+            materialize(*it); it = shadowed.erase(it); changed = true;
+        }
+        for (auto it = copies.begin(); it != copies.end();) {
+            if (!reached(it->second, begin, size, from, to)) { ++it; continue; }
+            materialize(it++); changed = true;
+        }
+        if (changed) { textures_changed(); publish(); }
+    }
+    // Written bytes become covered, as if a newer copy owned them: partly written copies
+    // move to shadowed and keep their other bytes on the GPU.
+    void before_write(std::uintptr_t begin, std::size_t size) {
+        bool changed = false;
+        std::size_t from = 0, to = 0;
+        for (auto it = shadowed.begin(); it != shadowed.end();) {
+            if (!reached(*it, begin, size, from, to)) { ++it; continue; }
+            changed = true; ++stats.dma_overwritten;
+            if (it->cover(from, to)) { retire_shadowed(*it); it = shadowed.erase(it); } else ++it;
+        }
+        for (auto it = copies.begin(); it != copies.end();) {
+            if (!reached(it->second, begin, size, from, to)) { ++it; continue; }
+            changed = true; ++stats.dma_overwritten;
+            if (from == 0 && to == it->second.bytes) { retire_target(it->second); it = copies.erase(it); continue; }
+            drop_crops(it->first);
+            it->second.cover(from, to);
+            shadowed.push_back(std::move(it->second));
+            it = copies.erase(it);
+        }
+        while (shadowed.size() > 8) { materialize(shadowed.front()); shadowed.erase(shadowed.begin()); }
+        if (changed) { textures_changed(); publish(); }
     }
     void invalidate_pointer(const std::uint8_t* begin, std::size_t size) {
         for (auto& t : textures)
@@ -1080,6 +1138,7 @@ struct GlesDirect::Impl {
         if (limits.stamp_resident_copies) { entry.stamp = ++stamps; entry.write_stamps(); }
         invalidate_pointer(destination, bytes);
         textures_changed();
+        publish();
         ++stats.resident_copies;
         return t;
     }
@@ -1112,6 +1171,7 @@ struct GlesDirect::Impl {
             else ++it;
         }
         textures_changed();
+        publish();
     }
     void evict_textures() {
         while (textures.size() > limits.textures || stats.texture_bytes > limits.texture_bytes) {
@@ -2205,6 +2265,15 @@ GlesDirect::ResidentTarget GlesDirect::resident_copy(const TextureCopy& p, std::
     return impl_->resident_copy(p, token, destination, capacity);
 }
 void GlesDirect::release(std::uint32_t token, std::size_t bytes) { impl_->release(token, bytes); }
+void GlesDirect::before_read(const void* data, std::size_t size) {
+    impl_->before_read(reinterpret_cast<std::uintptr_t>(data), size);
+}
+void GlesDirect::before_write(const void* data, std::size_t size) {
+    impl_->before_write(reinterpret_cast<std::uintptr_t>(data), size);
+}
+bool GlesDirect::resident_in(const void* data, std::size_t size) const {
+    return impl_->resident_in(reinterpret_cast<std::uintptr_t>(data), size);
+}
 GlesProgramBuilderStats GlesDirect::program_builder() const {
     return impl_->builder ? impl_->builder->stats() : GlesProgramBuilderStats{};
 }

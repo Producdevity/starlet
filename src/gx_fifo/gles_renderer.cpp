@@ -21,6 +21,10 @@ void GlesBackend::copy_texture(const gx::TextureCopy& copy, std::uint8_t* destin
 std::uint32_t GlesBackend::peek_depth(int x, int y) { return renderer_.peek_depth(x, y); }
 std::uint32_t GlesBackend::peek_color(int x, int y) { return renderer_.peek_color(x, y); }
 
+bool GlesBackend::resident_in(const void* data, std::size_t bytes) const { return renderer_.resident_in(data, bytes); }
+void GlesBackend::before_dma_read(const void* data, std::size_t bytes) { renderer_.before_dma_read(data, bytes); }
+void GlesBackend::before_dma_write(const void* data, std::size_t bytes) { renderer_.before_dma_write(data, bytes); }
+
 bool GlesBackend::present(const gx::FramebufferView& frame, int drawable_width, int drawable_height, bool black) {
     return renderer_.present_framebuffer(frame, drawable_width, drawable_height, black);
 }
@@ -33,7 +37,7 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 "presentations %llu, programs %llu, decoded %llu bytes; direct draws %llu zero-area %llu culled %llu unready %llu "
                 "submissions %llu batched %llu instanced %llu skipped %u; program waits %llu/%llu/%llu/%llu/%llu "
                 "(33/67/133/267 ms/longer) max %llu ms, GL-thread links %llu max %llu ms; resident copies %llu hits %llu "
-                "crops %llu materialized %llu\n",
+                "crops %llu materialized %llu overwritten by DMA %llu\n",
                 gpu.retraces, gpu.presented, gpu.frame_buffer, gpu.known_frame_buffer, (unsigned long long)s.draws,
                 (unsigned long long)s.display_copies, (unsigned long long)s.texture_copies,
                 (unsigned long long)s.presentations, (unsigned long long)s.shader_compiles,
@@ -46,7 +50,8 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 (unsigned long long)s.direct.program_waits[4], (unsigned long long)s.direct.program_wait_max_ms,
                 (unsigned long long)s.direct.fallback_links, (unsigned long long)s.direct.fallback_link_max_ms,
                 (unsigned long long)s.direct.resident_copies, (unsigned long long)s.direct.resident_hits,
-                (unsigned long long)s.direct.resident_crops, (unsigned long long)s.direct.materialized);
+                (unsigned long long)s.direct.resident_crops, (unsigned long long)s.direct.materialized,
+                (unsigned long long)s.direct.dma_overwritten);
 }
 
 }

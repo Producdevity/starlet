@@ -325,6 +325,8 @@ struct GlesRenderer::Impl {
     bool transform_uploaded = false;
     std::unique_ptr<DrawPreparation> preparation;
     std::unique_ptr<GlesDirect> direct;
+    // direct for resident_in on other threads, once created.
+    std::atomic<GlesDirect*> shared_direct{nullptr};
     // Resident copy programs specialized per format, scale and source; mode-keyed.
     struct ResidentProgram { std::uint32_t mode = 0; GLuint name = 0; GLint rect = -1, filter = -1, rows = -1; };
     GLuint copy_samplers[2] = {}; // Nearest and linear clamped EFB lookups for fast copies.
@@ -484,6 +486,7 @@ struct GlesRenderer::Impl {
     ~Impl() {
         if (owner != std::this_thread::get_id()) std::terminate();
         if (!context_valid) return;
+        shared_direct.store(nullptr, std::memory_order_release);
         direct.reset();
         for (const auto& p : resident_programs) glDeleteProgram(p.name);
         if (copy_samplers[0]) glDeleteSamplers(2, copy_samplers);
@@ -542,6 +545,7 @@ struct GlesRenderer::Impl {
             g.reinterpret_format(rgba6); return true;
         }, [&g](const GlesResidentCopy& copy) { g.execute([&g, &copy] { g.materialize(copy); }, true); },
         [&g](std::function<void()> op, bool wait) { g.execute(std::move(op), wait); }, strip_framebuffer});
+        shared_direct.store(direct.get(), std::memory_order_release);
     }
     void flush_direct() {
         if (!direct) return;
@@ -1804,6 +1808,22 @@ void GlesRenderer::copy_texture_resident(const TextureCopy& p, std::uint8_t* des
 void GlesRenderer::release_resident(std::uint32_t token, std::size_t bytes) {
     auto& g = *impl_; g.check_owner();
     if (g.direct) g.direct->release(token, bytes);
+}
+void GlesRenderer::before_dma_read(const void* data, std::size_t bytes) {
+    auto& g = *impl_; g.check_owner();
+    if (!g.direct) return;
+    if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
+    try { g.direct->before_read(data, bytes); } catch (...) { g.failed = true; throw; }
+}
+void GlesRenderer::before_dma_write(const void* data, std::size_t bytes) {
+    auto& g = *impl_; g.check_owner();
+    if (!g.direct) return;
+    if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
+    try { g.direct->before_write(data, bytes); } catch (...) { g.failed = true; throw; }
+}
+bool GlesRenderer::resident_in(const void* data, std::size_t bytes) const {
+    const auto* direct = impl_->shared_direct.load(std::memory_order_acquire);
+    return direct && direct->resident_in(data, bytes);
 }
 bool GlesRenderer::present_framebuffer(const FramebufferView &f, int width, int height, bool black) {
     auto &g = *impl_;

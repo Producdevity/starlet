@@ -730,6 +730,76 @@ void resident_copy_chain() {
     }
     fake::map_pattern=false; fake::read_pattern_row=0;
 }
+// Host transfers (DMA on the game's behalf) over a resident copy see memory as the console has
+// it: a read gets the copy's bytes, a write replaces them, and bytes a write leaves keep the copy's.
+void dma_over_resident_copies() {
+    Fixture f; f.memory.bytes.resize(512,0xa5);
+    TextureCopy rgba; rgba.width=16; rgba.height=8; rgba.format=6; rgba.stride=256; // 512 bytes
+    const std::uint32_t rgba_16x8=15u|(7u<<10)|(6u<<20), i8_8x4=0x100c07;
+    const auto lookup=[&](GlesRenderer& r,std::uint32_t image){f.bp(0x8b,image);r.draw_direct(f.decoder.state(),f.command(),f.memory);r.wait_until_idle();};
+    std::vector<std::uint8_t> pixels(16*8*4);
+    for(std::size_t i=0;i<pixels.size();++i) pixels[i]=std::uint8_t(i%251);
+    alignas(32) std::array<std::uint8_t,512> stored{};
+    store_texture_copy(rgba,{pixels.data(),pixels.size()},stored.data(),stored.size());
+    fake::map_pattern=true; fake::read_pattern_row=16;
+    GlesRenderer renderer; lookup(renderer,i8_8x4);
+    alignas(32) std::array<std::uint8_t,512> bytes{};
+    check(!renderer.resident_in(bytes.data(),bytes.size()),"no copy is resident before the first");
+
+    renderer.copy_texture_resident(rgba,bytes.data(),bytes.size(),0x8000);
+    check(renderer.resident_in(bytes.data()+500,4) && !renderer.resident_in(bytes.data()+512,64),"the copy's destination is resident");
+    auto reads=fake::read_pixels; auto s=renderer.stats().direct;
+    renderer.before_dma_write(bytes.data(),bytes.size());
+    bytes.fill(0x33);
+    lookup(renderer,rgba_16x8);
+    auto t=renderer.stats().direct;
+    check(t.resident_hits==s.resident_hits && t.materialized==s.materialized && t.dma_overwritten==s.dma_overwritten+1 &&
+          fake::read_pixels==reads && std::all_of(bytes.begin(),bytes.end(),[](std::uint8_t b){return b==0x33;}),
+          "a lookup after a transfer wrote over a copy reads the transfer's bytes, not the copy");
+    check(!renderer.resident_in(bytes.data(),bytes.size()),"a copy a transfer wrote over is no longer resident");
+
+    renderer.copy_texture_resident(rgba,bytes.data(),bytes.size(),0x8000);
+    s=renderer.stats().direct;
+    renderer.before_dma_read(bytes.data()+100,4);
+    t=renderer.stats().direct;
+    check(t.materialized==s.materialized+1 && fake::read_pixels==reads+1 && bytes==stored,
+          "a transfer reading part of a copy gets the copy's bytes");
+    renderer.before_dma_read(bytes.data(),bytes.size());
+    check(renderer.stats().direct.materialized==t.materialized && fake::read_pixels==reads+1,
+          "a materialized copy is ordinary memory for later transfers");
+
+    bytes.fill(0);
+    renderer.copy_texture_resident(rgba,bytes.data(),bytes.size(),0x8000);
+    renderer.before_dma_write(bytes.data()+256,64);
+    std::fill(bytes.begin()+256,bytes.begin()+320,0x44);
+    s=renderer.stats().direct;
+    lookup(renderer,rgba_16x8);
+    t=renderer.stats().direct;
+    check(t.resident_hits==s.resident_hits && t.materialized==s.materialized+1 && fake::read_pixels==reads+2 &&
+          std::equal(bytes.begin(),bytes.begin()+256,stored.begin()) && std::equal(bytes.begin()+320,bytes.end(),stored.begin()+320) &&
+          std::all_of(bytes.begin()+256,bytes.begin()+320,[](std::uint8_t b){return b==0x44;}),
+          "a lookup of a partly written copy keeps the written bytes and gets the copy's others");
+
+    bytes.fill(0);
+    renderer.copy_texture_resident(rgba,bytes.data(),bytes.size(),0x8000);
+    renderer.before_dma_write(bytes.data()+256,256);
+    check(renderer.resident_in(bytes.data(),256),"a copy's unwritten bytes stay resident");
+    renderer.before_dma_write(bytes.data(),256);
+    s=renderer.stats().direct;
+    lookup(renderer,rgba_16x8);
+    t=renderer.stats().direct;
+    check(!renderer.resident_in(bytes.data(),bytes.size()) && t.materialized==s.materialized && fake::read_pixels==reads+2 &&
+          bytes==std::array<std::uint8_t,512>{},"transfers writing all of a copy in parts drop it");
+
+    renderer.copy_texture_resident(rgba,bytes.data(),bytes.size(),0x8000);
+    renderer.before_dma_write(bytes.data(),64);
+    std::fill(bytes.begin(),bytes.begin()+64,0x55);
+    renderer.before_dma_read(bytes.data()+64,448);
+    check(renderer.stats().direct.materialized==t.materialized+1 && std::equal(bytes.begin()+64,bytes.end(),stored.begin()+64) &&
+          std::all_of(bytes.begin(),bytes.begin()+64,[](std::uint8_t b){return b==0x55;}),
+          "a transfer reading a partly written copy gets the copy's remaining bytes beside the written ones");
+    fake::map_pattern=false; fake::read_pattern_row=0;
+}
 void stamped_resident_copies() {
     GlesLimits limits; limits.direct.stamp_resident_copies=true;
     GlesRenderer renderer(limits); Fixture f; f.memory.bytes.resize(64,0xa5); f.bp(0x8b,0x100c0f);
@@ -1459,7 +1529,7 @@ int main() {
         rejected_program_skips_draws();
         unready_program_policy();
         program_reuse_across_tev_colours();
-        resident_copies(); resident_copy_crops(); resident_copy_chain(); stamped_resident_copies();
+        resident_copies(); resident_copy_crops(); resident_copy_chain(); dma_over_resident_copies(); stamped_resident_copies();
         z_texture_clear();
         direct_geometry_cache();
         direct_instancing();

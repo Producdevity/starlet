@@ -433,6 +433,7 @@ s32 CARDReadAsync(CARDFileInfo* fileInfo, void* addr, s32 length, s32 offset, CA
             report("CARDRead", read);
             if (read != CARD_RESULT_READY) return;
             if (!data->empty()) {
+                starlet::os::before_dma_write(addr, data->size());
                 std::memcpy(addr, data->data(), data->size());
                 starlet::os::report_cpu_write(addr, data->size());
             }
@@ -457,6 +458,7 @@ s32 CARDWriteAsync(CARDFileInfo* fileInfo, const void* addr, s32 length, s32 off
     host_allocation_scope host;
     auto info = std::make_shared<sc::Card::FileInfo>(from_file_info(fileInfo));
     const u8* bytes = static_cast<const u8*>(addr);
+    if (length > 0) starlet::os::before_dma_read(bytes, std::size_t(length));
     auto data = std::make_shared<std::vector<u8>>(bytes, bytes + (length > 0 ? length : 0));
     transfer(
         chan, [slot, info, data, length, offset] { return s32(slot->card->write(*info, data->data(), length, offset)); },

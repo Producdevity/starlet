@@ -46,6 +46,7 @@ OSBootInfo local_boot_info;
 OSBootInfo* boot_info = &local_boot_info;
 bool print_game_log = false;
 CpuWriteObserver cpu_write_observer = nullptr;
+std::atomic<DmaObserver> dma_observer{nullptr};
 ResetObserver reset_observer = nullptr;
 
 using clock = std::chrono::steady_clock;
@@ -190,6 +191,13 @@ void set_game_log(bool print) { print_game_log = print; }
 void set_cpu_write_observer(CpuWriteObserver observer) { cpu_write_observer = observer; }
 void report_cpu_write(const void* data, std::size_t bytes) {
     if (cpu_write_observer) cpu_write_observer(data, bytes);
+}
+void set_dma_observer(DmaObserver observer) { dma_observer.store(observer, std::memory_order_release); }
+void before_dma_read(const void* data, std::size_t bytes) {
+    if (const auto observer = dma_observer.load(std::memory_order_acquire)) observer(data, bytes, false);
+}
+void before_dma_write(void* data, std::size_t bytes) {
+    if (const auto observer = dma_observer.load(std::memory_order_acquire)) observer(data, bytes, true);
 }
 void set_reset_observer(ResetObserver observer) { reset_observer = observer; }
 

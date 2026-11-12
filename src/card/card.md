@@ -88,8 +88,8 @@ that move data (mount, check, format, create, read, write, set status and
 attributes, delete, rename) run in order on one service thread (`starlet-card`)
 and complete through `raise_interrupt`, with the callback on the interrupt thread;
 the synchronous calls sleep the guest thread on the slot's queue as `__CARDSync`
-does. Guest memory is read when a request is made and written when it completes
-(`report_cpu_write`). `finish_card_writes(timeout)` is the exit path's wait for
+does. Guest memory is read when a request is made (`before_dma_read`) and written
+when it completes (`before_dma_write`, `report_cpu_write`). `finish_card_writes(timeout)` is the exit path's wait for
 requests already made. `tests/card/sdk_card_tests.cpp` (`starlet_card_sdk`) runs
 the calls on the guest CPU: probe and mount rules, geometry, the created entry,
 writes and reads across blocks, asynchronous completion on the interrupt thread,

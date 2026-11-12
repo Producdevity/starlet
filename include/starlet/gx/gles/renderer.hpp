@@ -112,6 +112,17 @@ public:
     // pending, and presentation waits for the previous frame.
     void copy_texture_resident(const TextureCopy&, std::uint8_t*, std::size_t, std::uint32_t token) override;
     void release_resident(std::uint32_t token, std::size_t bytes) override;
+    // Direct path, for host transfers on the game's behalf (DMA engines, card and disc
+    // files; starlet::os::before_dma_read and before_dma_write), on the owner thread
+    // after the GX commands that precede the transfer. Before a read, resident copies
+    // with bytes in the range are materialized, waiting for the GL thread; before a
+    // write, they are dropped, and copies the write covers in part keep their other bytes
+    // on the GPU. Cache stores and flushes are neither: they leave copies resident.
+    void before_dma_read(const void* data, std::size_t bytes);
+    void before_dma_write(const void* data, std::size_t bytes);
+    // Any thread: whether resident copies may hold bytes of [data, data + bytes); the
+    // calls above change nothing otherwise.
+    bool resident_in(const void* data, std::size_t bytes) const;
     // With the direct path active, XFBs change only through display copies, so a
     // retrace showing the same XFB and extent as the last presentation returns false
     // without presenting or swapping; the previous image stays on screen.

@@ -88,6 +88,15 @@ either way.
   game fills with native 32-bit numbers for `GXSetArray` are registered with
   `starlet_gx_host_order_array` and released before reuse.
 
+## Host transfers
+
+`start_gpu` observes `starlet::os::before_dma_read` and `before_dma_write`. A
+transfer whose range may hold results the renderer keeps off memory
+(`Renderer::resident_in`) waits while the GPU thread runs the commands queued
+before it and then the renderer's `before_dma_read` or `before_dma_write`; other
+transfers do not wait. The GPU and GL threads never wait for a guest or DMA
+thread.
+
 ## Diagnostics
 
 `GpuSetup::diagnostics`: `stats` (renderer and decoder counters every 300
@@ -99,4 +108,6 @@ draws are logged once per message.
 ## Tests
 
 `tests/gx_fifo` (host, Linux): staging across chunks, unlinked FIFOs and wrap,
-token and draw-done order, peeks, a display copy presented by VI.
+token and draw-done order, peeks, a display copy presented by VI. With GLES
+headers, `dma_tests.cpp` runs ARAM and disc DMA over resident texture copies of
+the GLES renderer on a recording GL fake.

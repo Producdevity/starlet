@@ -152,10 +152,30 @@ copy's top-left texels: it samples a texture of its own size that
 the copy is replaced, so its sampler wraps and clamps at the lookup's edges.
 Any other overlapping lookup first materializes the copy with a
 readback and `store_texture_copy`, reproducing the CPU encoder's bytes.
-Unregistered writable ranges release their copies. Where nobody reports CPU
-writes, as in a recompiled game, `stamp_resident_copies` writes a per-copy stamp
-into the first eight bytes of up to 64 destination blocks spread over the copy,
-its first and last included. The copy is sampled or materialized only while
+`release_resident` drops the copies in a range the port no longer lets the GX
+write (Galaxy unregisters its writable ranges this way).
+
+Host transfers on the game's behalf call `starlet::os::before_dma_read` or
+`before_dma_write` first: ARAM and disc DMA, card reads and writes, THP planes
+and audio DMA. gx_fifo passes one whose range may hold a resident copy
+(`resident_in`, a list the GPU thread republishes whenever its copies change) to
+the GPU thread after the commands queued before it, while the transfer waits;
+other transfers cost a locked list scan. A read materializes the copies it
+reaches, waiting for the GL thread's readback, so the transfer gets the copy's
+bytes. A write drops the copies it covers without materializing them; one it
+covers in part records the written range as covered and is kept like a copy a
+newer one partly replaced (below), so its other bytes stay exact. Cache stores
+and flushes only change page generations, since games flush memory holding valid
+copies before swapping it out. A port whose own DMA bypasses `starlet::os` calls
+the renderer's `before_dma_read` and `before_dma_write` itself. Copies by the
+game's CPU are not transfers: Resident Evil 4 swaps its sub screen window with
+ARAM by `memcpy` through 64 KiB DMA buffers (`MemorySwap`), so only stamps show
+that the room's bytes replaced the sub screen's copies there.
+
+Where nobody reports CPU writes, as in a recompiled game or a CPU copy like
+that one, `stamp_resident_copies` writes a per-copy stamp into the first eight
+bytes of up to 64 destination blocks spread over the copy, its first and last
+included. The copy is sampled or materialized only while
 every stamp is intact; a game reusing the memory overwrites it wholesale and
 breaks one, and the memory then keeps the game's bytes. Stamping every block
 cost a cache miss per block, several milliseconds per frame on the H700.

@@ -9,7 +9,9 @@ declared in `include/starlet/sdk/os.h`. Moved from the Pikmin 2 port's platform 
   interrupt thread that outranks every OS priority while the running thread has interrupts enabled.
   `wait_for_interrupt` is for game loops that spin on a variable an interrupt handler sets.
 - `os_core`: arena bounds, time base (40.5 MHz ticks), calendar, alarms, reports, cache maintenance
-  (reported to observers such as the GX), console settings, reset.
+  (reported to observers such as the GX), console settings, reset. Host transfers into and out of game
+  memory (ARAM, disc, card, THP, audio DMA) call `before_dma_read` or `before_dma_write` first, and
+  report what they wrote with `report_cpu_write`; cache stores and flushes are not transfers.
 - `os_misc`: processor registers, exception context, error handlers, locked cache switch, the IPL
   ROM font geometry with blank glyphs.
 - `game_memory`: the port's memory map. Physical address p is `window_base + p`; the arena, fixed

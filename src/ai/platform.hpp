@@ -15,6 +15,8 @@ void restore_interrupts(starlet::sdk::BOOL level);
 // Queues handler to run on the guest CPU as an interrupt.
 void raise_interrupt(void (*handler)());
 void* hardware_to_native(starlet::sdk::u32 address, starlet::sdk::u32 bytes);
+// Before the DMA reads game memory (starlet::os::before_dma_read).
+void before_dma_read(const void* data, starlet::sdk::u32 bytes);
 [[noreturn]] void panic(const char* message);
 // Runs fn with host allocation: Starlet's memory, never a game heap.
 void with_host_allocation(void (*fn)(void*), void* context);

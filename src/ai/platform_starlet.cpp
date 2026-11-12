@@ -4,6 +4,7 @@
 #include "starlet/os/game_memory.hpp"
 #include "starlet/os/guest_cpu.hpp"
 #include "starlet/os/host_allocation.hpp"
+#include "starlet/os/os_core.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,7 @@ void raise_interrupt(void (*handler)()) { starlet::os::raise_interrupt(handler);
 void* hardware_to_native(starlet::sdk::u32 address, starlet::sdk::u32 bytes) {
     return starlet::os::hardware_to_native(address, bytes);
 }
+void before_dma_read(const void* data, starlet::sdk::u32 bytes) { starlet::os::before_dma_read(data, bytes); }
 void panic(const char* message) {
     OSPanic(__FILE__, __LINE__, "%s", message);
     std::abort();

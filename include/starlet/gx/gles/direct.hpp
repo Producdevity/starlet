@@ -86,6 +86,8 @@ struct GlesResidentCopy {
 struct GlesDirectStats {
     std::uint64_t draws = 0, zero_area = 0, submissions = 0, segments = 0, vertex_bytes = 0;
     std::uint64_t resident_copies = 0, resident_hits = 0, materialized = 0;
+    // Resident copies a host transfer wrote over, wholly or in part (before_write).
+    std::uint64_t dma_overwritten = 0;
     // GPU copies of a resident copy's top-left part made for smaller lookups (counted in resident_hits too).
     std::uint64_t resident_crops = 0;
     std::uint64_t geometry_hits = 0, geometry_misses = 0, geometry_validated_bytes = 0;
@@ -157,6 +159,14 @@ public:
     ResidentTarget resident_copy(const TextureCopy&, std::uint32_t token, std::uint8_t* destination, std::size_t capacity);
     // The token range no longer names memory; its resident copies are dropped.
     void release(std::uint32_t token, std::size_t bytes);
+    // A host transfer (DMA on the game's behalf) is about to read [data, data + size):
+    // resident copies holding bytes there are materialized first.
+    void before_read(const void* data, std::size_t size);
+    // A host transfer is about to write [data, data + size): resident copies there are
+    // dropped without materializing; partly covered ones keep their other bytes (direct.md).
+    void before_write(const void* data, std::size_t size);
+    // Any thread: whether a resident copy may hold bytes of [data, data + size).
+    bool resident_in(const void* data, std::size_t size) const;
     GlesDirectStats stats() const;
     // The program builder's progress; not running without one.
     GlesProgramBuilderStats program_builder() const;

@@ -36,6 +36,14 @@ public:
     // EFB reads after all prior draws: top-left origin, D24 depth, colour as 0xAARRGGBB.
     virtual std::uint32_t peek_depth(int x, int y) = 0;
     virtual std::uint32_t peek_color(int x, int y) = 0;
+    // Host transfers on the game's behalf (starlet::os::before_dma_read, before_dma_write). Any
+    // thread: whether results the renderer keeps off memory (resident texture copies) may hold
+    // bytes of [data, data + bytes). Only then does the GPU thread call before_dma_read or
+    // before_dma_write, after the commands written before the transfer, while the transfer waits:
+    // memory about to be read gets those results, memory about to be written drops them.
+    virtual bool resident_in(const void*, std::size_t) const { return false; }
+    virtual void before_dma_read(const void*, std::size_t) {}
+    virtual void before_dma_write(const void*, std::size_t) {}
     // Shows frame (or black) on a drawable of that size; false when nothing new was shown.
     virtual bool present(const gx::FramebufferView& frame, int drawable_width, int drawable_height, bool black) = 0;
     // Development: the EFB as RGBA8 rows from the lower left; empty when the renderer cannot read it.

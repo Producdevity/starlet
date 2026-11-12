@@ -30,8 +30,19 @@ void set_game_log(bool print);
 // DCStoreRange/DCFlushRange report the CPU writes the GX may read.
 using CpuWriteObserver = void (*)(const void* data, std::size_t bytes);
 void set_cpu_write_observer(CpuWriteObserver);
-// DMA engines (disc, ARAM) report the memory they wrote the same way.
+// DMA engines (disc, ARAM, card, THP) report the memory they wrote the same way, once written.
 void report_cpu_write(const void* data, std::size_t bytes);
+
+// Host transfers on the game's behalf (the DMA engines above, card writes from memory, audio DMA)
+// call these before they read or write game memory. On the console the GX has written its
+// results to memory by then; a renderer that keeps some on the GPU (resident texture copies)
+// writes them back before a read and drops those a write replaces. A cache store or flush is not
+// a transfer: the game flushes memory holding valid copies too. The observer may wait for the GPU
+// and GL threads, so callers hold no lock those threads take.
+using DmaObserver = void (*)(const void* data, std::size_t bytes, bool write);
+void set_dma_observer(DmaObserver);
+void before_dma_read(const void* data, std::size_t bytes);
+void before_dma_write(void* data, std::size_t bytes);
 
 // OSResetSystem hands the request to the application, which exits or restarts.
 using ResetObserver = void (*)(int reset, unsigned code, bool force_menu);

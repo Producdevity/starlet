@@ -20,6 +20,9 @@ public:
                       std::uint32_t address) override;
     std::uint32_t peek_depth(int x, int y) override;
     std::uint32_t peek_color(int x, int y) override;
+    bool resident_in(const void* data, std::size_t bytes) const override;
+    void before_dma_read(const void* data, std::size_t bytes) override;
+    void before_dma_write(const void* data, std::size_t bytes) override;
     bool present(const gx::FramebufferView& frame, int drawable_width, int drawable_height, bool black) override;
     std::vector<std::uint8_t> readback() override;
     void print_stats(const GpuCounters& gpu) override;

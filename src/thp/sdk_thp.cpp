@@ -25,6 +25,9 @@ starlet::sdk::s32 THPVideoDecode(void* file, void* tileY, void* tileU, void* til
     unsigned width = 0, height = 0;
     if (!starlet::thp::frame_size(frame, packet_limit, width, height)) return 1;
     const std::size_t luma = std::size_t(width) * height;
+    starlet::os::before_dma_write(tileY, luma);
+    starlet::os::before_dma_write(tileU, luma / 4);
+    starlet::os::before_dma_write(tileV, luma / 4);
     try {
         decoder()->decode(frame, packet_limit, width, height,
                           {{{static_cast<std::uint8_t*>(tileY), luma},

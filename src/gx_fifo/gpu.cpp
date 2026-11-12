@@ -382,6 +382,18 @@ public:
         return failure_;
     }
 
+    bool on_thread() const { return std::this_thread::get_id() == thread_.get_id(); }
+    bool resident_in(const void* data, std::size_t bytes) const { return renderer_.resident_in(data, bytes); }
+    // A transfer's memory as the console has it once the GX has run the commands before it.
+    void before_dma(const void* data, std::size_t bytes, bool write) {
+        try {
+            if (write) renderer_.before_dma_write(data, bytes);
+            else renderer_.before_dma_read(data, bytes);
+        } catch (const std::exception& error) {
+            report(std::string("GX results around a DMA failed: ") + error.what());
+        }
+    }
+
 private:
     static std::uint32_t word(std::uint8_t address, std::uint32_t value) { return std::uint32_t{address} << 24 | (value & 0xffffff); }
 
@@ -561,6 +573,17 @@ std::unique_ptr<Gpu> gpu;
 void (*dirty_state)() = nullptr;
 std::string last_failure;
 
+// os::before_dma_read and before_dma_write, on any thread. Only a range that may hold resident
+// results waits for the GPU thread: the commands queued before the transfer run first, then the
+// renderer settles the range. A read waits for the GL thread's readback too. The GPU and GL
+// threads never wait for a guest or DMA thread, so the wait ends.
+void note_dma(const void* data, std::size_t bytes, bool write) {
+    Gpu* g = gpu.get();
+    if (!g || !bytes || !g->resident_in(data, bytes)) return;
+    if (g->on_thread()) return g->before_dma(data, bytes, write);
+    gpu_call([g, data, bytes, write] { g->before_dma(data, bytes, write); });
+}
+
 }
 
 void start_gpu(GpuSetup setup) {
@@ -572,10 +595,12 @@ void start_gpu(GpuSetup setup) {
     host_allocation_scope host;
     dirty_state = setup.flush_dirty_state;
     gpu = std::make_unique<Gpu>(std::move(setup));
+    os::set_dma_observer(note_dma);
 }
 
 void stop_gpu() {
     host_allocation_scope host;
+    os::set_dma_observer(nullptr);
     gpu.reset();
 }
 

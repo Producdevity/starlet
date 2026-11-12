@@ -5,6 +5,7 @@
 
 `starlet::ar`: 16 MiB of ARAM and its DMA (AR and ARQ). Transfers copy when posted and complete as
 interrupts, one timing the hardware's queued DMA can produce. Main-memory addresses resolve through
-`starlet::os::hardware_to_native`.
+`starlet::os::hardware_to_native`; each transfer calls `before_dma_read` (MRAM to ARAM) or
+`before_dma_write` (ARAM to MRAM) before copying.
 
 Both moved from the Pikmin 2 port.

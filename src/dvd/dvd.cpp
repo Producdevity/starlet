@@ -67,6 +67,7 @@ bool exists(const std::string& path) {
 
 void install_fst() {
     const DiscState& d = disc_now();
+    os::before_dma_write(fst_memory, d.fst.size());
     std::memcpy(fst_memory, d.fst.data(), d.fst.size());
     os::report_cpu_write(fst_memory, d.fst.size());
 }
@@ -147,6 +148,7 @@ private:
         // Reads past the end of a file return the bytes that exist; the drive would read whatever
         // follows on the disc, which no correct caller uses.
         auto* out = static_cast<std::uint8_t*>(r.address);
+        if (r.length > 0) os::before_dma_write(out, std::size_t(r.length));
         s32 done = 0;
         while (done < r.length) {
             const ssize_t n = pread(e.fd, out + done, std::size_t(r.length - done), off_t(r.offset) + done);

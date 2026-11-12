@@ -186,6 +186,7 @@ void program(const void* data, std::uint32_t bytes, std::uint32_t register_addre
         std::pair<Block*, std::uint32_t> request{&block, bytes};
         platform::with_host_allocation(resize_block, &request);
     }
+    platform::before_dma_read(data, bytes);
     std::memcpy(block.samples.data(), data, bytes);
     block.frames = bytes / 4;
     {
