@@ -1,0 +1,8 @@
+add_executable(starlet_thp_video_tests video_tests.cpp)
+target_link_libraries(starlet_thp_video_tests PRIVATE starlet::thp)
+add_test(NAME starlet_thp_video COMMAND starlet_thp_video_tests)
+set_tests_properties(starlet_thp_video PROPERTIES TIMEOUT 60)
+
+add_executable(starlet_thp_resources_tests resources_tests.cpp)
+target_link_libraries(starlet_thp_resources_tests PRIVATE starlet::thp)
+add_test(NAME starlet_thp_resources COMMAND starlet_thp_resources_tests)
