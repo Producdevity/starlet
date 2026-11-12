@@ -351,6 +351,9 @@ struct GlesDirect::Impl {
     // rendering into a texture that pending draws still sample makes the driver wait.
     struct SpareTarget { int width, height; GLuint texture, framebuffer; std::uint64_t frame; };
     std::vector<SpareTarget> spare_targets;
+    // GPU copies of a resident copy's top-left part, for lookups smaller than the copy.
+    struct Crop { std::uint32_t token; unsigned width, height; GLuint texture, framebuffer; };
+    std::vector<Crop> crops;
     std::vector<std::uint8_t> vertices, scratch;
     UniformBytes uniforms;
     TransformUniforms transform_block;
@@ -444,6 +447,7 @@ struct GlesDirect::Impl {
                 for (const auto& s : samplers) glDeleteSamplers(1, &s.second);
                 for (const auto& c : copies) { glDeleteFramebuffers(1, &c.second.framebuffer); glDeleteTextures(1, &c.second.texture); }
                 for (const auto& s : spare_targets) { glDeleteFramebuffers(1, &s.framebuffer); glDeleteTextures(1, &s.texture); }
+                for (const auto& c : crops) { glDeleteFramebuffers(1, &c.framebuffer); glDeleteTextures(1, &c.texture); }
                 for (const auto& a : arenas) if (a.buffer) glDeleteBuffers(1, &a.buffer);
                 for (const auto& v : geometry_vaos) glDeleteVertexArrays(1, &v.second);
                 glDeleteTextures(GLsizei(names.textures.size()), names.textures.data());
@@ -919,6 +923,7 @@ struct GlesDirect::Impl {
         return found;
     }
     void materialize(std::map<std::uint32_t, GlesResidentCopy>::iterator it) {
+        drop_crops(it->first);
         target.materialize(it->second);
         ++stats.materialized;
         retire_texture(it->second.texture);
@@ -934,11 +939,14 @@ struct GlesDirect::Impl {
             const auto& c = found[0]->second;
             const auto& p = c.plan;
             const unsigned tile_width = d.format == TextureFormat::i8 ? 8 : 4, tile_bytes = d.format == TextureFormat::rgba8 ? 64 : 32;
+            const unsigned width = p.destination_width(), height = p.destination_height();
+            // With the copy's stride, texel (x, y) of a lookup no larger than the copy is the copy's texel (x, y).
             if (found[0]->first == d.address && levels == 1 && static_cast<unsigned>(d.format) == texture_copy_sample_format(p) &&
-                d.width == p.destination_width() && d.height == p.destination_height() &&
+                d.width <= width && d.height <= height &&
                 p.stride == std::size_t{(d.width + tile_width - 1u) / tile_width} * tile_bytes && c.intact()) {
                 ++stats.resident_hits;
-                return c.texture;
+                if (d.width == width && d.height == height) return c.texture;
+                return crop(found[0]->first, c, d.width, d.height);
             }
         }
         for (auto it : found) materialize(it);
@@ -950,8 +958,41 @@ struct GlesDirect::Impl {
             if (!t->pointer || (t->pointer < begin + size && begin < t->pointer + t->source_bytes)) { t->validated = 0; t->generation = 0; }
         textures_changed();
     }
+    // Copies the resident copy's rows and columns below width and height into a texture of
+    // that size, on the GPU after the copy's pass; kept until the copy is replaced or dropped.
+    GLuint crop(std::uint32_t token, const GlesResidentCopy& c, unsigned width, unsigned height) {
+        for (const auto& k : crops) if (k.token == token && k.width == width && k.height == height) return k.texture;
+        const auto t = target_of(int(width), int(height));
+        crops.push_back({token, width, height, t.texture, t.framebuffer});
+        pending.push_back([source = GLuint(c.framebuffer), from = GLuint(c.texture), texture = t.texture, width, height] {
+            static constexpr GLenum channels[] = {GL_TEXTURE_SWIZZLE_R, GL_TEXTURE_SWIZZLE_G, GL_TEXTURE_SWIZZLE_B, GL_TEXTURE_SWIZZLE_A};
+            GLint read = 0, swizzle[4];
+            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, from);
+            for (unsigned i = 0; i < 4; ++i) glGetTexParameteriv(GL_TEXTURE_2D, channels[i], &swizzle[i]);
+            glBindTexture(GL_TEXTURE_2D, texture);
+            for (unsigned i = 0; i < 4; ++i) glTexParameteri(GL_TEXTURE_2D, channels[i], swizzle[i]);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, GLsizei(width), GLsizei(height));
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(read));
+        });
+        ++stats.resident_crops;
+        return t.texture;
+    }
+    void drop_crops(std::uint32_t token) {
+        for (auto it = crops.begin(); it != crops.end();) {
+            if (it->token != token) { ++it; continue; }
+            retire_target(int(it->width), int(it->height), it->texture, it->framebuffer);
+            it = crops.erase(it);
+        }
+    }
     void retire_target(const GlesResidentCopy& c) {
-        spare_targets.push_back({int(c.plan.destination_width()), int(c.plan.destination_height()), c.texture, c.framebuffer, frame});
+        drop_crops(c.token);
+        retire_target(int(c.plan.destination_width()), int(c.plan.destination_height()), c.texture, c.framebuffer);
+    }
+    void retire_target(int width, int height, GLuint texture, GLuint framebuffer) {
+        spare_targets.push_back({width, height, texture, framebuffer, frame});
         // Bounded: the oldest spares beyond a few per frame's copies are deleted.
         if (spare_targets.size() > 48) {
             retire_texture(spare_targets.front().texture); retire_framebuffer(spare_targets.front().framebuffer);
@@ -966,7 +1007,17 @@ struct GlesDirect::Impl {
                 retire_target(c); copies.erase(it);
             } else materialize(it);
         }
-        const int width = p.destination_width(), height = p.destination_height();
+        const auto t = target_of(p.destination_width(), p.destination_height());
+        auto& entry = copies[token];
+        entry = {token, bytes, t.texture, t.framebuffer, p, destination, capacity};
+        if (limits.stamp_resident_copies) { entry.stamp = ++stamps; entry.write_stamps(); }
+        invalidate_pointer(destination, bytes);
+        textures_changed();
+        ++stats.resident_copies;
+        return t;
+    }
+    // A spare RGBA8 target of this size, or a new one whose creation is queued.
+    GlesDirect::ResidentTarget target_of(int width, int height) {
         GLuint texture = 0, framebuffer = 0;
         for (auto it = spare_targets.begin(); it != spare_targets.end(); ++it)
             if (it->width == width && it->height == height && it->frame + 2 <= frame) {
@@ -985,12 +1036,6 @@ struct GlesDirect::Impl {
                     throw std::runtime_error("resident texture-copy framebuffer is incomplete");
             });
         }
-        auto& entry = copies[token];
-        entry = {token, bytes, texture, framebuffer, p, destination, capacity};
-        if (limits.stamp_resident_copies) { entry.stamp = ++stamps; entry.write_stamps(); }
-        invalidate_pointer(destination, bytes);
-        textures_changed();
-        ++stats.resident_copies;
         return {texture, framebuffer};
     }
     void release(std::uint32_t token, std::size_t bytes) {

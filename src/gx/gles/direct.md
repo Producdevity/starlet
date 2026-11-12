@@ -141,7 +141,11 @@ sample format decodes (`decode_texture_copy`); in fast shading, copies other
 than luminance and RGB5A3 are framebuffer blits whose target swizzle selects
 the decoded channels, without the 4/5/6-bit quantization. A later lookup at the same
 address with that format, size, one level and natural tile stride samples the
-copy directly; any other overlapping lookup first materializes it with a
+copy directly. A smaller lookup whose natural stride is the copy's reads the
+copy's top-left texels: it samples a texture of its own size that
+`glCopyTexSubImage2D` fills from the copy's framebuffer on the GPU, kept until
+the copy is replaced, so its sampler wraps and clamps at the lookup's edges.
+Any other overlapping lookup first materializes the copy with a
 readback and `store_texture_copy`, reproducing the CPU encoder's bytes.
 Unregistered writable ranges release their copies. Where nobody reports CPU
 writes, as in a recompiled game, `stamp_resident_copies` writes a per-copy stamp

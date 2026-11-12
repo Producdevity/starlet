@@ -78,6 +78,8 @@ struct GlesResidentCopy {
 struct GlesDirectStats {
     std::uint64_t draws = 0, zero_area = 0, submissions = 0, segments = 0, vertex_bytes = 0;
     std::uint64_t resident_copies = 0, resident_hits = 0, materialized = 0;
+    // GPU copies of a resident copy's top-left part made for smaller lookups (counted in resident_hits too).
+    std::uint64_t resident_crops = 0;
     std::uint64_t geometry_hits = 0, geometry_misses = 0, geometry_validated_bytes = 0;
     std::size_t geometry_bytes = 0, geometries = 0;
     std::uint64_t program_misses = 0, state_plans = 0, uniform_blocks = 0, batched_draws = 0, culled_draws = 0, culled_clusters = 0;

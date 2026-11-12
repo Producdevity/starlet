@@ -29,7 +29,14 @@ GLuint next = 0, active = 0, bound[16]{}, samplers[16]{}, pack_buffer = 0, unpac
 std::map<GLuint, unsigned char> first;
 std::map<GLenum, GLint> pixel;
 unsigned clears = 0;
-GLuint framebuffer = 0;
+GLuint framebuffer = 0, read_framebuffer = 0;
+// glCopyTexSubImage2D calls; the last one's read framebuffer, destination texture and
+// x, y, width and height. The framebuffer the last glDrawArrays rendered into.
+unsigned texture_copies = 0;
+GLuint copy_source = 0, copy_texture = 0, array_framebuffer = 0;
+std::array<GLint, 4> copy_rect{};
+// The texture bound to unit 3 at the last indexed draw.
+GLuint draw_texture = 0;
 std::map<GLuint, GLuint> color_attachments;
 std::map<GLuint, GLuint> depth_attachments;
 unsigned uniform_ranges = 0, read_pixels = 0;
@@ -102,7 +109,16 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
 void glDisableVertexAttribArray(GLuint index) {}
 void glVertexAttrib4f(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {}
 void glVertexAttribI4ui(GLuint index, GLuint x, GLuint y, GLuint z, GLuint w) {}
-void glBindFramebuffer(GLenum target, GLuint framebuffer) { if (target != GL_READ_FRAMEBUFFER) fake::framebuffer = framebuffer; }
+void glBindFramebuffer(GLenum target, GLuint framebuffer) {
+    if (target != GL_READ_FRAMEBUFFER) fake::framebuffer = framebuffer;
+    if (target != GL_DRAW_FRAMEBUFFER) fake::read_framebuffer = framebuffer;
+}
+void glCopyTexSubImage2D(GLenum, GLint, GLint, GLint, GLint x, GLint y, GLsizei width, GLsizei height) {
+    ++fake::texture_copies;
+    fake::copy_source = fake::read_framebuffer; fake::copy_texture = fake::bound[fake::active];
+    fake::copy_rect = {x, y, width, height};
+}
+void glGetTexParameteriv(GLenum, GLenum, GLint* params) { *params = 0; }
 void glBindRenderbuffer(GLenum target, GLuint renderbuffer) {}
 void glBindSampler(GLuint unit, GLuint sampler) { fake::samplers[unit] = sampler; }
 void glBindTexture(GLenum target, GLuint texture) { fake::bound[fake::active] = texture; }
@@ -152,9 +168,10 @@ void glDisable(GLenum cap) { if (cap == GL_DEPTH_TEST) fake::depth_test = GL_FAL
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
     ++fake::draws;fake::submitted_index_count=count;
     fake::draw_first = fake::first[fake::bound[3]];
+    fake::draw_texture = fake::bound[3];
     fake::sampler_seen = fake::samplers[3];
 }
-void glDrawArrays(GLenum, GLint, GLsizei) { ++fake::draws; }
+void glDrawArrays(GLenum, GLint, GLsizei) { ++fake::draws; fake::array_framebuffer = fake::framebuffer; }
 void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices) { glDrawElements(mode, count, type, indices); }
 void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices, GLint) { glDrawElements(mode, count, type, indices); }
 void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instances, GLint) {
@@ -217,6 +234,9 @@ void glGetIntegerv(GLenum pname, GLint *data) {
         break;
     case GL_NUM_PROGRAM_BINARY_FORMATS:
         *data = fake::program_binary_formats;
+        break;
+    case GL_READ_FRAMEBUFFER_BINDING:
+        *data = GLint(fake::read_framebuffer);
         break;
     case GL_MAX_VIEWPORT_DIMS:
         data[0] = 16384;
