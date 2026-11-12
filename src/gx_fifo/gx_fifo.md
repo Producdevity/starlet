@@ -35,7 +35,8 @@ GXFifo.c: `__GXFifoInit`, `__GXSaveCPUFifoAux`, `GXInitFifoBase`,
 `GXInitFifoPtrs`, `GXInitFifoLimits`, `GXSetCPUFifo`, `GXSetGPFifo`,
 `GXSaveCPUFifo`, `GXSaveGPFifo`, `GXGetCPUFifo`, `GXGetGPFifo`, `GXGetGPStatus`,
 `GXGetFifoStatus`, `GXGetFifoPtrs`, `GXGetFifoBase`, `GXGetFifoSize`,
-`GXGetFifoLimits`, `GXSetBreakPtCallback`, `GXEnableBreakPt` (panics),
+`GXGetFifoLimits`, `GXSetBreakPtCallback`, `GXEnableBreakPt` (the GPU does not
+stop there; panics when a breakpoint callback is set, whose interrupt is not raised),
 `GXDisableBreakPt`, `GXSetCurrentGXThread`, `GXGetCurrentGXThread`.
 
 GXMisc.c: `GXFlush`, `GXResetWriteGatherPipe`, `GXAbortFrame`, `__GXAbort`,

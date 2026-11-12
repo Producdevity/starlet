@@ -311,8 +311,13 @@ GXBreakPtCallback GXSetBreakPtCallback(GXBreakPtCallback callback) {
     OSRestoreInterrupts(enabled);
     return previous;
 }
-void GXEnableBreakPt(void*) { OSPanic(__FILE__, __LINE__, "GX breakpoints are not supported"); }
-// No breakpoint can be enabled, so none is pending.
+// The GPU never stops at a breakpoint: decoding runs in command order and draw-sync tokens raise their
+// interrupts as they pass, so a breakpoint without a callback (Super Mario Sunshine's TDrawSyncManager
+// keeps the GPU one token behind with them) only changes how far the GPU may run ahead. A breakpoint
+// with a callback expects that interrupt, which is not provided.
+void GXEnableBreakPt(void*) {
+    if (break_point_callback) OSPanic(__FILE__, __LINE__, "GX breakpoint interrupts are not supported");
+}
 void GXDisableBreakPt() {}
 
 OSThread* GXSetCurrentGXThread() {
