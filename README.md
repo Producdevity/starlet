@@ -16,6 +16,9 @@ and the disc handling and SDL services its ports share:
   and WIA and RVZ stored or with Zstandard), parses the FST and runs the
   first-launch setup that extracts a supported disc into a port's `gamedata/`.
   C++17, with the pinned Zstandard decoder in `third_party/zstd`.
+- `starlet::card` (`starlet_card`) keeps memory cards as Dolphin GCI folders and
+  serves them as the SDK's CARD calls (source ports) or as formatted card images
+  (EXI card models). C++17, no other dependencies.
 - `starlet::host` (`starlet_host`) plays audio through the firmware's SDL2, reads
   its game controllers into a port's GameCube layout, and turns the frontend's
   SIGTERM into a prompt exit with the saves flushed. C++17 and SDL2.
@@ -23,7 +26,8 @@ and the disc handling and SDL services its ports share:
 A port feeds the command stream to a `Decoder` and gives it a `MemoryReader` for
 the memory the commands refer to; [src/gx/decoder.md](src/gx/decoder.md) describes
 that contract. [src/disc/disc.md](src/disc/disc.md) describes the disc formats,
-their limits and the setup flow; [src/host/host.md](src/host/host.md) the audio,
+their limits and the setup flow; [src/card/card.md](src/card/card.md) the card
+folders, images and CARD calls; [src/host/host.md](src/host/host.md) the audio,
 controller and quit contracts.
 
 ## Layout
@@ -32,13 +36,16 @@ controller and quit contracts.
 include/starlet/gx/       public headers
 include/starlet/gx/gles/  OpenGL ES renderer headers
 include/starlet/disc/     disc image, FST and setup headers
+include/starlet/card/     memory card headers
 include/starlet/host/     audio, controller and quit headers
 src/gx/                   GX model, with a note per module
 src/gx/gles/              OpenGL ES renderer
 src/disc/                 disc images and setup
+src/card/                 memory cards
 src/host/                 SDL audio, controllers and quit
 tests/gx/                 host tests
 tests/disc/               disc host tests
+tests/card/               memory card tests
 tests/host/               audio, controller and quit tests
 third_party/zstd/         Zstandard v1.5.6 (submodule)
 ```
@@ -63,7 +70,7 @@ leaves it out.
 ```cmake
 set(STARLET_GLES ON)
 add_subdirectory(path/to/starlet)
-target_link_libraries(port PRIVATE starlet::gx_gles starlet::host)
+target_link_libraries(port PRIVATE starlet::gx_gles starlet::card starlet::host)
 target_link_libraries(port-setup PRIVATE starlet::disc)
 ```
 
