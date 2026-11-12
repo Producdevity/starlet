@@ -1,0 +1,4 @@
+add_executable(starlet_gx_fifo_tests gx_fifo_tests.cpp)
+target_link_libraries(starlet_gx_fifo_tests PRIVATE starlet_gx_fifo)
+add_test(NAME starlet_gx_fifo COMMAND starlet_gx_fifo_tests)
+set_tests_properties(starlet_gx_fifo PROPERTIES TIMEOUT 30)
