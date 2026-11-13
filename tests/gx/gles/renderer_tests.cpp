@@ -78,7 +78,8 @@ void clip_disabled_draw_behind_eye() {
     uniforms.position[2]={0,.1f,1,-15};
     auto crossing=base;
     crossing.transform=std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,base.transform->state_revision});
-    rejects([&]{renderer.draw(crossing);},"a clip-disabled draw crossing the eye plane still rejects");
+    renderer.draw(crossing);
+    check(fake::draws==before+2 && !renderer.failed(),"a clip-disabled draw crossing the eye plane is submitted for GLES to clip");
 }
 void adjacent_draw_batches() {
     Fixture f;auto captured=f.capture();const auto first=packet(captured);

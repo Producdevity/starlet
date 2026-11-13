@@ -79,8 +79,8 @@ void clip_disabled_draws() {
     uniforms.position[0][3] = 0;
     uniforms.position[2][3] = 1280;
     outside.transform = std::make_shared<TransformSnapshot>(TransformSnapshot{draw.transform->pipeline,uniforms,draw.transform->state_revision});
-    check(!plan_gles_draw(outside) && !plan_gles_draw(outside,FramebufferFetch::none,false),
-          "clip-disabled near/far crossing still rejects");
+    {const auto a = plan_gles_draw(outside), b = plan_gles_draw(outside,FramebufferFetch::none,false);
+     check(a && b && a.pipeline.discarded && b.pipeline.discarded, "clip-disabled draws wholly beyond a depth plane are discarded");}
 }
 void offscreen_clip_disabled_draws() {
     Fixture f;
@@ -113,26 +113,34 @@ void offscreen_clip_disabled_draws() {
     }
     auto crossing = packet(f.capture());uniforms.position[2] = {0,0,1,0};
     crossing.transform = std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,crossing.transform->state_revision});
-    check(!plan_gles_draw(crossing), "triangles crossing W=0 cannot use divided-coordinate culling");
+    {const auto a = plan_gles_draw(crossing);
+     check(a && !a.pipeline.discarded, "triangles crossing W=0 are left to GLES clipping, not divided-coordinate culling");}
 }
-void clip_disabled_behind_eye() {
+void clip_disabled_depth() {
     Fixture f;
     auto base = packet(f.capture());
-    auto transform = base.transform->pipeline;
-    transform.clipping_disabled = true; transform.orthographic = false;
+    const auto with = [&](TransformPipeline transform, const TransformUniforms& uniforms) {
+        auto draw = base;
+        draw.transform = std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,base.transform->state_revision});
+        return draw;
+    };
+    auto ortho = base.transform->pipeline; ortho.clipping_disabled = true;
+    auto perspective = ortho; perspective.orthographic = false;
     auto uniforms = base.transform->uniforms;
-    uniforms.position[2][3] = 10;
-    auto behind = base;
-    behind.transform = std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,base.transform->state_revision});
-    const auto full = plan_gles_draw(behind), warm = plan_gles_draw(behind,FramebufferFetch::none,false);
-    check(full && warm && full.pipeline.discarded && warm.pipeline.discarded,
-          "clip-disabled draws with negative W at every vertex are discarded");
+    // Orthographic depth runs from -1 (near) to 0; view z = 0.01y - 0.5 + t across the quad.
+    uniforms.position[2] = {0,.01f,1,-3};
+    {const auto draw = with(ortho,uniforms); const auto a = plan_gles_draw(draw), b = plan_gles_draw(draw,FramebufferFetch::none,false);
+     check(a && b && a.pipeline.discarded && b.pipeline.discarded, "a clip-disabled draw wholly beyond the near plane is discarded");}
+    uniforms.position[2] = {0,.01f,1,-2};
+    {const auto draw = with(ortho,uniforms); const auto a = plan_gles_draw(draw), b = plan_gles_draw(draw,FramebufferFetch::none,false);
+     check(a && b && !a.pipeline.discarded && !b.pipeline.discarded, "a clip-disabled draw crossing the near plane is clipped, not rejected");}
+    uniforms = base.transform->uniforms; uniforms.position[2][3] = 10;
+    {const auto draw = with(perspective,uniforms); const auto a = plan_gles_draw(draw), b = plan_gles_draw(draw,FramebufferFetch::none,false);
+     check(a && b && a.pipeline.discarded && b.pipeline.discarded, "a clip-disabled draw wholly behind the eye is discarded");}
     // View z = 0.1y - 15.5 runs from -5.5 to 4.5 across the quad: W changes sign.
     uniforms.position[2] = {0,.1f,1,-15};
-    auto crossing = base;
-    crossing.transform = std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,base.transform->state_revision});
-    check(!plan_gles_draw(crossing) && !plan_gles_draw(crossing,FramebufferFetch::none,false),
-          "clip-disabled draws with W of both signs still reject");
+    {const auto draw = with(perspective,uniforms); const auto a = plan_gles_draw(draw);
+     check(a && !a.pipeline.discarded, "a clip-disabled draw crossing the eye plane is clipped, not rejected");}
 }
 void deferred_shader_source() {
     for (unsigned variant = 0; variant < 6; ++variant) {
@@ -564,7 +572,7 @@ int main(int argc, char** argv) {
         direct_parity_cases();
         fast_program_rebuilds();
         disabled_lookup_draws();
-        clipped_texture_projection(); clip_disabled_draws(); offscreen_clip_disabled_draws(); clip_disabled_behind_eye(); deferred_shader_source(); mipmap_lod_controls(); perspective_integration(); inactive_indirect_inputs(); indirect_lookup_and_offsets(); rgb8_full_replacement(); rgb8_alpha_update(); rgba6_fetch_boundary(); depth_shader_order(); routing_ownership_and_keys(); automatic_repeat_coordinates(); shared_maps_and_dead_inputs(); rejection_and_limits();
+        clipped_texture_projection(); clip_disabled_draws(); offscreen_clip_disabled_draws(); clip_disabled_depth(); deferred_shader_source(); mipmap_lod_controls(); perspective_integration(); inactive_indirect_inputs(); indirect_lookup_and_offsets(); rgb8_full_replacement(); rgb8_alpha_update(); rgba6_fetch_boundary(); depth_shader_order(); routing_ownership_and_keys(); automatic_repeat_coordinates(); shared_maps_and_dead_inputs(); rejection_and_limits();
         if (argc == 2) {
             Fixture f; const auto c = f.capture(); const auto p = plan_gles_draw(packet(c));
             std::ofstream(std::string(argv[1]) + ".vert") << pipeline(p).vertex;

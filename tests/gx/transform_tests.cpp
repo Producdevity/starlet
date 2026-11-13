@@ -537,15 +537,14 @@ void clip_disabled_domain() {
         output.gles_clip = {0,0,0,1}; output.gles_clip[axis] = sign;
         ok(validate_transform_clipping(pipeline,output));
         output.gles_clip[axis] = sign * 1.001f;
-        if (axis == 2)
-            require(!validate_transform_clipping(pipeline,output), "clip-disabled depth crossing remains unsupported");
-        else
-            ok(validate_transform_clipping(pipeline,output));
+        ok(validate_transform_clipping(pipeline,output));
     }
-    for (float w : {0.0f,-1.0f,std::numeric_limits<float>::infinity()}) {
+    for (float w : {0.0f,-1.0f}) {
         output.gles_clip = {0,0,0,w};
-        require(!validate_transform_clipping(pipeline,output), "clip-disabled invalid W rejected");
+        ok(validate_transform_clipping(pipeline,output));
     }
+    output.gles_clip = {0,0,0,std::numeric_limits<float>::infinity()};
+    require(!validate_transform_clipping(pipeline,output), "clip-disabled infinite W rejected");
     output.gles_clip = {std::numeric_limits<float>::quiet_NaN(),0,0,1};
     require(!validate_transform_clipping(pipeline,output), "clip-disabled nonfinite component rejected");
     pipeline.clipping_disabled = false;

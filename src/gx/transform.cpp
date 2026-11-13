@@ -553,13 +553,11 @@ TransformCapture capture_transform(const State& s, const VertexSnapshot& vertice
 TransformStatus validate_transform_clipping(const TransformPipeline& pipeline, const TransformOutput& output) {
     if (!pipeline.clipping_disabled) return {};
     const auto& c = output.gles_clip;
-    if (!std::isfinite(c[3]) || c[3] <= 0)
-        return fail(TransformError::unsupported_state, "clip-disabled vertex requires positive finite W");
-    for (unsigned i = 0; i < 3; ++i)
+    for (unsigned i = 0; i < 4; ++i)
         if (!std::isfinite(c[i]))
             return fail(TransformError::unsupported_state, "non-finite clip-disabled vertex");
-    if (std::abs(c[2]) > c[3])
-        return fail(TransformError::unsupported_state, "clip-disabled vertex crosses the GLES depth volume");
+    // Depth clips as with clipping enabled; only vertices inside the depth range reach the viewport.
+    if (!(c[3] > 0) || std::abs(c[2]) > c[3]) return {};
     for (unsigned i = 0; i < 2; ++i)
         if (!std::isfinite(c[i] / c[3]))
             return fail(TransformError::unsupported_state, "clip-disabled viewport projection overflows");

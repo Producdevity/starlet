@@ -41,26 +41,29 @@ bool outside_viewport(const DrawPacket& packet) {
     return true;
 }
 
-// GLES clips away a triangle whose W is negative at every vertex; a clip-disabled draw
-// lying wholly behind the eye therefore rasterizes nothing.
-bool behind_eye(const DrawPacket& packet, const TransformEvaluator& evaluator) {
+// Clip-disabled draws still clip depth, as GLES does for every draw: a draw whose vertices all
+// lie behind the eye, or all beyond the same depth plane, writes nothing.
+bool beyond_depth(const DrawPacket& packet, const TransformEvaluator& evaluator) {
     if (!packet.transform->pipeline.clipping_disabled) return false;
-    float first_w = 0;
-    bool any = false;
+    bool any = false, behind = true, near = true, far = true, clipped = false;
+    TransformOutput first{};
     for (const auto& v : packet.vertices->vertices()) {
         if (v.disabled) continue;
         const auto value = evaluator.evaluate(v);
         if (!value) return false;
-        const auto w = value.output.gles_clip[3];
-        if (!(w <= 0)) return false;
-        if (!any) first_w = w;
+        const auto& c = value.output.gles_clip;
+        const bool before = !(c[2] >= -c[3]), after = !(c[2] <= c[3]);
+        behind = behind && c[3] <= 0; near = near && before; far = far && after;
+        if ((before || after) && !clipped) { clipped = true; first = value.output; }
         any = true;
     }
-    if (!any) return false;
-    static std::atomic<bool> reported{false};
-    if (!reported.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr, "starlet: gx: dropped a clip-disabled draw behind the eye (view z=%g, w=%g)\n", -first_w, first_w);
-    return true;
+    if (clipped) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "starlet: gx: depth-clipped a clip-disabled draw (view z=%g, w=%g)\n",
+                         first.eye_position[2], first.gles_clip[3]);
+    }
+    return any && (behind || near || far);
 }
 
 struct ProjectionVertex {
@@ -327,6 +330,10 @@ GlesDrawResult plan_gles_draw(const DrawPacket& packet, FramebufferFetch fetch, 
     bool projection_proven = true;
     const TransformEvaluator evaluator(*packet.transform, TransformArithmetic::float32_candidate_v1);
     if (!evaluator.status()) return reject(evaluator.status().message);
+    if (beyond_depth(packet, evaluator)) {
+        p.discarded = true;
+        return {{}, std::move(p)};
+    }
     for (const auto& v : packet.vertices->vertices()) {
         if (v.disabled) continue;
         const auto evaluated = evaluator.evaluate(v);
@@ -334,7 +341,7 @@ GlesDrawResult plan_gles_draw(const DrawPacket& packet, FramebufferFetch fetch, 
         const auto clipping = validate_transform_clipping(packet.transform->pipeline, evaluated.output);
         if (!clipping) {
             // The raster plan already restricts the scissor to the viewport.
-            if (outside_viewport(packet) || behind_eye(packet, evaluator)) {
+            if (outside_viewport(packet)) {
                 p.discarded = true;
                 return {{}, std::move(p)};
             }
