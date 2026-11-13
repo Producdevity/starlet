@@ -23,6 +23,7 @@ typedef struct StarletGxStateCache {
     uint32_t words[264], generations[264], last_tev[8], generation;
     uint32_t xf_words[88], xf_generations[88];
     uint32_t cp_layout[10], cp_known, cp_words[256], cp_generations[256];
+    uint32_t matrix_words[1536], matrix_generations[1536];
     int full_mask;
 } StarletGxStateCache;
 extern StarletGxStateCache starlet_gx_state_cache;
@@ -34,6 +35,7 @@ static inline void starlet_gx_state_forget(StarletGxStateCache* cache)
         memset(cache->generations, 0, sizeof cache->generations);
         memset(cache->xf_generations, 0, sizeof cache->xf_generations);
         memset(cache->cp_generations, 0, sizeof cache->cp_generations);
+        memset(cache->matrix_generations, 0, sizeof cache->matrix_generations);
         cache->generation = 1;
     }
     cache->full_mask = 0;
@@ -110,6 +112,27 @@ static inline int starlet_gx_cp_keep(StarletGxStateCache* cache, unsigned opcode
     cache->cp_generations[address] = cache->generation;
     starlet_gx_cp_note(cache, opcode, address, word, 0);
     return 1;
+}
+
+static inline int starlet_gx_matrix_keep(StarletGxStateCache* cache, unsigned address, const void* data,
+                                         unsigned rows, unsigned columns, unsigned stride, int recording)
+{
+    const uint8_t* bytes = (const uint8_t*)data;
+    unsigned row, column, count;
+    int changed = 0;
+    if (recording || !rows || rows > 16 || !columns || columns > 16 || rows > 16 / columns || stride < columns) return 1;
+    count = rows * columns;
+    if (address >= 1536 || count > 1536 - address) return 1;
+    if (!cache->generation) starlet_gx_state_forget(cache);
+    for (row = 0; row < rows; ++row) for (column = 0; column < columns; ++column) {
+        uint32_t word;
+        const unsigned slot = address + row * columns + column;
+        memcpy(&word, bytes + (row * stride + column) * 4, 4);
+        changed |= cache->matrix_generations[slot] != cache->generation || cache->matrix_words[slot] != word;
+        cache->matrix_words[slot] = word;
+        cache->matrix_generations[slot] = cache->generation;
+    }
+    return changed;
 }
 
 /* Index-only geometry lists leave BP and cached texgen registers unchanged. */

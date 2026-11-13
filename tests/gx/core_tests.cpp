@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <new>
@@ -733,6 +734,20 @@ void sdk_state_write_cache() {
     }
     require(starlet_gx_cp_keep(&cache, 8, 0x30, 0, 0) && starlet_gx_cp_keep(&cache, 8, 0x30, 0, 0),
             "matrix index CP writes always restore vertex latches");
+    std::uint32_t matrix[12] = {1,2,3,4,5,6,7,8,9,10,11,12};
+    require(starlet_gx_matrix_keep(&cache, 0, matrix, 3, 4, 4, 0), "first position matrix emits");
+    require(!starlet_gx_matrix_keep(&cache, 0, matrix, 3, 4, 4, 0), "equal position matrix is suppressed");
+    require(!starlet_gx_matrix_keep(&cache, 4, matrix + 4, 2, 4, 4, 0), "overlapping equal matrix rows reuse shadow");
+    require(starlet_gx_matrix_keep(&cache, 0x400, matrix, 3, 3, 4, 0), "normal matrix packs three columns per row");
+    matrix[3] ^= 1;
+    require(!starlet_gx_matrix_keep(&cache, 0x400, matrix, 3, 3, 4, 0), "normal shadow ignores the translation column");
+    matrix[0] ^= 1;
+    require(starlet_gx_matrix_keep(&cache, 0x400, matrix, 3, 3, 4, 1), "matrix recording emits without learning");
+    matrix[0] ^= 1;
+    require(!starlet_gx_matrix_keep(&cache, 0x400, matrix, 3, 3, 4, 0), "recording preserves the live matrix shadow");
+    require(starlet_gx_matrix_keep(&cache, 1535, matrix, 3, 4, 4, 0), "out-of-range matrices stay for decoder validation");
+    starlet_gx_state_forget(&cache);
+    require(starlet_gx_matrix_keep(&cache, 0x400, matrix, 3, 3, 4, 0), "indexed loads and FIFO changes forget matrices");
     starlet_gx_state_forget(&cache);
     Memory a_memory, b_memory; Sink a_sink, b_sink;
     Decoder a(a_memory, a_sink), b(b_memory, b_sink);
@@ -765,6 +780,28 @@ void sdk_state_write_cache() {
     require(write(0x41000008), "an unknown list's final mask cannot consume a suppressed write");
     require(write(0x41000008), "the unknown masked result is learned only after a full write");
     require(!write(0x41000008), "full-state suppression resumes after mask consumption");
+    StarletGxStateCache matrices{};
+    std::uint32_t random = 0x12345678;
+    for (unsigned iteration = 0; iteration < 1000; ++iteration) {
+        auto next = [&] { random = random * 1664525u + 1013904223u; return random; };
+        const auto address = next() % 1500;
+        const unsigned rows = 2 + (next() & 1), columns = 3 + (next() & 1), stride = columns + (next() & 1);
+        std::array<std::uint32_t, 16> values;
+        for (auto& value : values) value = next();
+        for (unsigned repeat = 0; repeat < 2; ++repeat) {
+            std::vector<std::uint8_t> command{0x10};
+            const auto put = [&](std::uint32_t word) { for (int shift = 24; shift >= 0; shift -= 8) command.push_back(word >> shift); };
+            put(((rows * columns - 1) << 16) | address);
+            for (unsigned row = 0; row < rows; ++row) for (unsigned column = 0; column < columns; ++column)
+                put(values[row * stride + column]);
+            ok(a.feed({command.data(), command.size()}));
+            const bool keep = starlet_gx_matrix_keep(&matrices, address, values.data(), rows, columns, stride, 0);
+            if (keep) ok(b.feed({command.data(), command.size()}));
+            require(!std::memcmp(a.state().xf_data(), b.state().xf_data(), 1536 * 4), "random overlapping matrix suppression preserves all XF memory words");
+            require(keep == (repeat == 0), "an equal multirow matrix is suppressed");
+        }
+        if ((iteration & 31) == 0) starlet_gx_state_forget(&matrices);
+    }
     const auto generation = cache.generation;
     require(starlet_gx_bp_keep(&cache, 0x41000017, 1), "recorded display lists retain explicit state writes");
     require(cache.generation == generation && !write(0x41000008), "recording does not modify the executed-state shadow");
