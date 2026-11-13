@@ -162,11 +162,13 @@ computes exactly what its own draw would. Programs with emboss texgens, per-vert
 matrices and clustered geometry draw separately. A scene of repeated models (a title made of
 hundreds of flowers) then costs one driver draw per run of identical shapes.
 
-Games often write BP registers again with unchanged values between draws (a material
-loaded per model). A draw whose BP values equal those of the last state plan keeps that
-plan and the textures it resolved, without planning or texture lookups; CI textures also
-need their palette generation unchanged, since a TLUT load changes the palette without
-changing a register. Such draws then also qualify for instancing.
+State plans retain one immutable state index per segment, including returns to an
+interleaved state; a cache hit with equal regular TEV values needs no new state copy.
+Batched regular TEV values travel per vertex. Independent bounded raster and texture
+planning caches compare all consumed input words, so changing an alpha reference or
+texture binding does not replan unrelated raster state. Program eviction invalidates
+all three caches. CI texture resolutions still check palette generations.
+Such draws also qualify for instancing.
 `GlesDirectLimits::geometry_min_vertices` (default 8) sets the smallest indexed draw kept
 as resident geometry; smaller ones stream and are never instanced.
 

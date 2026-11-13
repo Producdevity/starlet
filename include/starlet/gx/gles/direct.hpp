@@ -101,6 +101,7 @@ struct GlesDirectStats {
     std::size_t geometry_bytes = 0, geometries = 0;
     std::uint64_t program_misses = 0, state_plans = 0, batched_draws = 0, culled_draws = 0, culled_clusters = 0;
     std::uint64_t state_hits = 0, state_misses = 0, program_hits = 0;
+    std::uint64_t state_reuses = 0, raster_plan_hits = 0, texture_plan_hits = 0;
     // GXMatrices blocks recorded; GXTransform and GXPost blocks recorded; bytes of uniform
     // buffer data handed to the GL thread.
     std::uint64_t uniform_blocks = 0, shared_blocks = 0, uniform_bytes = 0;

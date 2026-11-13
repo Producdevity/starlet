@@ -286,8 +286,8 @@ DirectProgramResult plan_direct_program(const State& state, const VertexLayout& 
     return {{}, std::move(p)};
 }
 
-DrawStatus plan_direct_state(const State& state, const DirectProgram& program, TextureCmprModel cmpr, DirectDrawState& out,
-                             GuardBand guard_band, FractionalViewport fractional) {
+DrawStatus plan_direct_raster(const State& state, const DirectProgram& program, DirectRasterState& out,
+                              GuardBand guard_band, FractionalViewport fractional) {
     const auto raster = capture_raster(state);
     if (!raster) return reject(DrawError::raster, raster.status.message);
     const auto plan = program.fast ? plan_gles_raster_fast(*raster.snapshot, guard_band, fractional)
@@ -299,7 +299,6 @@ DrawStatus plan_direct_state(const State& state, const DirectProgram& program, T
     const auto& fog = out.raster.fog;
     if (program.fast && (fog.type | fog.orthographic << 3 | fog.range << 4) != program.fog)
         return reject(DrawError::unsupported_state, "fog differs from program");
-    out.tev = capture_tev_uniforms(state);
     if (program.fast) {
         out.pixel_controls = {};
         out.alpha_write = out.raster.alpha_write;
@@ -315,6 +314,17 @@ DrawStatus plan_direct_state(const State& state, const DirectProgram& program, T
         out.pixel_controls = {};
         out.alpha_write = false;
     }
+    return {};
+}
+
+DrawStatus plan_direct_textures(const State& state, const DirectProgram& program, TextureCmprModel cmpr, DirectTextureState& out) {
+    const auto coordinate_scale = [&](unsigned i) {
+        RasterScale scale;
+        scale.words = {{state.bp(0x30 + i * 2), state.bp(0x31 + i * 2)}};
+        scale.s = (scale.words[0] & 0xffff) + 1;
+        scale.t = (scale.words[1] & 0xffff) + 1;
+        return scale;
+    };
     for (unsigned map = 0; map < 8; ++map) if (program.maps & (1u << map)) {
         auto& d = out.textures[map];
         const auto described = describe_texture(state, static_cast<std::uint8_t>(map), cmpr, {}, d);
@@ -327,7 +337,7 @@ DrawStatus plan_direct_state(const State& state, const DirectProgram& program, T
                                  sampler.max_lod_sixteenths / 16.0f, sampler.edge_lod ? 1.0f : 0.0f}};
     }
     auto check_scale = [&](unsigned map, unsigned coordinate) -> const char* {
-        const auto& scale = raster.snapshot->coordinates[coordinate];
+        const auto scale = coordinate_scale(coordinate);
         const auto& d = out.textures[map];
         if ((scale.words[0] | scale.words[1]) & 0x20000) return "GX cylindrical coordinate wrapping is not implemented";
         const auto automatic_repeat = [](std::uint32_t word, TextureWrap wrap, unsigned s, unsigned size) {
@@ -344,7 +354,7 @@ DrawStatus plan_direct_state(const State& state, const DirectProgram& program, T
         if (!tev_stage_samples(program.tev, i)) continue;
         if (const auto error = check_scale(stage.texture_map, stage.texture_coord)) return reject(DrawError::unsupported_state, error);
         const auto& d = out.textures[stage.texture_map];
-        const auto& scale = raster.snapshot->coordinates[stage.texture_coord];
+        const auto scale = coordinate_scale(stage.texture_coord);
         // Texture coordinates scale against the size the image register holds; a host extent
         // keeps them normalized to its whole texture.
         const auto image = d.bp_words[2];
@@ -358,12 +368,20 @@ DrawStatus plan_direct_state(const State& state, const DirectProgram& program, T
         for (unsigned i = 0; i < 4; ++i) if (program.indirect.lookup_mask & (1u << i)) {
             const auto& lookup = program.indirect.lookups[i];
             if (const auto error = check_scale(lookup.map, lookup.coordinate)) return reject(DrawError::unsupported_state, error);
-            const auto& scale = raster.snapshot->coordinates[lookup.coordinate];
+            const auto scale = coordinate_scale(lookup.coordinate);
             const auto& d = out.textures[lookup.map];
             out.indirect_scale[i] = {{float(scale.s) * 128, float(scale.t) * 128, 1.0f / (128 * d.width), 1.0f / (128 * d.height)}};
         }
     }
     return {};
+}
+
+DrawStatus plan_direct_state(const State& state, const DirectProgram& program, TextureCmprModel cmpr, DirectDrawState& out,
+                             GuardBand guard_band, FractionalViewport fractional) {
+    const auto raster = plan_direct_raster(state, program, out, guard_band, fractional);
+    if (!raster) return raster;
+    out.tev = capture_tev_uniforms(state);
+    return plan_direct_textures(state, program, cmpr, out);
 }
 
 bool batched_zero_alpha_exact(const DirectProgram& program, const DirectDrawState& s) {

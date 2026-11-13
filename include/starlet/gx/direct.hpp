@@ -79,18 +79,25 @@ DirectProgramResult plan_direct_program(const State&, const VertexLayout&, Frame
                                         bool batched = false, std::uint8_t latched_normal = 0, bool instanced = false,
                                         std::uint32_t batched_options = 0);
 
-struct DirectDrawState {
+struct DirectRasterState {
     GlesRasterPlan raster;
-    TevUniforms tev;
+    std::array<std::uint32_t, 4> pixel_controls{};
+    bool alpha_write = false;
+    std::array<float, 3> constant_alpha{};
+};
+struct DirectTextureState {
     std::array<std::array<float, 2>, 16> coordinate_scale{}, image_size{};
     std::array<std::array<float, 4>, 4> indirect_scale{};
     std::array<std::array<float, 4>, 8> sampler_lod{};
     std::array<std::array<std::int32_t, 4>, 6> indirect_rows{};
-    std::array<std::uint32_t, 4> pixel_controls{};
     std::array<TextureDescriptor, 8> textures{}; // Valid for program.maps.
-    bool alpha_write = false;
-    std::array<float, 3> constant_alpha{}; // Fast programs with constant_alpha: uGxConstantAlpha.
 };
+struct DirectDrawState : DirectRasterState, DirectTextureState {
+    TevUniforms tev;
+};
+DrawStatus plan_direct_raster(const State&, const DirectProgram&, DirectRasterState&,
+                              GuardBand = GuardBand::reject, FractionalViewport = FractionalViewport::reject);
+DrawStatus plan_direct_textures(const State&, const DirectProgram&, TextureCmprModel, DirectTextureState&);
 DrawStatus plan_direct_state(const State&, const DirectProgram&, TextureCmprModel, DirectDrawState&,
                              GuardBand = GuardBand::reject, FractionalViewport = FractionalViewport::reject);
 // Whether a fast program's alpha test can keep failing fragments with alpha 0 instead of

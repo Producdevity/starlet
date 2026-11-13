@@ -1084,6 +1084,36 @@ void direct_state_plan_cache() {
     renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
     check(renderer.stats().direct.state_misses == stats.state_misses + 1, "viewport change cannot reuse a cached raster plan");
 }
+void direct_group_results() {
+    GlesRenderer renderer; Fixture f; const auto draw = f.command();
+    renderer.draw_direct(f.decoder.state(), draw, f.memory);
+    renderer.draw_direct(f.decoder.state(), draw, f.memory);
+    auto before = renderer.stats().direct;
+    check(before.state_plans == 1 && before.state_reuses == 1, "equal draws retain one immutable segment state");
+    f.bp(0xf3, 0x3f0011);
+    renderer.draw_direct(f.decoder.state(), draw, f.memory);
+    auto after = renderer.stats().direct;
+    check(after.raster_plan_hits == before.raster_plan_hits + 1 &&
+          after.texture_plan_hits == before.texture_plan_hits + 1,
+          "alpha-reference changes reuse independent raster and texture results");
+    const auto image = f.decoder.state().bp(0x88);
+    f.bp(0x88, image ^ 1);
+    renderer.draw_direct(f.decoder.state(), draw, f.memory);
+    before = renderer.stats().direct;
+    check(before.raster_plan_hits == after.raster_plan_hits + 1 && before.texture_plan_hits == after.texture_plan_hits,
+          "texture changes preserve raster results but rebuild texture descriptors");
+    f.bp(0x88, image);
+    renderer.draw_direct(f.decoder.state(), draw, f.memory);
+    after = renderer.stats().direct;
+    check(after.state_plans == before.state_plans && after.state_reuses == before.state_reuses + 1,
+          "returning to a state reuses its retained segment index without another copy");
+    f.f(0x101c, 8388608);
+    renderer.draw_direct(f.decoder.state(), draw, f.memory);
+    before = renderer.stats().direct;
+    check(before.texture_plan_hits == after.texture_plan_hits + 1 && before.raster_plan_hits == after.raster_plan_hits,
+          "viewport changes preserve texture results and rebuild raster state");
+    renderer.wait_until_idle();
+}
 void direct_batched_normals() {
     std::vector<std::uint8_t> plain;
     {
@@ -2043,6 +2073,7 @@ int main() {
         direct_uniform_blocks();
         direct_uniform_deltas();
         direct_state_plan_cache();
+        direct_group_results();
         direct_full_matrix_block();
         direct_batched_zero_alpha();
         direct_batched_vertex_fog();

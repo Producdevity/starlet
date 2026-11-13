@@ -448,32 +448,100 @@ struct GlesDirect::Impl {
     std::vector<Record> records;
     std::vector<DirectDrawState> states;
     std::vector<Run> runs;
-    struct StatePlan {
+    template<class Result, std::size_t N> struct GroupPlan {
         const Program* program = nullptr;
         std::uint64_t hash = 0;
         TextureCmprModel cmpr{};
+        std::array<std::uint32_t, N> words{};
+        Result result;
+    };
+    std::array<GroupPlan<DirectRasterState, 32>, 256> raster_plans;
+    std::array<GroupPlan<DirectTextureState, 128>, 1024> texture_plans;
+    template<class Result, std::size_t N, std::size_t Entries, class Build>
+    DrawStatus group_plan(std::array<GroupPlan<Result, N>, Entries>& cache, const Program& program,
+                          TextureCmprModel cmpr, const std::array<std::uint32_t, N>& words, Result& out, Build build,
+                          std::uint64_t& hits) {
+        std::uint64_t hash = reinterpret_cast<std::uintptr_t>(&program) >> 4;
+        for (auto word : words) hash = (hash ^ word) * 0x100000001b3ull;
+        auto& entry = cache[hash % cache.size()];
+        if (entry.program == &program && entry.hash == hash && entry.cmpr == cmpr && entry.words == words) {
+            out = entry.result;
+            ++hits;
+            return {};
+        }
+        const auto status = build(out);
+        if (status) {
+            entry.program = &program; entry.hash = hash; entry.cmpr = cmpr;
+            entry.words = words; entry.result = out;
+        }
+        return status;
+    }
+    DrawStatus grouped_state(const State& state, const Program& program, TextureCmprModel cmpr, DirectDrawState& out) {
+        std::array<std::uint32_t, 32> raster{};
+        unsigned n = 0;
+        for (unsigned i = 0; i < 6; ++i) raster[n++] = state.xf(0x101a + i);
+        for (auto address : {0, 0x20, 0x21, 0x22, 0x40, 0x41, 0x42, 0x43, 0x44, 0x59, 0x68})
+            raster[n++] = state.bp(address);
+        for (unsigned i = 0xe8; i <= 0xf2; ++i) raster[n++] = state.bp(i);
+        raster[n++] = state.bp(0xf4); raster[n++] = state.bp(0xf5); raster[n++] = state.efb().height;
+        auto status = group_plan(raster_plans, program, cmpr, raster, static_cast<DirectRasterState&>(out),
+            [&](auto& result) { return plan_direct_raster(state, *program.plan, result, limits.guard_band, limits.fractional_viewport); },
+            stats.raster_plan_hits);
+        if (!status) return status;
+        std::array<std::uint32_t, 128> textures{};
+        n = 0;
+        textures[n++] = state.bp(0);
+        for (unsigned i = 6; i < 0x20; ++i) textures[n++] = state.bp(i);
+        for (unsigned i = 0x25; i < 0x40; ++i) textures[n++] = state.bp(i);
+        for (unsigned i = 0x80; i < 0xc0; ++i) textures[n++] = state.bp(i);
+        for (unsigned i = 0; i < 8; ++i) {
+            const auto extent = state.texture_extent(i);
+            textures[n++] = extent.width | (std::uint32_t{extent.height} << 16);
+        }
+        out.tev = capture_tev_uniforms(state);
+        return group_plan(texture_plans, program, cmpr, textures, static_cast<DirectTextureState&>(out),
+            [&](auto& result) { return plan_direct_textures(state, *program.plan, cmpr, result); }, stats.texture_plan_hits);
+    }
+    struct StatePlan {
+        const Program* program = nullptr;
+        std::uint64_t hash = 0, segment = 0;
+        TextureCmprModel cmpr{};
         State::DrawRegisters registers;
         DirectDrawState state;
+        std::uint32_t index = 0;
+        bool expanded = false;
     };
     std::array<StatePlan, 2048> state_plans;
-    DrawStatus plan_state(const State& state, const Program& program, TextureCmprModel cmpr, DirectDrawState& out) {
+    DrawStatus plan_state(const State& state, const Program& program, TextureCmprModel cmpr, std::uint32_t& index,
+                          bool expanded = false) {
         const auto& registers = state.draw_registers();
         const auto hash = registers.hash(true);
         auto& cached = state_plans[(hash ^ (reinterpret_cast<std::uintptr_t>(&program) >> 4)) % state_plans.size()];
         if (cached.program == &program && cached.hash == hash && cached.cmpr == cmpr &&
             registers.matches(cached.registers, true)) {
-            out = cached.state;
-            if (!program.plan->batched) out.tev = capture_tev_uniforms(state);
             ++stats.state_hits;
-            return {};
-        }
-        ++stats.state_misses;
-        const auto status = plan_direct_state(state, *program.plan, cmpr, out, limits.guard_band, limits.fractional_viewport);
-        if (status) {
+            if (cached.segment == segment && cached.expanded == expanded &&
+                (program.plan->batched || !std::memcmp(registers.words.data() + 270, cached.registers.words.data() + 270, 32))) {
+                index = cached.index;
+                ++stats.state_reuses;
+                return {};
+            }
+            if (!program.plan->batched) cached.state.tev = capture_tev_uniforms(state);
+        } else {
+            ++stats.state_misses;
+            cached.program = nullptr;
+            cached.state = {};
+            const auto status = grouped_state(state, program, cmpr, cached.state);
+            if (!status) return status;
             cached.program = &program; cached.hash = hash; cached.cmpr = cmpr;
-            cached.registers = registers; cached.state = out;
         }
-        return status;
+        cached.registers = registers;
+        index = static_cast<std::uint32_t>(states.size());
+        states.push_back(cached.state);
+        ++stats.state_plans;
+        if (expanded) states.back().raster.cull = 0;
+        cached.segment = segment; cached.index = index; cached.expanded = expanded;
+        return {};
     }
     std::uint64_t segment = 1, frame = 1, sequence = 0;
     // Keyed by the BP revision that ignores TEV colour writes, which most draws make, and
@@ -508,61 +576,15 @@ struct GlesDirect::Impl {
         if (bytes && !state.palette_generation(d.palette_offset, bytes, generation)) return ~std::uint64_t{0};
         return generation;
     }
-    // BP values at the last state plan. Games rewrite unchanged registers between draws:
-    // equal values keep the plan and the textures it resolved (CI palettes are checked
-    // by generation, since a TLUT load changes them without changing a register).
-    std::array<std::uint32_t, 256> planned_bp{};
-    // BP 0xe0-0xe7 keep only the last colour or konst write; both register sets are kept here.
-    std::array<std::uint32_t, 16> planned_tev{};
-    bool same_bp_values(const State& state) const {
-        // Usually equal: no early exit, so the comparison vectorizes.
-        std::uint32_t differ = 0;
-        for (unsigned a = 0; a < 256; ++a) differ |= state.bp(static_cast<std::uint8_t>(a)) ^ planned_bp[a];
-        for (unsigned i = 0; i < 16; ++i) differ |= state.tev_register(i >= 8, static_cast<std::uint8_t>(i & 7)) ^ planned_tev[i];
-        return !differ;
-    }
     bool same_palettes(const State& state, const Program& p) const {
         const auto& planned = states[last_state.index];
         for (unsigned map = 0; map < 8; ++map) if (p.plan->maps & (1u << map))
             if (palette_generation(state, planned.textures[map]) != last_textures.palettes[map]) return false;
         return true;
     }
-    // Batched draws share state, textures and uniform block while only TEV color
-    // registers, material colours and their own position matrix change between them.
-    struct { bool valid = false; std::uint64_t bp = 0, xf = 0, segment = 0, frame = 0; const Program* program = nullptr;
+    struct { bool valid = false; std::uint64_t segment = 0, frame = 0; const Program* program = nullptr;
              std::uint32_t state = 0; std::array<GLuint, 8> textures{}, samplers{}; bool expanded = false;
              std::uint32_t options = 0; } batch;
-    // What the batch's state plan read: BP values with the konst bank in place of E0-E7 (the
-    // colour bank travels per vertex), texture extents, the XF viewport and CI palettes.
-    struct {
-        std::array<std::uint32_t, 256> bp{};
-        std::array<std::uint32_t, 8> konst{};
-        std::array<std::uint32_t, 6> viewport{};
-        std::array<TextureExtent, 8> extents{};
-        std::array<std::uint64_t, 8> palettes{};
-    } batch_inputs;
-    void record_batch_inputs(const State& state, const Program& p, const DirectDrawState& planned) {
-        for (unsigned a = 0; a < 256; ++a) batch_inputs.bp[a] = state.bp(static_cast<std::uint8_t>(a));
-        for (unsigned i = 0; i < 8; ++i) {
-            batch_inputs.konst[i] = state.tev_register(true, static_cast<std::uint8_t>(i));
-            batch_inputs.extents[i] = state.texture_extent(static_cast<std::uint8_t>(i));
-            batch_inputs.palettes[i] = p.plan->maps & (1u << i) ? palette_generation(state, planned.textures[i]) : 0;
-        }
-        for (unsigned i = 0; i < 6; ++i) batch_inputs.viewport[i] = state.xf(static_cast<std::uint16_t>(0x101a + i));
-    }
-    bool same_batch_inputs(const State& state, const Program& p) const {
-        std::uint32_t differ = 0;
-        for (unsigned a = 0; a < 0xe0; ++a) differ |= state.bp(static_cast<std::uint8_t>(a)) ^ batch_inputs.bp[a];
-        for (unsigned a = 0xe8; a < 256; ++a) differ |= state.bp(static_cast<std::uint8_t>(a)) ^ batch_inputs.bp[a];
-        for (unsigned i = 0; i < 8; ++i) differ |= state.tev_register(true, static_cast<std::uint8_t>(i)) ^ batch_inputs.konst[i];
-        for (unsigned i = 0; i < 6; ++i) differ |= state.xf(static_cast<std::uint16_t>(0x101a + i)) ^ batch_inputs.viewport[i];
-        if (differ) return false;
-        for (unsigned i = 0; i < 8; ++i) if (!(state.texture_extent(static_cast<std::uint8_t>(i)) == batch_inputs.extents[i])) return false;
-        const auto& planned = states[batch.state];
-        for (unsigned map = 0; map < 8; ++map) if (p.plan->maps & (1u << map))
-            if (palette_generation(state, planned.textures[map]) != batch_inputs.palettes[map]) return false;
-        return true;
-    }
     std::uint32_t append_block(const void* data, std::size_t bytes, std::size_t declared) {
         const auto offset = (uniforms.size() + uniform_alignment - 1) / uniform_alignment * uniform_alignment;
         uniforms.resize(offset + bytes);
@@ -930,10 +952,6 @@ struct GlesDirect::Impl {
         append_instance_rows(draw_rows.data(), normal);
         ++last.instances;
         ++stats.draws; ++stats.instanced_draws;
-        if (last_state.index != last.state && last_state.index + 1 == states.size()) {
-            states.pop_back();
-            last_state.index = last.state;
-        }
         return true;
     }
     // Registers a program for words; it is linked on the GL thread before its first draw.
@@ -1055,6 +1073,8 @@ struct GlesDirect::Impl {
             }
             if (batch.program == oldest->get()) batch.valid = false;
             for (auto& cached : state_plans) if (cached.program == oldest->get()) cached.program = nullptr;
+            for (auto& cached : raster_plans) if (cached.program == oldest->get()) cached.program = nullptr;
+            for (auto& cached : texture_plans) if (cached.program == oldest->get()) cached.program = nullptr;
             forget_program(oldest->get());
             // Queued segments may still draw with it; the GL thread deletes it after them.
             std::shared_ptr<Program> retired(oldest->release());
@@ -2064,33 +2084,22 @@ struct GlesDirect::Impl {
         Program* p = batched_program(base, state, draw);
         if (!p) return false;
         const auto setup = expanded ? line_point_setup(state, *p->plan, draw.primitive) : LinePointSetup{};
-        const bool same_batch = batch.valid && batch.program == p && batch.segment == segment && batch.frame == frame &&
-                                batch.expanded == expanded && !limits.verify_textures;
-        if (same_batch && (batch.bp != state.bp_state_revision() || batch.xf != state.xf_register_revision()) &&
-            same_batch_inputs(state, *p)) {
-            batch.bp = state.bp_state_revision(); batch.xf = state.xf_register_revision();
+        std::uint32_t planned_index;
+        const auto status = plan_state(state, *p, cmpr, planned_index, expanded);
+        if (!status) {
+            if (status.error == DrawError::guard_band && misses_scissor(state, draw, memory)) { ++stats.culled_draws; return true; }
+            throw std::runtime_error(status.message);
         }
-        if (!(same_batch && batch.bp == state.bp_state_revision() && batch.xf == state.xf_register_revision())) {
-            states.emplace_back();
-            const auto status = plan_state(state, *p, cmpr, states.back());
-            if (!status) {
-                states.pop_back();
-                if (status.error == DrawError::guard_band && misses_scissor(state, draw, memory)) { ++stats.culled_draws; return true; }
-                throw std::runtime_error(status.message);
-            }
-            // Culling applies to triangles only; the quads drawn for lines and points keep every face.
-            if (expanded) states.back().raster.cull = 0;
-            ++stats.state_plans;
+        if (!(batch.valid && batch.program == p && batch.segment == segment && batch.frame == frame &&
+              batch.state == planned_index && batch.expanded == expanded && !limits.verify_textures)) {
             std::array<GLuint, 8> names{}, samplers_used{};
-            const auto& planned = states.back();
+            const auto& planned = states[planned_index];
             for (unsigned map = 0; map < 8; ++map) if (p->plan->maps & (1u << map)) {
                 names[map] = texture(state, map, planned.textures[map], memory, cmpr);
                 samplers_used[map] = sampler(planned.textures[map].sampler);
             }
-            batch = {true, state.bp_state_revision(), state.xf_register_revision(), segment, frame, p,
-                     static_cast<std::uint32_t>(states.size() - 1), names, samplers_used, expanded,
+            batch = {true, segment, frame, p, planned_index, names, samplers_used, expanded,
                      batched_zero_alpha_exact(*p->plan, planned) ? batched_zero_alpha : 0u};
-            record_batch_inputs(state, *p, planned);
         }
         // Batched programs read no position or normal matrix, and only the material lanes of
         // channels with a register material: blocks that differ elsewhere are shared.
@@ -2226,26 +2235,13 @@ struct GlesDirect::Impl {
             if (cached) source_hit();
             if (cached && cached->boxed && outside_clip(state, state.matrix_index(0), cached->box)) { ++stats.culled_draws; warm(p); return; }
         }
-        if (last_state.valid && last_state.bp != state.bp_revision() && last_state.xf == state.xf_register_revision() &&
-            last_state.program == &p && last_state.segment == segment && !limits.verify_textures && same_bp_values(state)) {
-            if (last_textures.valid && last_textures.bp == last_state.bp && last_textures.program == &p && same_palettes(state, p))
-                last_textures.bp = state.bp_revision();
-            last_state.bp = state.bp_revision();
+        std::uint32_t planned_index;
+        const auto status = plan_state(state, p, cmpr, planned_index);
+        if (!status) {
+            if (status.error == DrawError::guard_band && misses_scissor(state, draw, memory)) { ++stats.culled_draws; return; }
+            throw std::runtime_error(status.message);
         }
-        if (!(last_state.valid && last_state.bp == state.bp_revision() && last_state.xf == state.xf_register_revision() &&
-              last_state.program == &p && last_state.segment == segment)) {
-            states.emplace_back();
-            const auto status = plan_state(state, p, cmpr, states.back());
-            if (!status) {
-                states.pop_back();
-                if (status.error == DrawError::guard_band && misses_scissor(state, draw, memory)) { ++stats.culled_draws; return; }
-                throw std::runtime_error(status.message);
-            }
-            last_state = {true, state.bp_revision(), state.xf_register_revision(), segment, &p, static_cast<std::uint32_t>(states.size() - 1)};
-            for (unsigned a = 0; a < 256; ++a) planned_bp[a] = state.bp(static_cast<std::uint8_t>(a));
-            for (unsigned i = 0; i < 16; ++i) planned_tev[i] = state.tev_register(i >= 8, static_cast<std::uint8_t>(i & 7));
-            ++stats.state_plans;
-        }
+        last_state = {true, state.bp_revision(), state.xf_register_revision(), segment, &p, planned_index};
         if (p.plan->transform.latched_normal) resolve_latch();
         const std::uint64_t latch_used = p.plan->transform.latched_normal ? latch_revision + 1 : 0;
         const bool full = format.matrices;
