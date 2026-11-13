@@ -55,6 +55,12 @@ public:
     virtual bool peek_color_snapshot(int, int, int, std::uint32_t&) const { return false; }
     virtual void select_snapshot(int) {}
     virtual void release_snapshot(int) {}
+    // The EFB's depth as of this point, read back without waiting for the work before it
+    // (gx::GlesRenderer::request_depth_readback); -1 when the backend reads it live only.
+    virtual int request_depth_readback() { return -1; }
+    virtual bool depth_readback_value(int, int, int, std::uint32_t&) const { return false; }
+    virtual void wait_depth_readback(int) {}
+    virtual void release_depth_readback(int) {}
     // Shows frame (or black) on a drawable of that size; false when nothing new was shown.
     virtual bool present(const gx::FramebufferView& frame, int drawable_width, int drawable_height, bool black) = 0;
     // Development: the EFB as RGBA8 rows from the lower left; empty when the renderer cannot read it.

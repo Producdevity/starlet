@@ -58,6 +58,12 @@ bool gpu_peek_snapshot(int index, bool depth, int x, int y, std::uint32_t& value
 std::uint32_t gpu_peek_snapshot_wait(int index, bool depth, int x, int y);
 // GPU thread: the snapshot may be reused.
 void gpu_release_snapshot(int index);
+// GPU thread: request, wait for and release an asynchronous EFB depth readback; any thread: a
+// pixel of one that has arrived (see Renderer::request_depth_readback).
+int gpu_request_depth_readback();
+bool gpu_depth_readback_value(int handle, int x, int y, std::uint32_t& value);
+void gpu_wait_depth_readback(int handle);
+void gpu_release_depth_readback(int handle);
 
 // GPU thread: native-order arrays (see starlet/compat/gx_fifo.h), in command order.
 void gpu_host_order_array(std::uintptr_t base, std::size_t bytes);

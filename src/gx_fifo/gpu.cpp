@@ -382,6 +382,12 @@ public:
         return value;
     }
     void release_snapshot(int index) { renderer_.release_snapshot(index); }
+    int request_depth_readback() { return renderer_.request_depth_readback(); }
+    bool depth_readback_value(int handle, int x, int y, std::uint32_t& value) const {
+        return renderer_.depth_readback_value(handle, x, y, value);
+    }
+    void wait_depth_readback(int handle) { renderer_.wait_depth_readback(handle); }
+    void release_depth_readback(int handle) { renderer_.release_depth_readback(handle); }
     int token_snapshot(std::uint16_t token) { return token_reads_efb(token) ? renderer_.snapshot_efb(token_region(token)) : -1; }
 
     void present(const void* frame_buffer, bool black) {
@@ -738,6 +744,13 @@ bool gpu_peek_snapshot(int index, bool depth, int x, int y, std::uint32_t& value
 std::uint32_t gpu_peek_snapshot_wait(int index, bool depth, int x, int y) { return gpu->peek_snapshot_wait(index, depth, x, y); }
 
 void gpu_release_snapshot(int index) { gpu->release_snapshot(index); }
+
+int gpu_request_depth_readback() { return gpu->request_depth_readback(); }
+bool gpu_depth_readback_value(int handle, int x, int y, std::uint32_t& value) {
+    return gpu->depth_readback_value(handle, x, y, value);
+}
+void gpu_wait_depth_readback(int handle) { gpu->wait_depth_readback(handle); }
+void gpu_release_depth_readback(int handle) { gpu->release_depth_readback(handle); }
 
 void gpu_present(const void* frame_buffer, bool black) {
     gpu_post([frame_buffer, black] { gpu->present(frame_buffer, black); });

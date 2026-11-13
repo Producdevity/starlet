@@ -449,6 +449,28 @@ void live_depth_peeks_share_a_readback() {
     renderer.peek_depth(10,10);
     check(fake::read_pixels==reads+1,"an EFB clear counts as a write");
 }
+// An asynchronous depth readback: requests with no EFB write between them share one readback of
+// the whole EFB, values arrive after the wait, a write in between takes another, and a released
+// handle's slot is reused.
+void asynchronous_depth_readback() {
+    GlesRenderer renderer; Fixture f; const auto command=f.command();
+    renderer.draw_direct(f.decoder.state(),command,f.memory);
+    auto reads=fake::read_pixels;
+    const int a=renderer.request_depth_readback(), b=renderer.request_depth_readback();
+    std::uint32_t value=0;
+    check(a>=0 && a==b && fake::read_pixels==reads+1 && fake::pack_required==640u*456u*4u,
+          "requests with no EFB write between them share one whole-EFB readback");
+    renderer.wait_depth_readback(a);
+    check(renderer.depth_readback_value(a,10,10,value) && !renderer.depth_readback_value(a,640,0,value),
+          "an arrived readback answers inside the EFB only");
+    renderer.draw_direct(f.decoder.state(),command,f.memory);
+    const int c=renderer.request_depth_readback();
+    check(c>=0 && c!=a && fake::read_pixels==reads+2,"an EFB write between requests takes another readback");
+    check(!renderer.depth_readback_value(c,10,10,value),"a readback not waited for answers nothing yet");
+    renderer.release_depth_readback(a); renderer.release_depth_readback(b); renderer.release_depth_readback(c);
+    renderer.draw_direct(f.decoder.state(),command,f.memory);
+    check(renderer.request_depth_readback()==a,"a released readback's slot is reused");
+}
 void validation_precedes_mutation() {
     GlesRenderer renderer;
     DrawPacket incomplete;
@@ -1955,7 +1977,7 @@ int main() {
         validation_precedes_mutation();
         warm_shader_validation(); rgb8_replacement_boundary(); clear_boundary(); efb_layout_boundary();
         display_copy_boundary(); repeated_presentation();
-        direct_draw_path(); live_depth_peeks_share_a_readback();
+        direct_draw_path(); live_depth_peeks_share_a_readback(); asynchronous_depth_readback();
         rejected_program_skips_draws();
         unready_program_policy();
         program_reuse_across_tev_colours();

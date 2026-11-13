@@ -69,6 +69,14 @@ public:
     void clear_efb(const EfbClear&) override;
     std::uint32_t peek_depth(int x, int y) override;
     std::uint32_t peek_color(int x, int y) override;
+    // The EFB's packed depth as of now, read back without waiting for the GL work before it:
+    // request returns a handle (-1 when every slot is held), value reads a pixel once it has
+    // arrived (false before), wait blocks until then, release frees the handle. Requests with
+    // no EFB write between them share one readback. Values equal peek_depth's.
+    int request_depth_readback();
+    bool depth_readback_value(int handle, int x, int y, std::uint32_t& value) const;
+    void wait_depth_readback(int handle);
+    void release_depth_readback(int handle);
     // With the direct path active, draw-sync callbacks are deferred against snapshots
     // of the EFB's packed D24 depth and colour; otherwise snapshot_efb declines.
     int snapshot_efb() override;

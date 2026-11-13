@@ -36,6 +36,12 @@ bool GlesBackend::peek_color_snapshot(int index, int x, int y, std::uint32_t& va
 }
 void GlesBackend::select_snapshot(int index) { renderer_.select_snapshot(index); }
 void GlesBackend::release_snapshot(int index) { renderer_.release_snapshot(index); }
+int GlesBackend::request_depth_readback() { return renderer_.request_depth_readback(); }
+bool GlesBackend::depth_readback_value(int handle, int x, int y, std::uint32_t& value) const {
+    return renderer_.depth_readback_value(handle, x, y, value);
+}
+void GlesBackend::wait_depth_readback(int handle) { renderer_.wait_depth_readback(handle); }
+void GlesBackend::release_depth_readback(int handle) { renderer_.release_depth_readback(handle); }
 
 bool GlesBackend::present(const gx::FramebufferView& frame, int drawable_width, int drawable_height, bool black) {
     return renderer_.present_framebuffer(frame, drawable_width, drawable_height, black);

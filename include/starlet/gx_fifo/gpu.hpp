@@ -66,6 +66,13 @@ void present(const VideoFrame& frame);
 // Guest CPU: EFB reads after every command written so far (GXPeekZ, GXPeekARGB).
 std::uint32_t peek_depth(int x, int y);
 std::uint32_t peek_color(int x, int y);
+// Guest CPU: the EFB's depth as of every command written so far, without waiting for the GPU to
+// execute them. request returns a handle, or -1 when only live reads exist (peek_depth then);
+// readback_depth returns what peek_depth would have returned at the request, waiting for the
+// readback if it has not arrived; release_depth_readback ends the handle.
+int request_depth_readback();
+std::uint32_t readback_depth(int handle, int x, int y);
+void release_depth_readback(int handle);
 
 // The first GX command stream failure, or an empty string. The pointer stays valid until the next call.
 const char* gpu_failure();

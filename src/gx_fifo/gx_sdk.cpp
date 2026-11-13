@@ -158,6 +158,25 @@ std::uint32_t peek(bool depth, int x, int y) {
 std::uint32_t peek_depth(int x, int y) { return peek(true, x, y); }
 std::uint32_t peek_color(int x, int y) { return peek(false, x, y); }
 
+int request_depth_readback() {
+    flush_stage();
+    int handle = -1;
+    gpu_call([&handle] { handle = gpu_request_depth_readback(); });
+    return handle;
+}
+
+std::uint32_t readback_depth(int handle, int x, int y) {
+    std::uint32_t value = 0;
+    if (gpu_depth_readback_value(handle, x, y, value)) return value;
+    gpu_call([handle] { gpu_wait_depth_readback(handle); });
+    if (!gpu_depth_readback_value(handle, x, y, value)) throw std::out_of_range("depth readback outside the EFB");
+    return value;
+}
+
+void release_depth_readback(int handle) {
+    gpu_post([handle] { gpu_release_depth_readback(handle); });
+}
+
 }
 
 using namespace starlet::gx_fifo;

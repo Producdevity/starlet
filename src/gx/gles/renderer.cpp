@@ -368,6 +368,17 @@ struct GlesRenderer::Impl {
     // The EFB's packed depth, read whole by the first live depth peek after efb_writes reached
     // live_depth_writes; later peeks before the next EFB write read it (bottom row first).
     std::vector<std::uint8_t> live_depth;
+    // request_depth_readback: the whole EFB's packed depth read into a pixel-pack buffer, copied
+    // into pixels once its fence has signalled.
+    struct DepthReadback {
+        GLuint pack = 0;
+        GLsync fence = nullptr;
+        std::vector<std::uint8_t> pixels;
+        std::atomic<bool> ready{false};
+        unsigned refs = 0;
+        std::uint64_t writes = 0;
+    };
+    std::array<DepthReadback, 4> depth_readbacks;
     std::uint64_t live_depth_writes = ~std::uint64_t{0};
     std::uint64_t efb_writes = 0, last_snapshot_writes = 0;
     // Each packed snapshot is read back asynchronously into its buffer; once the fence
@@ -2202,6 +2213,83 @@ std::uint32_t GlesRenderer::peek_depth(int x, int y) {
         g.live_depth_writes = g.efb_writes;
     }
     return packed_depth(&g.live_depth[(std::size_t(g.efb_height-1-y) * g.efb_width + x) * 4]);
+}
+int GlesRenderer::request_depth_readback() {
+    auto& g = *impl_; g.require_ready();
+    for (std::size_t i = 0; i < g.depth_readbacks.size(); ++i) {
+        auto& d = g.depth_readbacks[i];
+        if (d.refs && d.writes == g.efb_writes) { ++d.refs; return int(i); }
+    }
+    std::size_t index = 0;
+    while (index < g.depth_readbacks.size() && g.depth_readbacks[index].refs) ++index;
+    if (index == g.depth_readbacks.size()) return -1;
+    auto& d = g.depth_readbacks[index];
+    d.refs = 1;
+    d.writes = g.efb_writes;
+    d.ready.store(false, std::memory_order_relaxed);
+    g.execute([&g, index] {
+        try {
+            auto& d = g.depth_readbacks[index];
+            const auto bytes = GLsizeiptr(g.efb_width) * g.efb_height * 4;
+            if (!d.pack) {
+                glGenBuffers(1, &d.pack); glBindBuffer(GL_PIXEL_PACK_BUFFER, d.pack);
+                glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
+            }
+            // As read_depth for a live peek, into the pack buffer.
+            g.copy_surface();
+            g.pack_efb(g.copy_framebuffer, 0, 0, g.efb_width, g.efb_height);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, d.pack); glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+            glReadPixels(0, 0, g.efb_width, g.efb_height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, g.framebuffer);
+            if (d.fence) glDeleteSync(d.fence);
+            d.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            if (!d.fence) throw std::runtime_error("EFB depth readback fence allocation failed");
+            gl_check("EFB depth readback");
+        } catch (...) { g.failed = true; throw; }
+    }, false);
+    return int(index);
+}
+bool GlesRenderer::depth_readback_value(int handle, int x, int y, std::uint32_t& value) const {
+    const auto& g = *impl_;
+    if (handle < 0 || handle >= int(g.depth_readbacks.size()) || x < 0 || x >= g.efb_width || y < 0 || y >= g.efb_height)
+        return false;
+    const auto& d = g.depth_readbacks[std::size_t(handle)];
+    if (!d.ready.load(std::memory_order_acquire)) return false;
+    value = packed_depth(&d.pixels[(std::size_t(g.efb_height - 1 - y) * g.efb_width + x) * 4]);
+    return true;
+}
+void GlesRenderer::wait_depth_readback(int handle) {
+    auto& g = *impl_; g.check_owner();
+    if (handle < 0 || handle >= int(g.depth_readbacks.size()) || !g.depth_readbacks[std::size_t(handle)].refs)
+        throw std::out_of_range("unknown EFB depth readback");
+    auto& d = g.depth_readbacks[std::size_t(handle)];
+    if (d.ready.load(std::memory_order_acquire)) return;
+    ++g.stats.peek_waits;
+    g.execute([&g, &d] {
+        try {
+            const auto result = glClientWaitSync(d.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000);
+            if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED)
+                throw std::runtime_error("EFB depth readback did not retire within one second");
+            const auto bytes = std::size_t(g.efb_width) * g.efb_height * 4;
+            d.pixels.resize(bytes);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, d.pack);
+            const void* mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(bytes), GL_MAP_READ_BIT);
+            if (!mapped) throw std::runtime_error("EFB depth readback could not be mapped");
+            std::memcpy(d.pixels.data(), mapped, bytes);
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            gl_check("EFB depth readback map");
+        } catch (...) { g.failed = true; throw; }
+    }, true);
+    d.ready.store(true, std::memory_order_release);
+}
+void GlesRenderer::release_depth_readback(int handle) {
+    auto& g = *impl_; g.check_owner();
+    if (handle < 0 || handle >= int(g.depth_readbacks.size()) || !g.depth_readbacks[std::size_t(handle)].refs)
+        throw std::out_of_range("unknown EFB depth readback");
+    --g.depth_readbacks[std::size_t(handle)].refs;
 }
 std::uint32_t GlesRenderer::peek_color(int x, int y) {
     auto& g = *impl_; g.check_owner();
