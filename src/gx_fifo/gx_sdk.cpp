@@ -173,6 +173,10 @@ std::uint32_t readback_depth(int handle, int x, int y) {
     return value;
 }
 
+bool try_readback_depth(int handle, int x, int y, std::uint32_t& value) {
+    return gpu_depth_readback_value(handle, x, y, value);
+}
+
 void release_depth_readback(int handle) {
     gpu_post([handle] { gpu_release_depth_readback(handle); });
 }

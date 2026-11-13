@@ -374,9 +374,13 @@ struct GlesRenderer::Impl {
         GLuint pack = 0;
         GLsync fence = nullptr;
         std::vector<std::uint8_t> pixels;
-        std::atomic<bool> ready{false};
+        // requested: bumped by each new request (decode thread); published: the request whose
+        // pixels are mapped (GL thread). Ready while they match.
+        std::atomic<std::uint64_t> requested{0}, published{0};
+        std::uint64_t fenced = 0;  // GL thread: the request the current fence belongs to
         unsigned refs = 0;
         std::uint64_t writes = 0;
+        bool ready() const { return published.load(std::memory_order_acquire) == requested.load(std::memory_order_acquire); }
     };
     std::array<DepthReadback, 4> depth_readbacks;
     std::uint64_t live_depth_writes = ~std::uint64_t{0};
@@ -427,6 +431,32 @@ struct GlesRenderer::Impl {
     // The selected snapshot's bytes for an EFB pixel, once its readback is mapped;
     // null when peeks go to the live EFB.
     const std::uint8_t* peek_snapshot(int x, int y, bool color);
+    // GL thread: publishes the depth readbacks whose fence has signalled, so readers need not wait.
+    bool depth_readbacks_pending() const {
+        for (const auto& d : depth_readbacks) if (d.fence) return true;
+        return false;
+    }
+    void collect_depth_readbacks() {
+        for (auto& d : depth_readbacks) {
+            if (!d.fence) continue;
+            const auto status = glClientWaitSync(d.fence, 0, 0);
+            if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) continue;
+            map_depth_readback(d);
+        }
+    }
+    void map_depth_readback(DepthReadback& d) {
+        const auto bytes = std::size_t(efb_width) * efb_height * 4;
+        d.pixels.resize(bytes);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, d.pack);
+        const void* mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(bytes), GL_MAP_READ_BIT);
+        if (!mapped) throw std::runtime_error("EFB depth readback could not be mapped");
+        std::memcpy(d.pixels.data(), mapped, bytes);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glDeleteSync(d.fence); d.fence = nullptr;
+        gl_check("EFB depth readback map");
+        d.published.store(d.fenced, std::memory_order_release);
+    }
     // Submission thread: GL work runs there in call order; inline when not started.
     struct Submission {
         std::thread thread;
@@ -467,7 +497,7 @@ struct GlesRenderer::Impl {
     // Runs one task on the GL thread. A failure latches; the recording thread sees it next.
     void run_task(std::function<void()>& op) {
         auto& q = submission;
-        try { op(); if (!pending_reads.empty()) collect_snapshots(); }
+        try { op(); if (!pending_reads.empty()) collect_snapshots(); if (depth_readbacks_pending()) collect_depth_readbacks(); }
         catch (...) {
             std::lock_guard<std::mutex> lock(q.mutex);
             if (!q.failure) {
@@ -483,13 +513,37 @@ struct GlesRenderer::Impl {
         }
         q.done.notify_all();
     }
+    // Idle GL thread: publishes arrived depth readbacks, latching a failure as run_task does.
+    void poll_depth_readbacks() {
+        auto& q = submission;
+        try { collect_depth_readbacks(); }
+        catch (...) {
+            std::lock_guard<std::mutex> lock(q.mutex);
+            if (!q.failure) {
+                q.failure = std::current_exception();
+                try { throw; } catch (const std::exception& e) { std::fprintf(stderr, "GLES renderer failed: %s\n", e.what()); } catch (...) {}
+            }
+            failed = true;
+        }
+        q.done.notify_all();
+    }
     void run_submission() {
         auto& q = submission;
         for (;;) {
             std::function<void()> op;
             {
                 std::unique_lock<std::mutex> lock(q.mutex);
-                q.ready.wait(lock, [&] { return q.stopping || !q.queue.empty(); });
+                if (depth_readbacks_pending()) {
+                    // A readback is in flight: wake every millisecond to publish it once its fence signals.
+                    q.ready.wait_for(lock, std::chrono::milliseconds(1), [&] { return q.stopping || !q.queue.empty(); });
+                    if (q.queue.empty() && !q.stopping) {
+                        lock.unlock();
+                        poll_depth_readbacks();
+                        continue;
+                    }
+                } else {
+                    q.ready.wait(lock, [&] { return q.stopping || !q.queue.empty(); });
+                }
                 if (q.queue.empty()) break;
                 op = std::move(q.queue.front());
                 q.queue.pop_front();
@@ -2226,10 +2280,12 @@ int GlesRenderer::request_depth_readback() {
     auto& d = g.depth_readbacks[index];
     d.refs = 1;
     d.writes = g.efb_writes;
-    d.ready.store(false, std::memory_order_relaxed);
-    g.execute([&g, index] {
+    const auto generation = d.requested.load(std::memory_order_relaxed) + 1;
+    d.requested.store(generation, std::memory_order_release);
+    g.execute([&g, index, generation] {
         try {
             auto& d = g.depth_readbacks[index];
+            d.fenced = generation;
             const auto bytes = GLsizeiptr(g.efb_width) * g.efb_height * 4;
             if (!d.pack) {
                 glGenBuffers(1, &d.pack); glBindBuffer(GL_PIXEL_PACK_BUFFER, d.pack);
@@ -2256,7 +2312,7 @@ bool GlesRenderer::depth_readback_value(int handle, int x, int y, std::uint32_t&
     if (handle < 0 || handle >= int(g.depth_readbacks.size()) || x < 0 || x >= g.efb_width || y < 0 || y >= g.efb_height)
         return false;
     const auto& d = g.depth_readbacks[std::size_t(handle)];
-    if (!d.ready.load(std::memory_order_acquire)) return false;
+    if (!d.ready()) return false;
     value = packed_depth(&d.pixels[(std::size_t(g.efb_height - 1 - y) * g.efb_width + x) * 4]);
     return true;
 }
@@ -2265,25 +2321,17 @@ void GlesRenderer::wait_depth_readback(int handle) {
     if (handle < 0 || handle >= int(g.depth_readbacks.size()) || !g.depth_readbacks[std::size_t(handle)].refs)
         throw std::out_of_range("unknown EFB depth readback");
     auto& d = g.depth_readbacks[std::size_t(handle)];
-    if (d.ready.load(std::memory_order_acquire)) return;
+    if (d.ready()) return;
     ++g.stats.peek_waits;
     g.execute([&g, &d] {
         try {
+            if (d.ready() || !d.fence) return;
             const auto result = glClientWaitSync(d.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000);
             if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED)
                 throw std::runtime_error("EFB depth readback did not retire within one second");
-            const auto bytes = std::size_t(g.efb_width) * g.efb_height * 4;
-            d.pixels.resize(bytes);
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, d.pack);
-            const void* mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(bytes), GL_MAP_READ_BIT);
-            if (!mapped) throw std::runtime_error("EFB depth readback could not be mapped");
-            std::memcpy(d.pixels.data(), mapped, bytes);
-            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-            gl_check("EFB depth readback map");
+            g.map_depth_readback(d);
         } catch (...) { g.failed = true; throw; }
     }, true);
-    d.ready.store(true, std::memory_order_release);
 }
 void GlesRenderer::release_depth_readback(int handle) {
     auto& g = *impl_; g.check_owner();

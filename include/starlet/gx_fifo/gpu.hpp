@@ -72,6 +72,8 @@ std::uint32_t peek_color(int x, int y);
 // readback if it has not arrived; release_depth_readback ends the handle.
 int request_depth_readback();
 std::uint32_t readback_depth(int handle, int x, int y);
+// Without waiting: false while the readback has not arrived (or the point is outside the EFB).
+bool try_readback_depth(int handle, int x, int y, std::uint32_t& value);
 void release_depth_readback(int handle);
 
 // The first GX command stream failure, or an empty string. The pointer stays valid until the next call.
