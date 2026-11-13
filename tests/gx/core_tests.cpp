@@ -1,3 +1,4 @@
+#include "starlet/compat/gx_fifo.h"
 #include "starlet/gx/decoder.hpp"
 
 #include <algorithm>
@@ -326,6 +327,14 @@ void rejected_inputs_and_limits() {
       const auto& x=memory.regions[0x4000]; require(d.feed({x.data(),x.size()}).error == Error::display_list_depth, "recursive DL terminates"); }
     { Limits limits; limits.max_commands=3; Decoder d(memory,sink,limits);
       const std::uint8_t x[]={0,0,0,0}; require(d.feed({x,sizeof(x)}).error == Error::work_limit, "command budget"); }
+    { Limits limits; limits.max_commands=2; Decoder d(memory,sink,limits);
+      const std::uint8_t x[]={8,0xa0,0,0,0,1, 8,0xa1,0,0,0,2, 8,0xa2,0,0,0,3};
+      require(d.feed({x,sizeof(x)}).error == Error::work_limit && d.state().cp(0xa0)==1 &&
+              d.state().cp(0xa1)==2 && d.state().cp(0xa2)==0, "batched CP honors the command budget before applying a word"); }
+    { Limits limits; limits.max_command_bytes=6; limits.max_expanded_bytes=12; Decoder d(memory,sink,limits);
+      const std::uint8_t x[]={8,0xa0,0,0,0,1, 8,0xa1,0,0,0,2, 8,0xa2,0,0,0,3};
+      require(d.feed({x,sizeof(x)}).error == Error::work_limit && d.state().cp(0xa1)==2 && d.state().cp(0xa2)==0,
+              "batched CP honors the expanded byte budget"); }
     { Limits limits; limits.max_command_bytes=16; Decoder d(memory,sink,limits); cp(d,0x50,0x200); cp(d,0x70,9);
       const std::uint8_t x[]={0x90,0,2}; require(d.feed({x,sizeof(x)}).error == Error::command_size, "draw allocation limit"); }
     { Decoder d(memory,sink); memory.regions[0x5000]={0x61};
@@ -650,12 +659,131 @@ void selective_bp_notifications() {
             "unobserved TLUT writes still load palette memory");
 }
 
+void xf_numeric_transfers() {
+    Memory memory; Sink sink; Decoder decoder(memory, sink);
+    std::uint32_t random = 6789;
+    for (unsigned trial = 0; trial < 500; ++trial) {
+        random = random * 1664525u + 1013904223u;
+        const unsigned count = 1 + random % 16;
+        const unsigned address = trial % 5 == 0 ? 0xffd : (random >> 16) % (0x1000 - count);
+        std::vector<std::uint8_t> bytes{0x10,0,static_cast<std::uint8_t>(count - 1),
+                                       static_cast<std::uint8_t>(address >> 8),static_cast<std::uint8_t>(address)};
+        std::vector<std::uint32_t> expected;
+        for (unsigned i = 0; i < count; ++i) {
+            random = random * 1664525u + 1013904223u; expected.push_back(random);
+            bytes.insert(bytes.end(), {static_cast<std::uint8_t>(random >> 24),static_cast<std::uint8_t>(random >> 16),
+                                       static_cast<std::uint8_t>(random >> 8),static_cast<std::uint8_t>(random)});
+        }
+        ok(decoder.feed({bytes.data(),bytes.size()}));
+        for (unsigned i = 0; i < count; ++i) require(decoder.state().xf(address + i) == expected[i],
+                                                   "XF endian conversion preserves every word across memory/register boundaries");
+        const auto revision = decoder.state().revision();
+        ok(decoder.feed({bytes.data(),bytes.size()}));
+        require(decoder.state().revision() == revision, "an equal XF transfer leaves revisions unchanged");
+    }
+}
+
+void indexed_list_state_footprint() {
+    Memory memory; Sink sink; Decoder decoder(memory, sink);
+    StarletGxStateCache cache{};
+    std::uint32_t random = 98765;
+    for (unsigned iteration = 0; iteration < 1000; ++iteration) {
+        auto next = [&] { random = random * 1664525u + 1013904223u; return random; };
+        const unsigned vat = next() & 7;
+        std::uint32_t low = next() & 511, high = 0;
+        low |= (2u + (next() & 1)) << 9;
+        for (unsigned attribute = 1; attribute < 12; ++attribute) {
+            unsigned mode = next() % 3; if (mode) ++mode;
+            if (attribute < 4) low |= mode << (9 + attribute * 2);
+            else high |= mode << ((attribute - 4) * 2);
+        }
+        auto a = 1u | (4u << 1) | (4u << 10) | (1u << 30);
+        if (next() & 1) a |= 0x80000200u;
+        cp(decoder, 0x50, low); cp(decoder, 0x60, high); cp(decoder, 0x70 + vat, a);
+        VertexLayout layout; std::string error;
+        require(decoder.state().vertex_layout(vat, layout, error), "random indexed layout is valid");
+        starlet_gx_cp_note(&cache, 8, 0x50, low, 0); starlet_gx_cp_note(&cache, 8, 0x60, high, 0);
+        starlet_gx_cp_note(&cache, 8, 0x70 + vat, a, 0);
+        std::vector<std::uint8_t> bytes(3 + 3 * layout.stride, 0x61);
+        bytes[0] = 0x90 | vat; bytes[1] = 0; bytes[2] = 3;
+        const auto end = bytes.size();
+        while (bytes.size() % 32) bytes.push_back(0);
+        require(starlet_gx_indexed_draw_list(&cache, bytes.data(), bytes.size()),
+                "indexed footprint sizes match the independent GX layout decoder");
+        bytes.resize(end + 5); bytes[end] = 0x61;
+        require(!starlet_gx_indexed_draw_list(&cache, bytes.data(), bytes.size()), "a trailing BP command invalidates state");
+        bytes.resize(end); bytes[1] = bytes[2] = 255;
+        require(!starlet_gx_indexed_draw_list(&cache, bytes.data(), bytes.size()), "a truncated primitive cannot preserve state");
+        bytes[1] = 0; bytes[2] = 3;
+        starlet_gx_state_forget(&cache);
+        require(!starlet_gx_indexed_draw_list(&cache, bytes.data(), bytes.size()),
+                "a list whose incoming CP layout is unknown cannot preserve state");
+    }
+}
+
+void sdk_state_write_cache() {
+    StarletGxStateCache cache{};
+    for (unsigned address : {0x50u, 0x60u, 0x70u, 0x87u, 0x97u, 0xa0u, 0xbfu}) {
+        require(starlet_gx_cp_keep(&cache, 8, address, 123, 0), "first CP state emits");
+        require(!starlet_gx_cp_keep(&cache, 8, address, 123, 0), "equal CP state is suppressed");
+        require(starlet_gx_cp_keep(&cache, 8, address, 456, 1), "recorded CP always emits without learning");
+        require(!starlet_gx_cp_keep(&cache, 8, address, 123, 0), "recording preserves live CP shadow");
+        starlet_gx_state_forget(&cache);
+        require(starlet_gx_cp_keep(&cache, 8, address, 123, 0), "FIFO/list invalidation forgets CP state");
+    }
+    require(starlet_gx_cp_keep(&cache, 8, 0x30, 0, 0) && starlet_gx_cp_keep(&cache, 8, 0x30, 0, 0),
+            "matrix index CP writes always restore vertex latches");
+    starlet_gx_state_forget(&cache);
+    Memory a_memory, b_memory; Sink a_sink, b_sink;
+    Decoder a(a_memory, a_sink), b(b_memory, b_sink);
+    auto same = [&] {
+        for (unsigned i = 0; i < 256; ++i) require(a.state().bp(i) == b.state().bp(i), "SDK suppression retains the complete BP image");
+        for (bool konst : {false, true}) for (unsigned i = 0; i < 8; ++i)
+            require(a.state().tev_register(konst, i) == b.state().tev_register(konst, i), "SDK suppression retains both TEV banks");
+    };
+    auto write = [&](std::uint32_t word) {
+        const auto address = static_cast<std::uint8_t>(word >> 24);
+        bp(a, address, word & 0xffffff);
+        const bool keep = starlet_gx_bp_keep(&cache, word, 0);
+        if (keep) bp(b, address, word & 0xffffff);
+        same();
+        return keep;
+    };
+    write(0xfeffffff); write(0x41000008);
+    require(!write(0x41000008), "an equal full-mask draw-state write is suppressed");
+    write(0xe0000123); write(0xe0800456);
+    require(write(0xe0000123), "bank restoration preserves the raw BP selector used by later masked writes");
+    require(!write(0xe0000123), "a repeated write to the same TEV bank is suppressed");
+    write(0xfe0000ff); require(write(0xe0000155), "a masked TEV write is retained");
+    require(write(0xe0000155), "a masked write invalidates the shadow value");
+    for (auto address : {0x45u, 0x47u, 0x48u, 0x52u, 0x64u, 0x65u, 0x66u, 0x80u, 0xbfu}) {
+        const auto word = address << 24;
+        require(write(word) && write(word), "sync, copies, texture and TLUT operations always emit");
+    }
+    write(0x41000008); starlet_gx_state_forget(&cache);
+    bp(a, 0xfe, 255); bp(b, 0xfe, 255);
+    require(write(0x41000008), "an unknown list's final mask cannot consume a suppressed write");
+    require(write(0x41000008), "the unknown masked result is learned only after a full write");
+    require(!write(0x41000008), "full-state suppression resumes after mask consumption");
+    const auto generation = cache.generation;
+    require(starlet_gx_bp_keep(&cache, 0x41000017, 1), "recorded display lists retain explicit state writes");
+    require(cache.generation == generation && !write(0x41000008), "recording does not modify the executed-state shadow");
+    require(starlet_gx_xf_keep(&cache, 0x40, 123, 0) && !starlet_gx_xf_keep(&cache, 0x40, 123, 0),
+            "equal texgen writes are suppressed");
+    require(starlet_gx_xf_keep(&cache, 0x18, 0, 0) && starlet_gx_xf_keep(&cache, 0x18, 0, 0),
+            "matrix-index writes always restore latches");
+    starlet_gx_state_forget(&cache);
+    require(starlet_gx_xf_keep(&cache, 0x40, 123, 0), "FIFO and list changes invalidate texgen shadows");
+    cache.generation = ~std::uint32_t{0}; starlet_gx_state_forget(&cache);
+    require(write(0x41000008) && starlet_gx_xf_keep(&cache, 0x40, 123, 0), "generation wrap cannot resurrect old state");
+}
+
 int main() {
     try {
         bp_mask_and_order(); tev_register_banks(); texgen_fields(); layouts_and_streaming(); layout_revision_ignores_arrays(); indexed_xf_and_bounds(); indexed_xf_reader_hook();
         palettes_snapshot_and_reload(); lists_mutation_and_shared_state(); rejected_inputs_and_limits(); failed_memory_is_not_applied(); immutable_list_during_execution();
         callback_reentry_is_rejected(); processing_exceptions_latch(); merged_primitives(); every_split_boundary();
-        host_commands_and_filtered_bp(); tev_banks_in_fed_writes(); list_fast_path_matches_general_path(); selective_bp_notifications();
+        host_commands_and_filtered_bp(); tev_banks_in_fed_writes(); list_fast_path_matches_general_path(); selective_bp_notifications(); sdk_state_write_cache(); indexed_list_state_footprint(); xf_numeric_transfers();
         std::cout << "GX core: 20 test groups passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

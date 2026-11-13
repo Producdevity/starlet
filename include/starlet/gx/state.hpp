@@ -125,7 +125,6 @@ private:
     void program_xf(std::uint16_t address, std::uint32_t value);
     void program_word(unsigned index, std::uint32_t value);
     void draw_word(unsigned index, std::uint32_t value, unsigned group);
-    void draw_bp(std::uint8_t address, std::uint32_t value);
     EfbLayout efb_;
     std::array<std::uint32_t, 256> bp_{};
     std::array<std::uint32_t, 256> cp_{};

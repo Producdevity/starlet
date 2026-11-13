@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#if defined(__aarch64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#include <arm_neon.h>
+#endif
 
 namespace starlet::gx {
 namespace {
@@ -191,26 +194,31 @@ Decoder::Fast Decoder::fast_command(const std::uint8_t* p, std::size_t remaining
         return Fast::applied;
     }
     if (p[0] == 0x61 && room && remaining >= 5 && plain_bp_[p[1]] && state_.bp_mask_ == 0xffffff) {
-        const auto address = p[1];
-        const auto value = std::uint32_t{p[2]} << 16 | std::uint32_t{p[3]} << 8 | p[4];
-        charge(5);
-        ++counts_.fast_bp;
-        // TEV registers E0-E7 hold two banks: the selector bit picks color or konstant.
-        const bool tev = address >= 0xe0 && address <= 0xe7;
-        if (tev) state_.tev_registers_[(value >> 23) & 1][address - 0xe0] = value & 0x7fffff;
-        if (state_.bp_[address] != value) {
-            state_.bp_[address] = value;
-            state_.program_bp(address, value);
-            ++state_.revision_;
-            ++state_.bp_revision_;
-            if (!tev || (value & 0x800000)) ++state_.bp_state_revision_;
-        }
-        if (notify_bp_[address] && !sink_.bp_write(state_, address, value)) {
-            fail(Error::sink_rejected, "GX sink rejected BP operation");
-            return Fast::failed;
-        }
-        if (!status_) return Fast::failed;
-        consumed = 5;
+        consumed = 0;
+        do {
+            const auto* command = p + consumed;
+            const auto address = command[1];
+            const auto value = std::uint32_t{command[2]} << 16 | std::uint32_t{command[3]} << 8 | command[4];
+            charge(5);
+            ++counts_.fast_bp;
+            const bool tev = address >= 0xe0 && address <= 0xe7;
+            if (tev) state_.tev_registers_[(value >> 23) & 1][address - 0xe0] = value & 0x7fffff;
+            if (state_.bp_[address] != value) {
+                state_.bp_[address] = value;
+                state_.program_bp(address, value);
+                ++state_.revision_;
+                ++state_.bp_revision_;
+                if (!tev || (value & 0x800000)) ++state_.bp_state_revision_;
+            }
+            if (notify_bp_[address] && !sink_.bp_write(state_, address, value)) {
+                fail(Error::sink_rejected, "GX sink rejected BP operation");
+                return Fast::failed;
+            }
+            if (!status_) return Fast::failed;
+            consumed += 5;
+        } while (remaining - consumed >= 5 && p[consumed] == 0x61 && plain_bp_[p[consumed + 1]] &&
+                 state_.bp_mask_ == 0xffffff && budget.commands < limits_.max_commands &&
+                 (!stream || limits_.max_expanded_bytes - budget.bytes >= 5));
         return Fast::applied;
     }
     if (p[0] == 0 && fast_nop_) {
@@ -238,17 +246,22 @@ Decoder::Fast Decoder::fast_command(const std::uint8_t* p, std::size_t remaining
         }
     }
     if (p[0] == 0x08 && room && remaining >= 6 && plain_cp_[p[1]]) {
-        const auto address = p[1];
-        const auto value = be32(p + 2);
-        charge(6);
-        ++counts_.fast_cp;
-        if (state_.cp_[address] != value) {
-            state_.cp_[address] = value;
-            ++state_.revision_;
-            ++state_.cp_revision_;
-            if (address < 0xa0) ++state_.cp_layout_revision_;
-        }
-        consumed = 6;
+        consumed = 0;
+        do {
+            const auto* command = p + consumed;
+            const auto address = command[1];
+            const auto value = be32(command + 2);
+            charge(6);
+            ++counts_.fast_cp;
+            if (state_.cp_[address] != value) {
+                state_.cp_[address] = value;
+                ++state_.revision_;
+                ++state_.cp_revision_;
+                if (address < 0xa0) ++state_.cp_layout_revision_;
+            }
+            consumed += 6;
+        } while (remaining - consumed >= 6 && p[consumed] == 0x08 && plain_cp_[p[consumed + 1]] &&
+                 budget.commands < limits_.max_commands && (!stream || limits_.max_expanded_bytes - budget.bytes >= 6));
         return Fast::applied;
     }
     return Fast::none;
@@ -258,7 +271,17 @@ void Decoder::apply_xf(std::size_t address, const std::uint8_t* words, std::size
     bool memory_changed = false, register_changed = false;
     auto* xf = state_.xf_.data() + address;
     const std::size_t memory_words = address < 0x1000 ? std::min<std::size_t>(count, 0x1000 - address) : 0;
-    for (std::size_t i = 0; i < memory_words; ++i) {
+    std::size_t i = 0;
+#if defined(__aarch64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    auto changed = vdupq_n_u32(0);
+    for (; i + 4 <= memory_words; i += 4) {
+        const auto value = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(words + i * 4)));
+        changed = vorrq_u32(changed, veorq_u32(value, vld1q_u32(xf + i)));
+        vst1q_u32(xf + i, value);
+    }
+    memory_changed = vmaxvq_u32(changed) != 0;
+#endif
+    for (; i < memory_words; ++i) {
         const auto word = be32(words + i * 4);
         memory_changed |= xf[i] != word;
         xf[i] = word;

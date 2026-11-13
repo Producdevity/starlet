@@ -8,6 +8,7 @@
 #include "starlet/gx_fifo/gpu.hpp"
 #include "starlet/gx_fifo/video.hpp"
 #include "starlet/os/guest_cpu.hpp"
+#include "starlet/os/game_memory.hpp"
 #include "starlet/os/host_allocation.hpp"
 #include "starlet/sdk/gx.h"
 
@@ -17,6 +18,7 @@
 
 extern "C" {
 StarletGxStage starlet_gx_stage = {nullptr, nullptr};
+StarletGxStateCache starlet_gx_state_cache = {};
 }
 
 using namespace starlet::sdk;
@@ -187,6 +189,10 @@ using namespace starlet::gx_fifo;
 
 extern "C" {
 
+int starlet_gx_draw_list_keeps_state(const void* data, unsigned size) {
+    return starlet::os::game_visible(data, size) && starlet_gx_indexed_draw_list(&starlet_gx_state_cache, data, size);
+}
+
 void starlet_gx_reserve(unsigned bytes) {
     starlet::os::checkpoint();
     if (linked()) {
@@ -251,6 +257,7 @@ void GXInitFifoLimits(GXFifoObj* fifo, u32 hiWatermark, u32 loWatermark) {
 }
 
 void GXSetCPUFifo(GXFifoObj* fifo) {
+    starlet_gx_state_forget(&starlet_gx_state_cache);
     flush_stage();
     sync_fifo_write_pointer();
     cpu_fifo = priv(fifo);
@@ -265,6 +272,7 @@ void GXSetCPUFifo(GXFifoObj* fifo) {
 }
 
 void GXSetGPFifo(GXFifoObj* fifo) {
+    starlet_gx_state_forget(&starlet_gx_state_cache);
     flush_stage();
     sync_fifo_write_pointer();
     auto* f = priv(fifo);

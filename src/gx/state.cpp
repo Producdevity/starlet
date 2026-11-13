@@ -6,6 +6,58 @@
 
 namespace starlet::gx {
 namespace {
+constexpr auto register_coefficients = [] {
+    std::array<std::uint64_t, 278> result{};
+    for (std::size_t i = 0; i < result.size(); ++i) {
+        auto value = (i + 1) * 0x9e3779b97f4a7c15ull;
+        value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+        value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+        result[i] = (value ^ (value >> 31)) | 1;
+    }
+    return result;
+}();
+
+struct RegisterMapping {
+    std::uint16_t program = 0xffff, draw = 0xffff;
+    std::uint32_t mask = ~0u;
+    std::uint8_t group = 0;
+};
+constexpr auto bp_mapping = [] {
+    std::array<RegisterMapping, 256> result{};
+    for (unsigned a = 0; a < result.size(); ++a) {
+        auto& m = result[a];
+        if (a == 0) { m.program = 25; m.mask = ~0xc000u; }
+        else if (a >= 0x10 && a < 0x20) m.program = 26 + a - 0x10;
+        else if (a >= 0x25 && a < 0x30) m.program = 42 + a - 0x25;
+        else if (a >= 0xc0 && a < 0xe0) m.program = 53 + a - 0xc0;
+        else if (a == 0xf3) { m.program = 85; m.mask = 0xff0000u; }
+        else if (a >= 0xf5 && a < 0xfe) m.program = 86 + a - 0xf5;
+        else if (a == 0x43) m.program = 95;
+        if (a >= 0x80 && a < 0xc0) { m.draw = a; m.group = 1; }
+        else if (a >= 0xe8 && a <= 0xf2) { m.draw = a; m.group = 3; }
+        else if (a == 0 || (a >= 0x20 && a <= 0x22) || (a >= 0x30 && a <= 0x44) || a == 0x59 || a == 0x68) {
+            m.draw = a; m.group = 2;
+        } else if ((a >= 6 && a < 0x20) || (a >= 0x25 && a < 0x30) ||
+                   (a >= 0xc0 && a < 0xe0) || (a >= 0xf3 && a < 0xfe)) m.draw = a;
+    }
+    return result;
+}();
+constexpr auto xf_mapping = [] {
+    std::array<RegisterMapping, 88> result{};
+    for (unsigned a = 0; a < result.size(); ++a) {
+        auto& m = result[a];
+        if (a >= 0x1a && a < 0x20) { m.draw = 256 + a - 0x1a; m.group = 4; }
+        if (a == 5) m.program = 0;
+        else if (a == 9) m.program = 1;
+        else if (a >= 0x0e && a <= 0x12) m.program = 2 + a - 0x0e;
+        else if (a == 0x26) m.program = 7;
+        else if (a == 0x3f) m.program = 8;
+        else if (a >= 0x40 && a < 0x48) m.program = 9 + a - 0x40;
+        else if (a >= 0x50 && a < 0x58) m.program = 17 + a - 0x50;
+    }
+    return result;
+}();
+
 std::uint32_t bits(std::uint32_t word, unsigned shift, unsigned count) {
     return (word >> shift) & ((1u << count) - 1u);
 }
@@ -40,34 +92,23 @@ State::State(EfbLayout efb) : efb_(efb) {
 void State::program_word(unsigned index, std::uint32_t value) {
     auto& old = program_registers_[index];
     if (old == value) return;
-    const auto hash = [index](std::uint32_t word) {
-        const std::uint64_t h = std::uint64_t{word} * ((std::uint64_t{index} + 1) * 0x9e3779b97f4a7c15ull);
-        return (h << 17) | (h >> 47);
-    };
-    program_register_hash_ ^= hash(old) ^ hash(value);
+    program_register_hash_ += (std::uint64_t{value} - old) * register_coefficients[index];
     old = value;
 }
 
 void State::program_bp(std::uint8_t address, std::uint32_t value) {
-    draw_bp(address, value);
-    if (address == 0) program_word(25, value & ~0xc000u);
-    else if (address >= 0x10 && address < 0x20) program_word(26 + address - 0x10, value);
-    else if (address >= 0x25 && address < 0x30) program_word(42 + address - 0x25, value);
-    else if (address >= 0xc0 && address < 0xe0) program_word(53 + address - 0xc0, value);
-    else if (address == 0xf3) program_word(85, value & 0xff0000u);
-    else if (address >= 0xf5 && address < 0xfe) program_word(86 + address - 0xf5, value);
-    else if (address == 0x43) program_word(95, value);
+    const auto& mapping = bp_mapping[address];
+    if (address >= 0xe0 && address <= 0xe7)
+        draw_word(value & 0x800000 ? address : 270 + address - 0xe0, value & 0x7fffff, value & 0x800000 ? 0 : 5);
+    else if (mapping.draw != 0xffff) draw_word(mapping.draw, value, mapping.group);
+    if (mapping.program != 0xffff) program_word(mapping.program, value & mapping.mask);
 }
 
 void State::program_xf(std::uint16_t address, std::uint32_t value) {
-    if (address >= 0x101a && address < 0x1020) draw_word(256 + address - 0x101a, value, 4);
-    if (address == 0x1005) program_word(0, value);
-    else if (address == 0x1009) program_word(1, value);
-    else if (address >= 0x100e && address <= 0x1012) program_word(2 + address - 0x100e, value);
-    else if (address == 0x1026) program_word(7, value);
-    else if (address == 0x103f) program_word(8, value);
-    else if (address >= 0x1040 && address < 0x1048) program_word(9 + address - 0x1040, value);
-    else if (address >= 0x1050 && address < 0x1058) program_word(17 + address - 0x1050, value);
+    if (address < 0x1000 || address >= 0x1058) return;
+    const auto& mapping = xf_mapping[address - 0x1000];
+    if (mapping.draw != 0xffff) draw_word(mapping.draw, value, mapping.group);
+    if (mapping.program != 0xffff) program_word(mapping.program, value);
 }
 
 std::uint64_t State::DrawRegisters::hash(bool batched) const {
@@ -79,24 +120,9 @@ bool State::DrawRegisters::matches(const DrawRegisters& other, bool batched) con
 void State::draw_word(unsigned index, std::uint32_t value, unsigned group) {
     auto& old = draw_registers_.words[index];
     if (old == value) return;
-    const auto hash = [index](std::uint32_t w) {
-        const std::uint64_t h = std::uint64_t{w} * ((std::uint64_t{index} + 1) * 0x9e3779b97f4a7c15ull);
-        return (h << 17) | (h >> 47);
-    };
-    draw_registers_.hashes[group] ^= hash(old) ^ hash(value);
+    draw_registers_.hashes[group] += (std::uint64_t{value} - old) * register_coefficients[index];
     old = value;
 }
-void State::draw_bp(std::uint8_t address, std::uint32_t value) {
-    if (address >= 0xe0 && address <= 0xe7) {
-        draw_word(value & 0x800000 ? address : 270 + address - 0xe0, value & 0x7fffff, value & 0x800000 ? 0 : 5);
-    } else if (address >= 0x80 && address < 0xc0) draw_word(address, value, 1);
-    else if (address >= 0xe8 && address <= 0xf2) draw_word(address, value, 3);
-    else if (address == 0 || (address >= 0x20 && address <= 0x22) || (address >= 0x30 && address <= 0x44) ||
-             address == 0x59 || address == 0x68) draw_word(address, value, 2);
-    else if ((address >= 6 && address < 0x20) || (address >= 0x25 && address < 0x30) ||
-             (address >= 0xc0 && address < 0xe0) || (address >= 0xf3 && address < 0xfe)) draw_word(address, value, 0);
-}
-
 std::uint32_t State::tev_register(bool konst, std::uint8_t half) const {
     if (half >= 8) {
         throw std::out_of_range("GX TEV register half");
