@@ -558,6 +558,7 @@ struct GlesDirect::Impl {
     unsigned draw_row_count = 0;
     // GXTransform and GXPost as last appended (its other fields unused); a draw's blocks start
     // as copies of them, so lanes its program does not read never differ.
+    // Each builder leaves its own built and retained fields equal.
     TransformUniforms shared_block{}, built_block{};
     struct { bool valid = false; std::uint64_t segment = 0; unsigned count = 0; std::uint32_t offset = 0; } last_matrices;
     struct { bool valid = false; std::uint64_t segment = 0, registers = 0, lights = 0, latch = 0; const Program* program = nullptr;
@@ -838,7 +839,6 @@ struct GlesDirect::Impl {
             return last_shared.offset;
         auto* built = reinterpret_cast<std::uint8_t*>(&built_block) + transform_shared_offset;
         auto* current = reinterpret_cast<std::uint8_t*>(&shared_block) + transform_shared_offset;
-        std::memcpy(built, current, transform_shared_bytes);
         direct_transform_shared(state, p.plan->transform, built_block);
         if (latch_used)
             for (unsigned k = 0; k < 9; ++k) built_block.latched_normal[k / 3][k % 3] = latch[k];
@@ -858,7 +858,6 @@ struct GlesDirect::Impl {
         if (last_post.valid && last_post.segment == segment && last_post.rows == rows && last_post.lights == state.xf_post_light_revision())
             return last_post.offset;
         const auto* xf = state.xf_data();
-        built_block.post = shared_block.post;
         for (unsigned row = 0; row < 64; ++row)
             if ((rows >> row) & 1) std::memcpy(built_block.post[row].data(), xf + 0x500 + row * 4, 16);
         std::uint32_t offset = last_post.offset;
