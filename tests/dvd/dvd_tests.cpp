@@ -2,15 +2,19 @@
 // directory and directory listings.
 #include "starlet/dvd/dvd.hpp"
 #include "starlet/os/game_memory.hpp"
+#include "starlet/os/guest_cpu.hpp"
 #include "starlet/os/os_core.hpp"
 #include "starlet/sdk/dvd.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <ftw.h>
@@ -72,6 +76,34 @@ std::vector<std::uint8_t> table() {
 
 int remove_entry(const char* path, const struct stat*, int, struct FTW*) { return std::remove(path); }
 
+}
+
+// A caller that polls the drive status until it reports idle finds its block final and its
+// callback run: the drive stays busy until the completion interrupt has delivered.
+int async_callbacks = 0;
+int async_reads() {
+    // Other interrupts (the game's retraces) wake a waiting status poll before the read's own.
+    static std::atomic<bool> stop{false};
+    std::thread retraces([] {
+        while (!stop) {
+            starlet::os::raise_interrupt([] {});
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    });
+    int unfinished = 0;
+    for (int i = 0; i < 300; ++i) {
+        DVDFileInfo file;
+        alignas(32) static u8 buffer[32];
+        DVDFastOpen(1, &file);
+        DVDReadAsyncPrio(&file, buffer, 32, 0, [](s32, DVDFileInfo*) { ++async_callbacks; }, 2);
+        while (DVDGetDriveStatus() != DVD_STATE_END) {}
+        if (file.cb.state != DVD_STATE_END) ++unfinished;
+    }
+    expect(unfinished == 0, "an idle drive has no block still busy");
+    expect(async_callbacks == 300, "every callback ran before the drive reported idle");
+    stop = true;
+    retraces.join();
+    return 0;
 }
 
 int main() {
@@ -150,6 +182,10 @@ int main() {
     expect(DVDFastOpenDir(1, &listing) == FALSE, "a file is not a directory");
     char missing[] = "/missing";
     expect(DVDOpenDir(missing, &listing) == FALSE, "no such directory");
+
+    const std::uintptr_t hints[] = {0x10000000, 0x20000000, 0x30000000};
+    starlet::os::set_stack_pool(std::size_t{16} << 20, 0x40000000, hints, 3);
+    starlet::os::run_main_thread(async_reads);
 
     nftw(root.c_str(), remove_entry, 16, FTW_DEPTH | FTW_PHYS);
     std::printf("%s\n", failures ? "dvd: failures" : "dvd: ok");

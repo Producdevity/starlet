@@ -117,7 +117,12 @@ public:
     }
     bool busy() {
         std::lock_guard<std::mutex> lock(mutex_);
-        return !queue_.empty() || active_;
+        return !queue_.empty() || active_ || completing_ > 0;
+    }
+    // After the completion interrupt ran: the block is final and its callback has returned.
+    void completed() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        --completing_;
     }
 
 private:
@@ -133,7 +138,13 @@ private:
             const s32 result = r.file ? read(r) : DVD_RESULT_GOOD;
             lock.lock();
             active_ = false;
-            os::raise_interrupt([r, result] { complete(r, result); });
+            // Busy until the interrupt completes the block: a caller that polls the drive status
+            // (Resident Evil 4's disc change, its block on the stack) must not return first.
+            ++completing_;
+            os::raise_interrupt([this, r, result] {
+                complete(r, result);
+                completed();
+            });
         }
     }
     static s32 read(const Request& r) {
@@ -163,6 +174,7 @@ private:
     std::deque<Request> queue_;
     bool started_ = false;
     bool active_ = false;
+    int completing_ = 0;
 };
 
 Drive& drive() {
