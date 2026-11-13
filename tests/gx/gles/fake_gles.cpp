@@ -20,6 +20,7 @@ std::map<GLuint, std::vector<unsigned char>> buffers;
 std::vector<unsigned char> split_vertices;
 std::vector<std::uint32_t> split_indices;
 unsigned static_buffer_uploads = 0, split_draws = 0;
+GLenum submitted_index_type = 0;
 
 bool track_uniforms=false;
 unsigned uniform_updates=0, negative_uniform_updates=0, transform_uploads=0;
@@ -247,6 +248,7 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices
             }
         }
     }
+    fake::submitted_index_type = type;
     ++fake::draws;fake::submitted_index_count=count;
     fake::draw_first = fake::first[fake::bound[3]];
     fake::draw_texture = fake::bound[3];

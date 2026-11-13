@@ -21,6 +21,7 @@ extern starlet::gx::TransformUniforms uploaded_transform;
 extern std::vector<unsigned char> submitted_vertices, split_vertices;
 extern std::vector<std::uint32_t> split_indices;
 extern unsigned split_draws, static_buffer_uploads;
+extern GLenum submitted_index_type;
 extern std::vector<std::uint16_t> submitted_indices;
 extern unsigned submitted_index_count;
 extern GLuint current_program;
@@ -1191,6 +1192,37 @@ void split_stream_geometry() {
     verify();
     check(fake::split_draws >= start + payloads.size(), "CPU cache eviction retains buffers until queued draws finish");
 }
+void large_split_stream_indices() {
+    struct Arrays : test::Memory {
+        std::vector<std::uint8_t> positions;
+        MemoryArrayView array_view(std::uint32_t address) override {
+            if (address != 0x1000) return {};
+            return {{positions.data(), positions.size()}, 0, false, 1};
+        }
+        SourceIdentity source_identity(const void* data, std::size_t) override { return {data, 1}; }
+    };
+    Fixture f; f.full_opaque_quad(); f.cp(0x50, (3u << 9) | (1u << 13)); f.cp(0x60, 0);
+    f.cp(0x70, 1u | (3u << 1) | (1u << 13) | (5u << 14));
+    f.cp(0xa0, 0x1000); f.cp(0xb0, 6); f.xf(0x103f, 0); f.bp(0, 0x10);
+    Arrays memory; memory.bytes = f.memory.bytes;
+    for (unsigned i = 0; i < 32768; ++i) memory.positions.insert(memory.positions.end(), {0,100,0,100,255,255});
+    std::vector<std::uint8_t> fifo;
+    for (unsigned i = 0; i < 65536; ++i) {
+        if (i == 32768) fifo.insert(fifo.end(), {0x80, 0x80, 0});
+        fifo.insert(fifo.end(), {static_cast<std::uint8_t>((i & 32767) >> 8), static_cast<std::uint8_t>(i),
+                               static_cast<std::uint8_t>(i >> 15), 32, 64, 255});
+    }
+    auto draw = f.command(); draw.vertices = {fifo.data(), fifo.size()}; draw.vertex_count = 32768;
+    const PrimitiveRun runs[] = {{0x80, 32768, 0}, {0x80, 32768, 32768 * 6 + 3}};
+    draw.runs = runs; draw.run_count = 2;
+    GlesLimits limits; limits.direct.geometry_min_vertices = 1000000;
+    GlesRenderer renderer(limits); const auto before = fake::split_draws;
+    renderer.draw_direct(f.decoder.state(), draw, memory); renderer.wait_until_idle();
+    check(fake::split_draws == before + 1 && fake::submitted_index_type == GL_UNSIGNED_INT,
+          "large merged streams use persistent 32-bit indices");
+    check(*std::max_element(fake::split_indices.begin(), fake::split_indices.end()) == 65535 && fake::split_vertices.size() == 65536 * 16,
+          "persistent indices address the last distinct tuple without narrowing the range");
+}
 void shared_state_snapshots() {
     GlesRenderer renderer; Fixture f; const auto draw = f.command();
     for (unsigned color = 0; color < 32; ++color) {
@@ -2165,6 +2197,7 @@ int main() {
         direct_state_plan_cache();
         direct_group_results();
         split_stream_geometry();
+        large_split_stream_indices();
         shared_state_snapshots();
         direct_full_matrix_block();
         direct_batched_zero_alpha();

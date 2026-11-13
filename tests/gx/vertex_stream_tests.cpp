@@ -428,6 +428,33 @@ void cached_gather_bounds() {
 }
 }
 
+void large_merged_tuple_updates() {
+    Fixture f; f.cp(0x50, (3u << 9) | (1u << 13));
+    f.cp(0x70, 1u | (3u << 1) | (1u << 13) | (5u << 14));
+    f.cp(0xa0, 0x1000); f.cp(0xb0, 6);
+    auto& positions = f.memory.regions[0x1000]; positions.resize(32768 * 6);
+    f.memory.generations[0x1000] = 1;
+    std::vector<std::uint8_t> fifo;
+    for (unsigned i = 0; i < 65536; ++i) {
+        if (i == 32768) fifo.insert(fifo.end(), {0x80, 0x80, 0});
+        fifo.insert(fifo.end(), {static_cast<std::uint8_t>((i & 32767) >> 8), static_cast<std::uint8_t>(i),
+                               static_cast<std::uint8_t>(i >> 15), 32, 64, 255});
+    }
+    const PrimitiveRun runs[] = {{0x80, 32768, 0}, {0x80, 32768, 32768 * 6 + 3}};
+    Draw draw; draw.primitive = 0x80; draw.vertex_count = 32768; draw.runs = runs; draw.run_count = 2;
+    draw.vertices = {fifo.data(), fifo.size()};
+    std::string error; require(f.decoder.state().vertex_layout(0, draw.layout, error), error);
+    const auto format = stream_format(draw.layout); StreamGeometry cached;
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        std::vector<std::uint8_t> vertices; std::vector<std::uint32_t> indices;
+        const auto reference = append_stream_vertices(f.decoder.state(), draw, f.memory, format, vertices, indices, 0);
+        const auto result = cached.update(f.decoder.state(), draw, f.memory, format);
+        require(reference && result && result.vertices == 65536, "flattened merged records retain a 32-bit count");
+        require(vertices == cached.vertices() && indices == cached.indices(), "large cold and changed gathers match fresh conversion");
+        positions[positions.size() - 5] = 16; ++f.memory.generations[0x1000];
+    }
+}
+
 int main() {
     try {
         eye_transform_parity();
@@ -437,6 +464,7 @@ int main() {
         partial_disable();
         changed_columns();
         merged_tuple_updates();
+        large_merged_tuple_updates();
         cached_gather_bounds();
         merged_runs();
     } catch (const std::exception& error) {

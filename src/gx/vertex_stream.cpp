@@ -332,12 +332,13 @@ StreamResult convert_records(const State& state, const Draw& draw, MemoryReader&
                              std::vector<std::uint8_t>& vertices, StreamArraySpans* spans, std::vector<std::uint8_t>& disabled,
                              std::uint16_t columns = 0xfff, bool overwrite = false,
                              const StreamArraySpans* known_spans = nullptr, const std::vector<std::uint8_t>* known_disabled = nullptr,
-                             std::array<float, 6>* bounds = nullptr) {
+                             std::array<float, 6>* bounds = nullptr, std::uint32_t records = 0) {
+    const std::uint32_t count = records ? records : draw.vertex_count;
     StreamResult result;
     auto fail = [&](VertexError error, const char* message) { result.error = error; result.message = message; return result; };
     const auto& layout = draw.layout;
     if (stream_format(layout) != format) return fail(VertexError::invalid_layout, "stream format does not match draw layout");
-    if ((draw.vertices.size && !draw.vertices.data) || draw.vertices.size != layout.stride * draw.vertex_count)
+    if ((draw.vertices.size && !draw.vertices.data) || draw.vertices.size != layout.stride * count)
         return fail(VertexError::invalid_input, "GX draw byte count does not match its vertex layout");
     for (const auto& a : layout.colors)
         if (a.mode != AttributeMode::none && ((a.format < 3) != (a.components == 3)))
@@ -400,7 +401,7 @@ StreamResult convert_records(const State& state, const Draw& draw, MemoryReader&
     for (unsigned t = 0; t < 8; ++t) add_numbers(layout.texcoords[t], 4 + t, false, format.texcoord_offset(t));
 
     const auto vertex_start = overwrite ? 0 : vertices.size();
-    vertices.resize(vertex_start + std::size_t{draw.vertex_count} * format.stride);
+    vertices.resize(vertex_start + std::size_t{count} * format.stride);
     auto restore = [&](VertexError error, const char* message) { vertices.resize(vertex_start); return fail(error, message); };
     disabled.clear();
     if (spans) *spans = known_spans ? *known_spans : StreamArraySpans{};
@@ -409,7 +410,7 @@ StreamResult convert_records(const State& state, const Draw& draw, MemoryReader&
     const bool sentinel_possible = indexed(layout.position) && !known_disabled;
     const unsigned sentinel = layout.position.mode == AttributeMode::index8 ? 255 : 65535;
     if (format.matrices || sentinel_possible) {
-        for (std::size_t i = 0; i < draw.vertex_count; ++i) {
+        for (std::size_t i = 0; i < count; ++i) {
             auto* out = vertices.data() + vertex_start + i * format.stride;
             const auto* cursor = draw.vertices.data + i * layout.stride;
             if (format.matrices) {
@@ -424,7 +425,7 @@ StreamResult convert_records(const State& state, const Draw& draw, MemoryReader&
             if (sentinel_possible) {
                 const unsigned position = layout.position.mode == AttributeMode::index8 ? cursor[0] : be16(cursor);
                 if (position == sentinel) {
-                    if (disabled.empty()) disabled.resize(draw.vertex_count);
+                    if (disabled.empty()) disabled.resize(count);
                     disabled[i] = 1;
                     std::memset(out, 0, format.matrices ? format.matrix_offset() : format.stride);
                 }
@@ -438,11 +439,11 @@ StreamResult convert_records(const State& state, const Draw& draw, MemoryReader&
         const auto& mask = known_disabled ? *known_disabled : disabled;
         const bool bounded = known_spans && known_spans->arrays[in.array].end > known_spans->arrays[in.array].first;
         const Column column{in, draw.vertices.data, layout.stride, vertices.data() + vertex_start, format.stride,
-                            draw.vertex_count, mask.empty() ? nullptr : mask.data(), arrays, bounded, in.array == 0 ? bounds : nullptr};
+                            count, mask.empty() ? nullptr : mask.data(), arrays, bounded, in.array == 0 ? bounds : nullptr};
         if (!column_function(in)(column))
             return restore(VertexError::memory_read, in.kind == Input::color ? "GX indexed color unavailable" : "GX indexed vertex data unavailable");
     }
-    result.vertices = draw.vertex_count;
+    result.vertices = count;
     return result;
 }
 }
@@ -492,7 +493,7 @@ StreamResult append_stream_vertices(const State& state, const Draw& draw, Memory
     const auto vertex_start = vertices.size();
     const auto index_start = indices.size();
     std::vector<std::uint8_t> disabled;
-    result = convert_records(state, flat, memory, format, vertices, spans, disabled, 0xfff, false, nullptr, nullptr, bounds);
+    result = convert_records(state, flat, memory, format, vertices, spans, disabled, 0xfff, false, nullptr, nullptr, bounds, draw.total_vertices());
     if (!result) return result;
     auto restore = [&](VertexError error, const char* message) {
         vertices.resize(vertex_start); indices.resize(index_start); return fail(error, message);
@@ -632,7 +633,7 @@ StreamResult StreamGeometry::update(const State& state, const Draw& draw, Memory
     } else if (changed_ || format.matrices) {
         std::vector<std::uint8_t> disabled;
         const auto result = convert_records(state, flat, memory, format, vertices_, &spans, disabled, changed_, true,
-                                            &known_spans, &disabled_, changed_ & 1 ? &bounds_ : nullptr);
+                                            &known_spans, &disabled_, changed_ & 1 ? &bounds_ : nullptr, result_.vertices);
         if (!result) result_ = result;
     }
     valid_ = bool(result_) && spans.viewed;
