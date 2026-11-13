@@ -4,6 +4,10 @@
 #include "starlet/gx/vertex.hpp"
 
 #include <cstring>
+#include <cmath>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace starlet::gx {
 
@@ -33,6 +37,33 @@ struct StreamFormat {
     bool operator!=(const StreamFormat& o) const { return !(*this == o); }
 };
 StreamFormat stream_format(const VertexLayout&);
+
+class StreamEyeTransform {
+public:
+    explicit StreamEyeTransform(const float matrix[12]);
+    void apply(const float position[3], float out[3]) const {
+#if defined(__aarch64__)
+        if (!nonfinite_ && std::isfinite(position[0]) && std::isfinite(position[1]) && std::isfinite(position[2])) {
+            // Preserve the scalar expression's fused-operation order.
+            auto eye = vmulq_n_f32(columns_[1], position[1]);
+            eye = vfmaq_n_f32(eye, columns_[0], position[0]);
+            eye = vfmaq_n_f32(eye, columns_[2], position[2]);
+            eye = vaddq_f32(eye, columns_[3]);
+            vst1_f32(out, vget_low_f32(eye));
+            vst1q_lane_f32(out + 2, eye, 2);
+            return;
+        }
+#endif
+        scalar(matrix_.data(), position, out);
+    }
+private:
+    [[gnu::noinline]] static void scalar(const float*, const float*, float*);
+    std::array<float, 12> matrix_;
+#if defined(__aarch64__)
+    float32x4_t columns_[4];
+    bool nonfinite_ = false;
+#endif
+};
 // 2^-fraction for a five-bit GX dequantization field; equals ldexp(1, -fraction).
 inline float fraction_scale(unsigned fraction) {
     const std::uint32_t bits = (127u - fraction) << 23;
@@ -67,7 +98,7 @@ struct StreamArraySpans {
 // lines and points are rejected. On failure both outputs are restored.
 StreamResult append_stream_vertices(const State&, const Draw&, MemoryReader&, const StreamFormat&,
                                     std::vector<std::uint8_t>& vertices, std::vector<std::uint32_t>& indices,
-                                    std::uint32_t first_index, StreamArraySpans* spans = nullptr);
+                                    std::uint32_t first_index, StreamArraySpans* spans = nullptr, std::array<float, 6>* bounds = nullptr);
 // The same records for a GX line or point draw, without indices; the caller expands
 // them (gx_line_point.hpp). Index-disabled vertices are rejected.
 StreamResult append_stream_records(const State&, const Draw&, MemoryReader&, const StreamFormat&,
@@ -81,6 +112,7 @@ public:
     const std::vector<std::uint8_t>& vertices() const { return vertices_; }
     const std::vector<std::uint32_t>& indices() const { return indices_; }
     std::uint16_t changed_columns() const { return changed_; }
+    const std::array<float, 6>& position_bounds() const { return bounds_; }
     std::size_t bytes() const;
 private:
     struct Array {
@@ -93,8 +125,10 @@ private:
     std::array<Array, 12> arrays_;
     std::vector<std::uint8_t> vertices_;
     std::vector<std::uint8_t> flattened_;
+    std::vector<std::uint8_t> disabled_;
     std::vector<std::uint32_t> indices_;
     StreamResult result_;
+    std::array<float, 6> bounds_{};
     std::uint16_t changed_ = 0;
     bool valid_ = false;
     unsigned updates_ = 0;

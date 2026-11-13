@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 #include <list>
 #include <map>
 #include <memory>
@@ -316,7 +317,52 @@ struct GlesDirect::Impl {
         std::vector<std::uint8_t> fifo;
         std::uint64_t generation = 0;
         StreamGeometry stream;
+        std::int32_t page = -1;
+        std::uint32_t static_offset = 0, index_offset = 0, payload = 0;
+        std::uint64_t dynamic_segment = 0;
+        std::uint32_t dynamic_offset = 0;
     };
+    struct StreamPage {
+        GLuint buffer = 0;
+        std::size_t capacity = 0, live = 0;
+        std::shared_ptr<std::vector<std::uint8_t>> data;
+    };
+    std::vector<StreamPage> stream_pages;
+    std::int32_t open_stream_page = -1;
+    std::vector<std::uint8_t> dynamic_vertices;
+    void seal_stream_page() {
+        if (open_stream_page < 0) return;
+        auto& page = stream_pages[open_stream_page];
+        pending.push_back([buffer = page.buffer, data = std::move(page.data)] {
+            glBindVertexArray(0);
+            glBindBuffer(GL_ARRAY_BUFFER, buffer);
+            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(data->size()), data->data(), GL_STATIC_DRAW);
+        });
+        open_stream_page = -1;
+    }
+    void release_stream(ConvertedGeometry& entry) {
+        if (entry.page < 0) return;
+        auto& page = stream_pages[entry.page];
+        page.live -= entry.payload;
+        if (!page.live) {
+            if (open_stream_page == entry.page) seal_stream_page();
+            retire_buffer(page.buffer);
+            page = {};
+        }
+        entry.page = -1;
+    }
+    void trim_stream_pages() {
+        std::size_t capacity = 0, live = 0, sparsest = stream_pages.size();
+        for (std::size_t i = 0; i < stream_pages.size(); ++i) {
+            const auto& page = stream_pages[i];
+            if (!page.buffer) continue;
+            capacity += page.capacity; live += page.live;
+            if (static_cast<std::int32_t>(i) != open_stream_page && (sparsest == stream_pages.size() ||
+                page.live * stream_pages[sparsest].capacity < stream_pages[sparsest].live * page.capacity)) sparsest = i;
+        }
+        if (sparsest == stream_pages.size() || capacity <= std::max<std::size_t>(16u << 20, live * 2 + (1u << 20))) return;
+        for (auto& entry : converted_geometry) if (entry.second.page == static_cast<std::int32_t>(sparsest)) release_stream(entry.second);
+    }
     std::unordered_map<SourceKey, ConvertedGeometry, SourceKeyHash> converted_geometry;
     std::size_t converted_bytes = 0;
     // Sources whose new entries are not reused in later frames, such as a model's list drawn
@@ -335,7 +381,55 @@ struct GlesDirect::Impl {
         std::int32_t base_vertex = 0;
         std::uint32_t index_offset = 0;
         bool short_indices = false;
+        bool split = false;
+        std::uint32_t static_offset = 0, dynamic_offset = 0;
     };
+    GeometryDraw stream_geometry(ConvertedGeometry& entry, const StreamFormat& format) {
+        const auto& converted = entry.stream.vertices();
+        const auto& elements = entry.stream.indices();
+        const auto count = converted.size() / format.stride;
+        const bool short_indices = count <= 65535;
+        if (entry.page < 0 || (entry.stream.changed_columns() & ~3u)) {
+            release_stream(entry);
+            const auto index_bytes = elements.size() * (short_indices ? 2 : 4);
+            const auto payload = ((converted.size() + 3) & ~std::size_t{3}) + index_bytes;
+            if (open_stream_page >= 0 && stream_pages[open_stream_page].capacity + payload > (1u << 20)) seal_stream_page();
+            if (open_stream_page < 0) {
+                std::size_t slot = 0;
+                while (slot < stream_pages.size() && stream_pages[slot].buffer) ++slot;
+                if (slot == stream_pages.size()) stream_pages.emplace_back();
+                stream_pages[slot] = {take(Kind::buffer), 0, 0, std::make_shared<std::vector<std::uint8_t>>()};
+                open_stream_page = static_cast<std::int32_t>(slot);
+            }
+            auto& page = stream_pages[open_stream_page];
+            entry.page = open_stream_page;
+            entry.static_offset = static_cast<std::uint32_t>(page.data->size());
+            page.data->insert(page.data->end(), converted.begin(), converted.end());
+            page.data->resize((page.data->size() + 3) & ~std::size_t{3});
+            entry.index_offset = static_cast<std::uint32_t>(page.data->size());
+            page.data->resize(page.data->size() + index_bytes);
+            if (short_indices) {
+                for (std::size_t i = 0; i < elements.size(); ++i) {
+                    const auto index = static_cast<std::uint16_t>(elements[i]);
+                    std::memcpy(page.data->data() + entry.index_offset + i * 2, &index, 2);
+                }
+            } else std::memcpy(page.data->data() + entry.index_offset, elements.data(), index_bytes);
+            entry.payload = static_cast<std::uint32_t>(payload);
+            page.capacity = page.data->size(); page.live += payload;
+            stats.static_stream_bytes += payload;
+        }
+        if (entry.dynamic_segment != segment || (entry.stream.changed_columns() & 3u)) {
+            const auto stride = 12u + format.normal_vectors * 12u;
+            entry.dynamic_offset = static_cast<std::uint32_t>(dynamic_vertices.size());
+            dynamic_vertices.resize(dynamic_vertices.size() + count * stride);
+            for (std::size_t i = 0; i < count; ++i)
+                std::memcpy(dynamic_vertices.data() + entry.dynamic_offset + i * stride, converted.data() + i * format.stride, stride);
+            entry.dynamic_segment = segment;
+            stats.vertex_bytes += count * stride;
+        }
+        return {stream_pages[entry.page].buffer, format, 0, entry.index_offset, short_indices, true,
+                entry.static_offset, entry.dynamic_offset};
+    }
     // Offsets of a draw's GXMatrices, GXTransform and GXPost blocks in the segment's
     // uniforms; post is no_block for programs without GXPost.
     static constexpr std::uint32_t no_block = ~0u;
@@ -359,6 +453,29 @@ struct GlesDirect::Impl {
         std::uint8_t texture_changes = 0xff;
         bool raster_changed = true;
     };
+    struct StateGroups { std::uint64_t raster = 0, textures = 0, tev = 0; };
+    struct DrawStateRecord {
+        std::uint32_t raster = 0, textures = 0;
+        TevUniforms tev;
+        StateGroups groups;
+        bool expanded = false;
+    };
+    struct DrawStateView {
+        const DirectRasterState& raster_state;
+        const TevUniforms& tev;
+        const decltype(DirectRasterState::raster)& raster;
+        const decltype(DirectRasterState::pixel_controls)& pixel_controls;
+        const decltype(DirectRasterState::alpha_write)& alpha_write;
+        const decltype(DirectRasterState::constant_alpha)& constant_alpha;
+        const decltype(DirectTextureState::coordinate_scale)& coordinate_scale;
+        const decltype(DirectTextureState::image_size)& image_size;
+        const decltype(DirectTextureState::indirect_scale)& indirect_scale;
+        const decltype(DirectTextureState::sampler_lod)& sampler_lod;
+        const decltype(DirectTextureState::indirect_rows)& indirect_rows;
+        const decltype(DirectTextureState::textures)& textures;
+        DrawStateView(const DirectRasterState& r, const DirectTextureState& t, const TevUniforms& v)
+            : raster_state(r), tev(v), raster(r.raster), pixel_controls(r.pixel_controls), alpha_write(r.alpha_write), constant_alpha(r.constant_alpha), coordinate_scale(t.coordinate_scale), image_size(t.image_size), indirect_scale(t.indirect_scale), sampler_lod(t.sampler_lod), indirect_rows(t.indirect_rows), textures(t.textures) {}
+    };
     // Everything one flush hands to the GL thread: GL work recorded since the last
     // flush runs first, then the draws, then deletions of objects they used.
     // Sources reported unchanged are still compared in full every 64th frame, staggered
@@ -368,9 +485,11 @@ struct GlesDirect::Impl {
         std::vector<std::function<void()>> before, after;
         std::vector<Program*> warm;
         std::vector<Record> records;
-        std::vector<DirectDrawState> states;
+        std::vector<DrawStateRecord> states;
+        std::vector<DirectRasterState> raster_states;
+        std::vector<DirectTextureState> texture_states;
         std::vector<Run> runs;
-        std::vector<std::uint8_t> vertices;
+        std::vector<std::uint8_t> vertices, dynamic_vertices;
         UniformBytes uniforms;
         std::vector<std::uint32_t> indices;
     };
@@ -446,61 +565,116 @@ struct GlesDirect::Impl {
     struct { bool valid = false; std::uint64_t segment = 0, lights = 0, rows = 0; std::uint32_t offset = 0; } last_post;
     std::vector<std::uint32_t> indices, words;
     std::vector<Record> records;
-    std::vector<DirectDrawState> states;
+    std::vector<DrawStateRecord> states;
+    std::vector<DirectRasterState> raster_states;
+    std::vector<DirectTextureState> texture_states;
+    DrawStateView state_view(std::uint32_t index) const {
+        const auto& entry = states[index];
+        return {raster_states[entry.raster], texture_states[entry.textures], entry.tev};
+    }
+    struct SnapshotSlot { std::uint64_t segment = 0, group = 0; std::uint32_t index = 0; bool expanded = false; };
+    std::array<SnapshotSlot, 512> raster_snapshots;
+    std::array<SnapshotSlot, 2048> texture_snapshots;
+    template<class T, std::size_t N>
+    std::uint32_t snapshot_group(std::array<SnapshotSlot, N>& slots, std::vector<T>& values,
+                                 std::uint64_t id, const T& value, bool expanded = false) {
+        auto& slot = slots[(id ^ (expanded ? (std::uint64_t{1} << 63) : 0)) % N];
+        if (slot.segment == segment && slot.group == id && slot.expanded == expanded) return slot.index;
+        const auto index = static_cast<std::uint32_t>(values.size());
+        values.push_back(value);
+        if constexpr (std::is_same_v<T, DirectRasterState>) {
+            if (expanded) values.back().raster.cull = 0;
+            ++stats.raster_snapshots;
+        } else ++stats.texture_snapshots;
+        stats.state_snapshot_bytes += sizeof(T);
+        slot = {segment, id, index, expanded};
+        return index;
+    }
+    std::uint64_t next_state_group = 1;
     std::vector<Run> runs;
     template<class Result, std::size_t N> struct GroupPlan {
-        const Program* program = nullptr;
-        std::uint64_t hash = 0;
+        std::uint64_t hash = 0, id = 0;
         TextureCmprModel cmpr{};
         std::array<std::uint32_t, N> words{};
         Result result;
+        bool valid = false;
     };
     std::array<GroupPlan<DirectRasterState, 32>, 256> raster_plans;
-    std::array<GroupPlan<DirectTextureState, 128>, 1024> texture_plans;
+    std::array<GroupPlan<DirectTextureState, 160>, 1024> texture_plans;
     template<class Result, std::size_t N, std::size_t Entries, class Build>
-    DrawStatus group_plan(std::array<GroupPlan<Result, N>, Entries>& cache, const Program& program,
+    DrawStatus group_plan(std::array<GroupPlan<Result, N>, Entries>& cache,
                           TextureCmprModel cmpr, const std::array<std::uint32_t, N>& words, Result& out, Build build,
-                          std::uint64_t& hits) {
-        std::uint64_t hash = reinterpret_cast<std::uintptr_t>(&program) >> 4;
+                          std::uint64_t& hits, std::uint64_t& id) {
+        std::uint64_t hash = 0;
         for (auto word : words) hash = (hash ^ word) * 0x100000001b3ull;
         auto& entry = cache[hash % cache.size()];
-        if (entry.program == &program && entry.hash == hash && entry.cmpr == cmpr && entry.words == words) {
+        if (entry.valid && entry.hash == hash && entry.cmpr == cmpr && entry.words == words) {
             out = entry.result;
+            id = entry.id;
             ++hits;
             return {};
         }
         const auto status = build(out);
         if (status) {
-            entry.program = &program; entry.hash = hash; entry.cmpr = cmpr;
+            entry.valid = true; entry.hash = hash; entry.cmpr = cmpr;
             entry.words = words; entry.result = out;
+            id = entry.id = next_state_group++;
         }
         return status;
     }
-    DrawStatus grouped_state(const State& state, const Program& program, TextureCmprModel cmpr, DirectDrawState& out) {
+    DrawStatus grouped_state(const State& state, const Program& program, TextureCmprModel cmpr, DirectDrawState& out, StateGroups& groups) {
         std::array<std::uint32_t, 32> raster{};
         unsigned n = 0;
         for (unsigned i = 0; i < 6; ++i) raster[n++] = state.xf(0x101a + i);
         for (auto address : {0, 0x20, 0x21, 0x22, 0x40, 0x41, 0x42, 0x43, 0x44, 0x59, 0x68})
-            raster[n++] = state.bp(address);
+            raster[n++] = state.bp(address) & (address == 0 ? 0x8c300u : address == 0x22 ? 1u << 22 :
+                                                  address == 0x44 ? 3u : address == 0x68 ? 1u : 0xffffffu);
         for (unsigned i = 0xe8; i <= 0xf2; ++i) raster[n++] = state.bp(i);
         raster[n++] = state.bp(0xf4); raster[n++] = state.bp(0xf5); raster[n++] = state.efb().height;
-        auto status = group_plan(raster_plans, program, cmpr, raster, static_cast<DirectRasterState&>(out),
+        raster[n++] = program.plan->fast | (program.plan->rgba6 << 1) | (program.plan->early_depth << 2) |
+                      (program.plan->needs_fetch << 3) | (program.plan->fog << 4);
+        auto status = group_plan(raster_plans, TextureCmprModel{}, raster, static_cast<DirectRasterState&>(out),
             [&](auto& result) { return plan_direct_raster(state, *program.plan, result, limits.guard_band, limits.fractional_viewport); },
-            stats.raster_plan_hits);
+            stats.raster_plan_hits, groups.raster);
         if (!status) return status;
-        std::array<std::uint32_t, 128> textures{};
+        std::array<std::uint32_t, 160> textures{};
         n = 0;
-        textures[n++] = state.bp(0);
-        for (unsigned i = 6; i < 0x20; ++i) textures[n++] = state.bp(i);
-        for (unsigned i = 0x25; i < 0x40; ++i) textures[n++] = state.bp(i);
-        for (unsigned i = 0x80; i < 0xc0; ++i) textures[n++] = state.bp(i);
+        const auto& plan = *program.plan;
+        textures[n++] = plan.fast | (std::uint32_t{plan.maps} << 1) |
+                        (std::uint32_t{plan.tev.stage_count} << 9) | (std::uint32_t{plan.indirect.lookup_mask} << 14);
+        unsigned coordinates = 0;
+        for (unsigned i = 0; i < 16; ++i) {
+            const bool sampled = i < plan.tev.stage_count && tev_stage_samples(plan.tev, i);
+            const auto& stage = plan.tev.stages[i];
+            textures[n++] = sampled ? 1u | (stage.texture_map << 1) | (stage.texture_coord << 4) : 0;
+            if (sampled) coordinates |= 1u << stage.texture_coord;
+        }
+        for (unsigned i = 0; i < 4; ++i) {
+            const auto& lookup = plan.indirect.lookups[i];
+            const bool active = plan.indirect.lookup_mask & (1u << i);
+            textures[n++] = active ? 1u | (lookup.map << 1) | (lookup.coordinate << 4) : 0;
+            if (active) coordinates |= 1u << lookup.coordinate;
+        }
+        if (plan.indirect.lookup_mask) {
+            textures[n++] = state.bp(0) & 0x70000;
+            for (unsigned i = 6; i < 0xf; ++i) textures[n++] = state.bp(i);
+            for (unsigned i = 0; i < 16; ++i) textures[n++] = i < plan.tev.stage_count ? state.bp(0x10 + i) : 0;
+            for (unsigned i = 0x25; i <= 0x27; ++i) textures[n++] = state.bp(i);
+        } else n += 29;
+        for (unsigned i = 0x30; i < 0x40; ++i)
+            textures[n++] = coordinates & (1u << ((i - 0x30) / 2)) ? state.bp(i) : 0;
+        for (unsigned i = 0x80; i < 0xc0; ++i) {
+            const auto map = (i & 3) + (i >= 0xa0 ? 4 : 0);
+            textures[n++] = (plan.maps & (1u << map)) && (i & 0x1f) < 0x1c ? state.bp(i) : 0;
+        }
         for (unsigned i = 0; i < 8; ++i) {
             const auto extent = state.texture_extent(i);
-            textures[n++] = extent.width | (std::uint32_t{extent.height} << 16);
+            textures[n++] = plan.maps & (1u << i) ? extent.width | (std::uint32_t{extent.height} << 16) : 0;
         }
         out.tev = capture_tev_uniforms(state);
-        return group_plan(texture_plans, program, cmpr, textures, static_cast<DirectTextureState&>(out),
-            [&](auto& result) { return plan_direct_textures(state, *program.plan, cmpr, result); }, stats.texture_plan_hits);
+        groups.tev = next_state_group++;
+        return group_plan(texture_plans, cmpr, textures, static_cast<DirectTextureState&>(out),
+            [&](auto& result) { return plan_direct_textures(state, *program.plan, cmpr, result); }, stats.texture_plan_hits, groups.textures);
     }
     struct StatePlan {
         const Program* program = nullptr;
@@ -508,6 +682,7 @@ struct GlesDirect::Impl {
         TextureCmprModel cmpr{};
         State::DrawRegisters registers;
         DirectDrawState state;
+        StateGroups groups;
         std::uint32_t index = 0;
         bool expanded = false;
     };
@@ -520,26 +695,37 @@ struct GlesDirect::Impl {
         if (cached.program == &program && cached.hash == hash && cached.cmpr == cmpr &&
             registers.matches(cached.registers, true)) {
             ++stats.state_hits;
-            if (cached.segment == segment && cached.expanded == expanded &&
-                (program.plan->batched || !std::memcmp(registers.words.data() + 270, cached.registers.words.data() + 270, 32))) {
+            const bool same_regular = !std::memcmp(registers.words.data() + 270, cached.registers.words.data() + 270, 32);
+            if (cached.segment == segment && cached.expanded == expanded && (program.plan->batched || same_regular)) {
                 index = cached.index;
                 ++stats.state_reuses;
                 return {};
             }
-            if (!program.plan->batched) cached.state.tev = capture_tev_uniforms(state);
+            if (!program.plan->batched && !same_regular) {
+                cached.state.tev = capture_tev_uniforms(state);
+                cached.groups.tev = next_state_group++;
+            }
+            if (!same_regular) {
+                std::copy_n(registers.words.data() + 270, 8, cached.registers.words.data() + 270);
+                cached.registers.hashes[5] = registers.hashes[5];
+            }
         } else {
             ++stats.state_misses;
             cached.program = nullptr;
             cached.state = {};
-            const auto status = grouped_state(state, program, cmpr, cached.state);
+            const auto status = grouped_state(state, program, cmpr, cached.state, cached.groups);
             if (!status) return status;
             cached.program = &program; cached.hash = hash; cached.cmpr = cmpr;
+            cached.registers = registers;
         }
-        cached.registers = registers;
         index = static_cast<std::uint32_t>(states.size());
-        states.push_back(cached.state);
+        const auto raster = snapshot_group(raster_snapshots, raster_states, cached.groups.raster,
+                                            static_cast<const DirectRasterState&>(cached.state), expanded);
+        const auto textures = snapshot_group(texture_snapshots, texture_states, cached.groups.textures,
+                                              static_cast<const DirectTextureState&>(cached.state));
+        states.push_back({raster, textures, cached.state.tev, cached.groups, expanded});
+        stats.state_snapshot_bytes += sizeof(DrawStateRecord);
         ++stats.state_plans;
-        if (expanded) states.back().raster.cull = 0;
         cached.segment = segment; cached.index = index; cached.expanded = expanded;
         return {};
     }
@@ -577,7 +763,7 @@ struct GlesDirect::Impl {
         return generation;
     }
     bool same_palettes(const State& state, const Program& p) const {
-        const auto& planned = states[last_state.index];
+        const auto planned = state_view(last_state.index);
         for (unsigned map = 0; map < 8; ++map) if (p.plan->maps & (1u << map))
             if (palette_generation(state, planned.textures[map]) != last_textures.palettes[map]) return false;
         return true;
@@ -692,7 +878,7 @@ struct GlesDirect::Impl {
     }
     std::vector<std::uint8_t> batch_vertices, expansion;
     void textures_changed() { last_textures.valid = false; batch.valid = false; }
-    GLuint vao = 0, vbo = 0, ibo = 0, ubo = 0;
+    GLuint vao = 0, vbo = 0, ibo = 0, ubo = 0, dynamic_vbo = 0;
     GLint uniform_alignment = 256;
     // GL-thread vertex arrays for resident geometry, by buffer and stream format.
     std::unordered_map<std::uint64_t, GLuint> geometry_vaos;
@@ -704,7 +890,7 @@ struct GlesDirect::Impl {
         run_gl([this] {
             glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &uniform_alignment);
             if (uniform_alignment <= 0) uniform_alignment = 256;
-            glGenVertexArrays(1, &vao); glGenBuffers(1, &vbo); glGenBuffers(1, &ibo); glGenBuffers(1, &ubo);
+            glGenVertexArrays(1, &vao); glGenBuffers(1, &vbo); glGenBuffers(1, &ibo); glGenBuffers(1, &ubo); glGenBuffers(1, &dynamic_vbo);
             glBindVertexArray(vao); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo); glBindVertexArray(0);
             program_cache = std::make_unique<GlesProgramCache>(limits.program_cache);
             gl_check("direct renderer initialization");
@@ -713,6 +899,8 @@ struct GlesDirect::Impl {
         }, true);
     }
     ~Impl() {
+        seal_stream_page();
+        for (auto& entry : converted_geometry) release_stream(entry.second);
         for (auto& g : geometries) delete_geometry(g);
         for (auto& g : retired_geometries) delete_geometry(g);
         try {
@@ -732,7 +920,7 @@ struct GlesDirect::Impl {
                 glDeleteBuffers(GLsizei(names.buffers.size()), names.buffers.data());
                 glDeleteSamplers(GLsizei(names.samplers.size()), names.samplers.data());
                 glDeleteFramebuffers(GLsizei(names.framebuffers.size()), names.framebuffers.data());
-                glDeleteBuffers(1, &vbo); glDeleteBuffers(1, &ibo); glDeleteBuffers(1, &ubo); glDeleteVertexArrays(1, &vao);
+                glDeleteBuffers(1, &vbo); glDeleteBuffers(1, &ibo); glDeleteBuffers(1, &ubo); glDeleteBuffers(1, &dynamic_vbo); glDeleteVertexArrays(1, &vao);
             }, true);
         } catch (...) {}
     }
@@ -918,12 +1106,18 @@ struct GlesDirect::Impl {
         const auto index = static_cast<std::uint32_t>(records.size() - 1);
         const bool grouped = instance_group.open && instance_group.record == index;
         // Games rewrite unchanged state between draws: a new plan with the same content is the same state.
+        const auto& before = states[last.state];
+        const auto& after = states[last_state.index];
         const bool same_state = last.state == last_state.index ||
-            !std::memcmp(&states[last.state], &states[last_state.index], sizeof(DirectDrawState));
+            (!std::memcmp(&raster_states[before.raster], &raster_states[after.raster], sizeof(DirectRasterState)) &&
+             !std::memcmp(&texture_states[before.textures], &texture_states[after.textures], sizeof(DirectTextureState)) &&
+             !std::memcmp(&before.tev, &after.tev, sizeof(TevUniforms)));
         if (!last.resident || !(last.program == &p || (grouped && last.program == p.instanced)) || !same_state ||
             last.textures != last_textures.textures || last.samplers != last_textures.samplers || last.latches != latches ||
             last.geometry.buffer != geometry.buffer || last.geometry.base_vertex != geometry.base_vertex ||
             last.geometry.index_offset != geometry.index_offset || last.geometry.short_indices != geometry.short_indices ||
+            last.geometry.split != geometry.split || last.geometry.static_offset != geometry.static_offset ||
+            last.geometry.dynamic_offset != geometry.dynamic_offset ||
             last.geometry.format != geometry.format || last.count != count || last.low != low || last.high != high ||
             last.blocks.shared != blocks.shared || last.blocks.post != blocks.post)
             return false;
@@ -1073,8 +1267,6 @@ struct GlesDirect::Impl {
             }
             if (batch.program == oldest->get()) batch.valid = false;
             for (auto& cached : state_plans) if (cached.program == oldest->get()) cached.program = nullptr;
-            for (auto& cached : raster_plans) if (cached.program == oldest->get()) cached.program = nullptr;
-            for (auto& cached : texture_plans) if (cached.program == oldest->get()) cached.program = nullptr;
             forget_program(oldest->get());
             // Queued segments may still draw with it; the GL thread deletes it after them.
             std::shared_ptr<Program> retired(oldest->release());
@@ -1499,12 +1691,14 @@ struct GlesDirect::Impl {
         geometry_key_hash = hash_words(k);
     }
     StreamResult append_converted(const State& state, const Draw& draw, MemoryReader& memory, const StreamFormat& format,
-                                  std::vector<std::uint8_t>& output, std::vector<std::uint32_t>& elements, std::uint32_t first) {
+                                  std::vector<std::uint8_t>& output, std::vector<std::uint32_t>& elements, std::uint32_t first,
+                                  std::array<float, 6>* object_bounds = nullptr, ConvertedGeometry** retained = nullptr) {
         const auto identity = memory.source_identity(draw.vertices.data, draw.vertices.size);
         if (!identity.generation || !limits.geometries)
-            return append_stream_vertices(state, draw, memory, format, output, elements, first);
+            return append_stream_vertices(state, draw, memory, format, output, elements, first, nullptr, object_bounds);
         build_geometry_key(state, draw, format, false);
         if (converted_bytes > 16 * 1024 * 1024 || converted_geometry.size() >= 4096) {
+            for (auto& entry : converted_geometry) release_stream(entry.second);
             converted_geometry.clear(); converted_bytes = 0;
         }
         auto& entry = converted_geometry[{identity.key, geometry_key_hash, draw.vertices.size}];
@@ -1513,6 +1707,7 @@ struct GlesDirect::Impl {
         if (entry.key != geometry_key ||
             ((entry.generation != identity.generation || frame % 64 == 0) &&
              (entry.fifo.size() != draw.vertices.size || std::memcmp(entry.fifo.data(), draw.vertices.data, draw.vertices.size)))) {
+            release_stream(entry);
             entry = {};
             entry.key = geometry_key;
             entry.fifo.assign(draw.vertices.data, draw.vertices.data + draw.vertices.size);
@@ -1537,6 +1732,11 @@ struct GlesDirect::Impl {
             if (!equal)
                 throw std::runtime_error("cached stream differs from scalar conversion");
             ++stats.stream_verified;
+        }
+        if (object_bounds) *object_bounds = entry.stream.position_bounds();
+        if (retained && result.vertices >= 8 && !format.registers) {
+            *retained = &entry;
+            return result;
         }
         const auto& converted = entry.stream.vertices();
         output.insert(output.end(), converted.begin(), converted.end());
@@ -1671,13 +1871,27 @@ struct GlesDirect::Impl {
     }
     // GL thread: the vertex array drawing geometry from buffer in format, shared
     // by every entry packed into that buffer.
-    GLuint geometry_vao(GLuint buffer, const StreamFormat& format) {
-        auto& name = geometry_vaos[(std::uint64_t{buffer} << 32) | format_key(format)];
+    GLuint geometry_vao(GLuint buffer, const StreamFormat& format, bool split = false) {
+        auto& name = geometry_vaos[(std::uint64_t{buffer} << 32) | format_key(format) | (split ? 1u << 31 : 0)];
         if (name) return name;
         glGenVertexArrays(1, &name);
         glBindVertexArray(name);
         glBindBuffer(GL_ARRAY_BUFFER, buffer);
         bind_format(format, 0);
+        if (split) {
+            const auto attribute = [&](GLuint index, GLint size, GLenum type, GLboolean normalized, GLuint offset, bool integer = false) {
+                if (integer) glVertexAttribIFormat(index, size, type, offset);
+                else glVertexAttribFormat(index, size, type, normalized, offset);
+                glVertexAttribBinding(index, index <= 3 ? 0 : 1);
+            };
+            attribute(0, 3, GL_FLOAT, GL_FALSE, 0);
+            for (unsigned i = 0; i < format.normal_vectors; ++i) attribute(1 + i, 3, GL_FLOAT, GL_FALSE, 12 + i * 12);
+            for (unsigned i = 0; i < 2; ++i) if (format.colors & (1u << i))
+                attribute(4 + i, 4, GL_UNSIGNED_BYTE, GL_TRUE, format.color_offset(i));
+            for (unsigned i = 0; i < 8; ++i) if (format.texcoords & (1u << i))
+                attribute(6 + i, 2, GL_FLOAT, GL_FALSE, format.texcoord_offset(i));
+            if (format.matrices) attribute(14, 3, GL_UNSIGNED_INT, GL_FALSE, format.matrix_offset(), true);
+        }
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buffer);
         glBindVertexArray(0);
         return name;
@@ -2093,13 +2307,13 @@ struct GlesDirect::Impl {
         if (!(batch.valid && batch.program == p && batch.segment == segment && batch.frame == frame &&
               batch.state == planned_index && batch.expanded == expanded && !limits.verify_textures)) {
             std::array<GLuint, 8> names{}, samplers_used{};
-            const auto& planned = states[planned_index];
+            const auto planned = state_view(planned_index);
             for (unsigned map = 0; map < 8; ++map) if (p->plan->maps & (1u << map)) {
                 names[map] = texture(state, map, planned.textures[map], memory, cmpr);
                 samplers_used[map] = sampler(planned.textures[map].sampler);
             }
             batch = {true, segment, frame, p, planned_index, names, samplers_used, expanded,
-                     batched_zero_alpha_exact(*p->plan, planned) ? batched_zero_alpha : 0u};
+                     batched_zero_alpha_exact(*p->plan, planned.raster_state) ? batched_zero_alpha : 0u};
         }
         // Batched programs read no position or normal matrix, and only the material lanes of
         // channels with a register material: blocks that differ elsewhere are shared.
@@ -2139,6 +2353,9 @@ struct GlesDirect::Impl {
         static_assert(sizeof registers == 32, "four signed RGBA registers");
         float m[12];
         std::memcpy(m, state.xf_data() + pn * 4, sizeof m);
+        const StreamEyeTransform eye_transform(m);
+        std::array<float, 6> eye_bounds{{INFINITY, INFINITY, INFINITY, -INFINITY, -INFINITY, -INFINITY}};
+        static const bool verify_eye = std::getenv("STARLET_VERIFY_STREAM") != nullptr;
         // Line and point records are expanded into quads after the eye transform.
         auto& target = expanded ? expansion : vertices;
         const auto at = expanded ? 0 : vertices.size();
@@ -2153,8 +2370,17 @@ struct GlesDirect::Impl {
             float position[3];
             std::memcpy(position, in, sizeof position);
             float eye[3];
-            for (unsigned k = 0; k < 3; ++k)
-                eye[k] = m[k * 4] * position[0] + m[k * 4 + 1] * position[1] + m[k * 4 + 2] * position[2] + m[k * 4 + 3];
+            eye_transform.apply(position, eye);
+            if (verify_eye) {
+                float reference[3];
+                for (unsigned k = 0; k < 3; ++k)
+                    reference[k] = m[k * 4] * position[0] + m[k * 4 + 1] * position[1] + m[k * 4 + 2] * position[2] + m[k * 4 + 3];
+                if (std::memcmp(reference, eye, sizeof eye)) throw std::runtime_error("SIMD eye transform differs from scalar");
+            }
+            for (unsigned k = 0; k < 3; ++k) {
+                eye_bounds[k] = std::min(eye_bounds[k], eye[k]);
+                eye_bounds[3 + k] = std::max(eye_bounds[3 + k], eye[k]);
+            }
             std::memcpy(out, eye, sizeof eye);
             if (one_depth) {
                 std::uint32_t bits;
@@ -2185,7 +2411,7 @@ struct GlesDirect::Impl {
         const auto first = expanded ? vertex_end : at;
         Program* drawn = batched_variant(*p, state, draw, batch.options | (one_depth ? batched_vertex_fog : 0u));
         static constexpr float identity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
-        if (added_indices && outside_clip(state, identity, bounds(vertices.data() + first, added, batched.stride))) {
+        if (added_indices && outside_clip(state, identity, expanded ? bounds(vertices.data() + first, added, batched.stride) : eye_bounds)) {
             vertices.resize(first);
             indices.resize(indices.size() - added_indices);
             ++stats.culled_draws;
@@ -2258,7 +2484,7 @@ struct GlesDirect::Impl {
             blocks.shared = shared_offset(state, p, latch_used);
             blocks.post = post_offset(state, p);
         }
-        const auto& planned = states[last_state.index];
+        const auto planned = state_view(last_state.index);
         if (limits.verify_textures || !(last_textures.valid && last_textures.bp == state.bp_revision() &&
               last_textures.segment == segment && last_textures.frame == frame && last_textures.program == &p)) {
             last_textures.textures.fill(0); last_textures.samplers.fill(0);
@@ -2345,14 +2571,25 @@ struct GlesDirect::Impl {
         auto& run = runs.back();
         const auto low = run.vertices;
         const auto at = vertices.size();
-        const auto result = append_converted(state, draw, memory, format, vertices, indices, run.vertices);
+        std::array<float, 6> object_bounds;
+        ConvertedGeometry* retained = nullptr;
+        const auto result = append_converted(state, draw, memory, format, vertices, indices, run.vertices, &object_bounds, &retained);
         if (!result) throw std::runtime_error(result.message);
-        if (result.indices && !format.matrices &&
-            outside_clip(state, state.matrix_index(0), bounds(vertices.data() + at, result.vertices, format.stride))) {
+        if (result.indices && !format.matrices && outside_clip(state, state.matrix_index(0), object_bounds)) {
             vertices.resize(at);
-            indices.resize(indices.size() - result.indices);
+            if (!retained) indices.resize(indices.size() - result.indices);
             ++stats.culled_draws;
             warm(p);
+            return check_segment();
+        }
+        if (retained) {
+            if (result.indices) {
+                const auto geometry = stream_geometry(*retained, format);
+                if (join_instances(p, state, draw, geometry, result.indices, 0, result.vertices - 1, latches, blocks)) return check_segment();
+                records.push_back({&p, true, geometry, last_state.index, blocks, 0, 0, result.indices, 0, result.vertices - 1,
+                                   last_textures.textures, last_textures.samplers, latches});
+            }
+            ++stats.draws;
             return check_segment();
         }
         run.vertices += result.vertices;
@@ -2380,7 +2617,7 @@ struct GlesDirect::Impl {
         records.push_back({&p, false, {}, state, blocks, run_index, first, count, low, high, bound, samplers_used, latches});
     }
     void check_segment() {
-        if (vertices.size() + indices.size() * 4 + uniforms.size() > limits.segment_bytes) flush();
+        if (vertices.size() + dynamic_vertices.size() + indices.size() * 4 + uniforms.size() > limits.segment_bytes) flush();
     }
     void bind_run(const Run& run) {
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -2413,7 +2650,7 @@ struct GlesDirect::Impl {
     static bool same(const RasterRect& a, const RasterRect& b) {
         return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
     }
-    void apply_raster(const DirectDrawState& s) {
+    void apply_raster(const DrawStateView& s) {
         const auto& r = s.raster;
         const bool fresh = !gl.valid;
         gl.valid = true;
@@ -2461,31 +2698,25 @@ struct GlesDirect::Impl {
         tev_colors = 1, alpha_reference = 2, z_bias = 4, constant_alpha = 8,
         fog_parameters = 16, coordinate_scales = 32, indirect = 64, lod_bias = 128
     };
-    static std::uint16_t uniform_changes(const DirectDrawState& a, const DirectDrawState& b) {
-        std::uint16_t changed = 0;
-        if (a.tev.registers != b.tev.registers || a.tev.konst != b.tev.konst) changed |= tev_colors;
-        if (a.tev.alpha_reference != b.tev.alpha_reference) changed |= alpha_reference;
-        if (a.tev.z_texture_bias != b.tev.z_texture_bias) changed |= z_bias;
-        if (a.constant_alpha != b.constant_alpha) changed |= constant_alpha;
-        if (std::memcmp(&a.raster.fog, &b.raster.fog, sizeof a.raster.fog)) changed |= fog_parameters;
-        if (a.coordinate_scale != b.coordinate_scale) changed |= coordinate_scales;
-        if (a.image_size != b.image_size || a.indirect_scale != b.indirect_scale || a.indirect_rows != b.indirect_rows) changed |= indirect;
-        if (a.sampler_lod != b.sampler_lod) changed |= lod_bias;
-        return changed;
+    static std::uint16_t uniform_changes(const StateGroups& a, const StateGroups& b) {
+        std::uint16_t changes = 0;
+        if (a.tev != b.tev) changes |= tev_colors | alpha_reference | z_bias;
+        if (a.raster != b.raster) changes |= constant_alpha | fog_parameters;
+        if (a.textures != b.textures) changes |= coordinate_scales | indirect | lod_bias;
+        return changes;
     }
     void prepare_record_changes() {
-        const DirectDrawState* previous = nullptr;
+        const DrawStateRecord* previous = nullptr;
         std::array<GLuint, 8> textures{}, samplers{};
         std::uint8_t bound = 0;
         for (auto& record : records) {
             const auto& state = states[record.state];
             auto& program = *record.program;
             if (program.uniform_record_segment == segment)
-                record.uniform_changes = uniform_changes(states[program.uniform_record_state], state);
+                record.uniform_changes = uniform_changes(states[program.uniform_record_state].groups, state.groups);
             program.uniform_record_segment = segment;
             program.uniform_record_state = record.state;
-            if (previous) record.raster_changed = previous->alpha_write != state.alpha_write ||
-                std::memcmp(&previous->raster, &state.raster, sizeof state.raster);
+            if (previous) record.raster_changed = previous->groups.raster != state.groups.raster || previous->expanded != state.expanded;
             previous = &state;
             record.texture_changes = 0;
             for (unsigned map = 0; map < 8; ++map) if (program.plan->maps & (1u << map)) {
@@ -2495,7 +2726,7 @@ struct GlesDirect::Impl {
             }
         }
     }
-    static void apply_fast_uniforms(Program& p, const DirectDrawState& s, std::uint16_t changes) {
+    static void apply_fast_uniforms(Program& p, const DrawStateView& s, std::uint16_t changes) {
         if (changes & tev_colors) for (unsigned i = 0; i < 4; ++i) {
             const auto& r = s.tev.registers[i]; const auto& k = s.tev.konst[i];
             if (p.registers[i].update(r)) glUniform4f(p.registers[i].location, r[0] / 255.0f, r[1] / 255.0f, r[2] / 255.0f, r[3] / 255.0f);
@@ -2525,7 +2756,7 @@ struct GlesDirect::Impl {
         if (changes & lod_bias) for (unsigned map = 0; map < 8; ++map) if ((p.plan->maps & (1u << map)) && p.bias[map].update({{s.sampler_lod[map][0]}}))
             glUniform1f(p.bias[map].location, s.sampler_lod[map][0]);
     }
-    static void apply_uniforms(Program& p, const DirectDrawState& s, std::uint16_t changes) {
+    static void apply_uniforms(Program& p, const DrawStateView& s, std::uint16_t changes) {
         if (p.plan->fast) return apply_fast_uniforms(p, s, changes);
         for (unsigned i = 0; i < 4; ++i) {
             const auto& r = s.tev.registers[i]; const auto& k = s.tev.konst[i];
@@ -2551,6 +2782,8 @@ struct GlesDirect::Impl {
     }
     void flush() {
         if (records.empty() && pending.empty() && retiring.empty() && warming.empty()) { reset_segment(); return; }
+        seal_stream_page();
+        trim_stream_pages();
         prepare_record_changes();
         std::shared_ptr<Segment> segment_data;
         {
@@ -2562,8 +2795,10 @@ struct GlesDirect::Impl {
         seg.before.swap(pending);
         seg.warm.swap(warming);
         seg.records.swap(records); seg.states.swap(states); seg.runs.swap(runs);
+        seg.raster_states.swap(raster_states); seg.texture_states.swap(texture_states);
         if (uniforms.size() < uniform_reach) uniforms.resize(uniform_reach);
         stats.uniform_bytes += uniforms.size();
+        seg.dynamic_vertices.swap(dynamic_vertices);
         seg.vertices.swap(vertices); seg.uniforms.swap(uniforms); seg.indices.swap(indices);
         reset_segment();
         seg.after.swap(retiring);
@@ -2579,13 +2814,19 @@ struct GlesDirect::Impl {
             if (!p->name && !p->rejected && builder && builder->running()) ready(*p);
         for (auto& op : seg.after) op();
         seg.before.clear(); seg.after.clear(); seg.warm.clear(); seg.records.clear(); seg.states.clear(); seg.runs.clear();
+        seg.dynamic_vertices.clear();
         seg.vertices.clear(); seg.uniforms.clear(); seg.indices.clear();
+        seg.raster_states.clear(); seg.texture_states.clear();
         std::lock_guard<std::mutex> lock(spare_mutex);
         if (spare_segments.size() < 4) spare_segments.push_back(segment_data);
     }
     void draw_segment(const Segment& seg) {
         ++gl_segments;
         const auto& records = seg.records; const auto& states = seg.states; const auto& runs = seg.runs;
+        if (!seg.dynamic_vertices.empty()) {
+            glBindBuffer(GL_ARRAY_BUFFER, dynamic_vbo);
+            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(seg.dynamic_vertices.size()), seg.dynamic_vertices.data(), GL_STREAM_DRAW);
+        }
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(seg.vertices.size()), seg.vertices.data(), GL_STREAM_DRAW);
         glBindVertexArray(vao);
@@ -2594,7 +2835,7 @@ struct GlesDirect::Impl {
         glBindBuffer(GL_UNIFORM_BUFFER, ubo);
         glBufferData(GL_UNIFORM_BUFFER, static_cast<GLsizeiptr>(seg.uniforms.size()), seg.uniforms.data(), GL_STREAM_DRAW);
         const bool depth = std::any_of(records.begin(), records.end(), [&](const Record& r) {
-            const auto& raster = states[r.state].raster;
+            const auto& raster = seg.raster_states[states[r.state].raster].raster;
             return raster.depth_test && (raster.depth_compare != 7 || raster.depth_write);
         });
         fixed_state(depth);
@@ -2625,8 +2866,12 @@ struct GlesDirect::Impl {
             if (program != r.program) {
                 glUseProgram(r.program->name); program = r.program;
             }
-            const auto vertex_array = r.resident ? geometry_vao(r.geometry.buffer, r.geometry.format) : vao;
+            const auto vertex_array = r.resident ? geometry_vao(r.geometry.buffer, r.geometry.format, r.geometry.split) : vao;
             if (bound_vao != vertex_array) { glBindVertexArray(vertex_array); bound_vao = vertex_array; }
+            if (r.resident && r.geometry.split) {
+                glBindVertexBuffer(0, dynamic_vbo, r.geometry.dynamic_offset, 12 + r.geometry.format.normal_vectors * 12);
+                glBindVertexBuffer(1, r.geometry.buffer, r.geometry.static_offset, r.geometry.format.stride);
+            }
             if (!r.resident && run != r.run) { bind_run(runs[r.run]); run = r.run; }
             const auto& format = r.resident ? r.geometry.format : runs[r.run].format;
             if (!format.matrices && latches != r.latches) {
@@ -2642,7 +2887,8 @@ struct GlesDirect::Impl {
             if (r.instances)
                 glBindBufferRange(GL_UNIFORM_BUFFER, 1, ubo, r.instance_offset,
                                   static_cast<GLsizeiptr>(r.instances) * transform_instance_rows * 16);
-            const auto& s = states[r.state];
+            const auto& entry = states[r.state];
+            const DrawStateView s(seg.raster_states[entry.raster], seg.texture_states[entry.textures], entry.tev);
             if (!raster_current || (state != r.state && r.raster_changed)) apply_raster(s);
             state = r.state; raster_current = true;
             apply_uniforms(*r.program, s, r.program->uniform_chain_valid ? r.uniform_changes : 0xffff);
@@ -2682,6 +2928,7 @@ struct GlesDirect::Impl {
     }
     void reset_segment() {
         vertices.clear(); indices.clear(); uniforms.clear(); records.clear(); states.clear(); runs.clear();
+        raster_states.clear(); texture_states.clear();
         for (auto& g : retired_geometries) delete_geometry(g);
         retired_geometries.clear();
         ++segment;

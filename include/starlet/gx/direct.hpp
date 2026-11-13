@@ -105,6 +105,6 @@ DrawStatus plan_direct_state(const State&, const DirectProgram&, TextureCmprMode
 // destination times one or one minus source alpha, and neither depth (GL writes it only while
 // testing) nor alpha is written.
 // Such a fragment then blends to exactly the destination (direct.md).
-bool batched_zero_alpha_exact(const DirectProgram&, const DirectDrawState&);
+bool batched_zero_alpha_exact(const DirectProgram&, const DirectRasterState&);
 
 } // namespace starlet::gx

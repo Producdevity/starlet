@@ -18,7 +18,9 @@ namespace fake {
 extern bool track_uniforms;
 extern unsigned uniform_updates, negative_uniform_updates, transform_uploads;
 extern starlet::gx::TransformUniforms uploaded_transform;
-extern std::vector<unsigned char> submitted_vertices;
+extern std::vector<unsigned char> submitted_vertices, split_vertices;
+extern std::vector<std::uint32_t> split_indices;
+extern unsigned split_draws, static_buffer_uploads;
 extern std::vector<std::uint16_t> submitted_indices;
 extern unsigned submitted_index_count;
 extern GLuint current_program;
@@ -1096,22 +1098,110 @@ void direct_group_results() {
     check(after.raster_plan_hits == before.raster_plan_hits + 1 &&
           after.texture_plan_hits == before.texture_plan_hits + 1,
           "alpha-reference changes reuse independent raster and texture results");
-    const auto image = f.decoder.state().bp(0x88);
-    f.bp(0x88, image ^ 1);
+    const auto image = f.decoder.state().bp(0x83);
+    f.bp(0x83, image ^ 1);
     renderer.draw_direct(f.decoder.state(), draw, f.memory);
     before = renderer.stats().direct;
     check(before.raster_plan_hits == after.raster_plan_hits + 1 && before.texture_plan_hits == after.texture_plan_hits,
           "texture changes preserve raster results but rebuild texture descriptors");
-    f.bp(0x88, image);
+    f.bp(0x83, image);
     renderer.draw_direct(f.decoder.state(), draw, f.memory);
     after = renderer.stats().direct;
     check(after.state_plans == before.state_plans && after.state_reuses == before.state_reuses + 1,
           "returning to a state reuses its retained segment index without another copy");
+    f.bp(0x88, f.decoder.state().bp(0x88) ^ 1);
+    renderer.draw_direct(f.decoder.state(), draw, f.memory);
+    before = renderer.stats().direct;
+    check(before.texture_plan_hits == after.texture_plan_hits + 1 && before.raster_plan_hits == after.raster_plan_hits + 1,
+          "an unused texture map preserves both planning groups");
+    after = before;
     f.f(0x101c, 8388608);
     renderer.draw_direct(f.decoder.state(), draw, f.memory);
     before = renderer.stats().direct;
     check(before.texture_plan_hits == after.texture_plan_hits + 1 && before.raster_plan_hits == after.raster_plan_hits,
           "viewport changes preserve texture results and rebuild raster state");
+    f.bp(0xc0, f.decoder.state().bp(0xc0) ^ 1);
+    renderer.draw_direct(f.decoder.state(), draw, f.memory);
+    after = renderer.stats().direct;
+    check(after.raster_plan_hits == before.raster_plan_hits + 1 && after.texture_plan_hits == before.texture_plan_hits + 1,
+          "programs with equal raster and sampling policies share group results");
+    before = after;
+    f.bp(0x22, f.decoder.state().bp(0x22) ^ 1);
+    f.bp(0x3e, f.decoder.state().bp(0x3e) ^ 1);
+    f.bp(0x10, f.decoder.state().bp(0x10) ^ 1);
+    renderer.draw_direct(f.decoder.state(), draw, f.memory);
+    after = renderer.stats().direct;
+    check(after.raster_plan_hits == before.raster_plan_hits + 1 && after.texture_plan_hits == before.texture_plan_hits + 1,
+          "triangle line width and unused coordinate or indirect controls preserve group results");
+    renderer.wait_until_idle();
+}
+void split_stream_geometry() {
+    struct Arrays : test::Memory {
+        std::vector<std::uint8_t> positions;
+        std::uint64_t generation = 1;
+        MemoryArrayView array_view(std::uint32_t address) override {
+            if (address != 0x1000 && address != 0x2000) return {};
+            return {{positions.data(), positions.size()}, 0, false, generation};
+        }
+        SourceIdentity source_identity(const void* data, std::size_t) override { return {data, generation}; }
+    };
+    GlesLimits limits; limits.direct.geometry_min_vertices = 100000;
+    GlesRenderer renderer(limits); Fixture f; Arrays memory; memory.bytes = f.memory.bytes;
+    const auto original = f.vertices;
+    f.cp(0x50, (2u << 9) | (1u << 13)); f.cp(0xa0, 0x1000); f.cp(0xb0, 12);
+    f.vertices.clear();
+    for (unsigned repeat = 0; repeat < 3; ++repeat) for (unsigned v = 0; v < 4; ++v) {
+        f.vertices.push_back(v);
+        f.vertices.insert(f.vertices.end(), original.begin() + v * 32 + 12, original.begin() + (v + 1) * 32);
+        f.vertices[f.vertices.size() - 20] ^= repeat;
+    }
+    for (unsigned v = 0; v < 4; ++v)
+        memory.positions.insert(memory.positions.end(), original.begin() + v * 32, original.begin() + v * 32 + 12);
+    auto draw = f.command(); draw.vertex_count = 12;
+    const auto verify = [&] {
+        renderer.draw_direct(f.decoder.state(), draw, memory); renderer.wait_until_idle();
+        std::vector<std::uint8_t> vertices; std::vector<std::uint32_t> indices;
+        const auto format = stream_format(draw.layout);
+        check(bool(append_stream_vertices(f.decoder.state(), draw, memory, format, vertices, indices, 0)), "fresh split reference");
+        check(indices.size() == fake::split_indices.size(), "persistent split index count");
+        for (std::size_t i = 0; i < indices.size(); ++i)
+            check(!std::memcmp(vertices.data() + indices[i] * format.stride,
+                               fake::split_vertices.data() + fake::split_indices[i] * format.stride, format.stride),
+                  "split vertex fetch matches fresh interleaved conversion");
+    };
+    const auto start = fake::split_draws;
+    verify(); const auto uploads = fake::static_buffer_uploads;
+    check(fake::split_draws == start + 1, "cached twelve-vertex draw uses split GPU streams");
+    verify();
+    check(fake::static_buffer_uploads == uploads, "unchanged static attributes and indices stay on GPU");
+    memory.positions[3] ^= 1; ++memory.generation; verify();
+    check(fake::static_buffer_uploads == uploads, "position changes stream only the dynamic prefix");
+    f.cp(0xa0, 0x2000); verify();
+    check(fake::static_buffer_uploads == uploads, "moving equal array bases retains static GPU data");
+    f.vertices[1] ^= 1; ++memory.generation; verify();
+    check(fake::static_buffer_uploads == uploads + 1, "payload mutation replaces immutable static data and indices");
+    draw.primitive = 0x90; verify();
+    check(fake::static_buffer_uploads == uploads + 2, "topology change gets independent persistent indices");
+    std::vector<std::vector<std::uint8_t>> payloads(4100, f.vertices);
+    for (const auto& payload : payloads) {
+        auto next = draw; next.vertices = {payload.data(), payload.size()};
+        renderer.draw_direct(f.decoder.state(), next, memory);
+    }
+    renderer.wait_until_idle();
+    verify();
+    check(fake::split_draws >= start + payloads.size(), "CPU cache eviction retains buffers until queued draws finish");
+}
+void shared_state_snapshots() {
+    GlesRenderer renderer; Fixture f; const auto draw = f.command();
+    for (unsigned color = 0; color < 32; ++color) {
+        f.bp(0xe2, color | (color << 12));
+        renderer.draw_direct(f.decoder.state(), draw, f.memory);
+    }
+    const auto stats = renderer.stats().direct;
+    check(stats.state_plans == 32 && stats.raster_snapshots == 1 && stats.texture_snapshots == 1,
+          "per-draw TEV changes share immutable raster and texture snapshots");
+    check(stats.state_snapshot_bytes < stats.state_plans * sizeof(DirectDrawState) / 4,
+          "retained state copies are bounded by shared groups and compact draw values");
     renderer.wait_until_idle();
 }
 void direct_batched_normals() {
@@ -2074,6 +2164,8 @@ int main() {
         direct_uniform_deltas();
         direct_state_plan_cache();
         direct_group_results();
+        split_stream_geometry();
+        shared_state_snapshots();
         direct_full_matrix_block();
         direct_batched_zero_alpha();
         direct_batched_vertex_fog();

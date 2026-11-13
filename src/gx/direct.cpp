@@ -384,7 +384,7 @@ DrawStatus plan_direct_state(const State& state, const DirectProgram& program, T
     return plan_direct_textures(state, program, cmpr, out);
 }
 
-bool batched_zero_alpha_exact(const DirectProgram& program, const DirectDrawState& s) {
+bool batched_zero_alpha_exact(const DirectProgram& program, const DirectRasterState& s) {
     const auto& r = s.raster;
     return program.fast && !program.constant_alpha && fast_alpha_test(program.tev) && r.blend && !r.subtract && !r.premultiply &&
            r.source_factor == 4 && (r.destination_factor == 1 || r.destination_factor == 5) && !(r.depth_test && r.depth_write) &&

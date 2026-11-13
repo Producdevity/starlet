@@ -9,7 +9,18 @@
 #include <string>
 #include <cstring>
 #include <vector>
+#include <stdexcept>
 namespace fake {
+struct VertexBinding { GLuint buffer = 0; GLintptr offset = 0; GLsizei stride = 0; };
+struct VertexAttribute { bool enabled = false, integer = false; GLuint binding = 0, offset = 0; GLint size = 0; GLenum type = 0; GLboolean normalized = false; };
+struct VertexArray { GLuint elements = 0; bool split = false; std::array<VertexBinding, 16> bindings; std::array<VertexAttribute, 16> attributes; };
+GLuint vertex_array = 0, array_buffer = 0;
+std::map<GLuint, VertexArray> vertex_arrays;
+std::map<GLuint, std::vector<unsigned char>> buffers;
+std::vector<unsigned char> split_vertices;
+std::vector<std::uint32_t> split_indices;
+unsigned static_buffer_uploads = 0, split_draws = 0;
+
 bool track_uniforms=false;
 unsigned uniform_updates=0, negative_uniform_updates=0, transform_uploads=0;
 starlet::gx::TransformUniforms uploaded_transform{};
@@ -104,6 +115,8 @@ extern "C" {
 void glActiveTexture(GLenum texture) { fake::active = texture - GL_TEXTURE0; }
 void glAttachShader(GLuint program, GLuint shader) {}
 void glBindBuffer(GLenum target, GLuint buffer) {
+    if (target == GL_ARRAY_BUFFER) fake::array_buffer = buffer;
+    if (target == GL_ELEMENT_ARRAY_BUFFER) fake::vertex_arrays[fake::vertex_array].elements = buffer;
     if (target == GL_PIXEL_PACK_BUFFER)
         fake::pack_buffer = buffer;
     if (target == GL_PIXEL_UNPACK_BUFFER)
@@ -124,7 +137,7 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
     fake::uniform_bindings[index] = {offset, size};
     if (index == 1) { fake::instance_offset = offset; fake::instance_size = size; }
 }
-void glDisableVertexAttribArray(GLuint index) {}
+void glDisableVertexAttribArray(GLuint index) { fake::vertex_arrays[fake::vertex_array].attributes.at(index).enabled = false; }
 void glVertexAttrib4f(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {}
 void glVertexAttribI4ui(GLuint index, GLuint x, GLuint y, GLuint z, GLuint w) { if (index == 14) fake::matrix_latches = {x, y, z, w}; }
 void glBindFramebuffer(GLenum target, GLuint framebuffer) {
@@ -140,7 +153,21 @@ void glGetTexParameteriv(GLenum, GLenum, GLint* params) { *params = 0; }
 void glBindRenderbuffer(GLenum target, GLuint renderbuffer) {}
 void glBindSampler(GLuint unit, GLuint sampler) { fake::samplers[unit] = sampler; }
 void glBindTexture(GLenum target, GLuint texture) { fake::bound[fake::active] = texture; }
-void glBindVertexArray(GLuint array) {}
+void glBindVertexArray(GLuint array) { fake::vertex_array = array; }
+void glBindVertexBuffer(GLuint binding, GLuint buffer, GLintptr offset, GLsizei stride) {
+    fake::vertex_arrays[fake::vertex_array].bindings.at(binding) = {buffer, offset, stride};
+}
+void glVertexAttribBinding(GLuint index, GLuint binding) {
+    auto& vao = fake::vertex_arrays[fake::vertex_array]; vao.split = true; vao.attributes.at(index).binding = binding;
+}
+void glVertexAttribFormat(GLuint index, GLint size, GLenum type, GLboolean normalized, GLuint offset) {
+    auto& a = fake::vertex_arrays[fake::vertex_array].attributes.at(index);
+    a.size = size; a.type = type; a.normalized = normalized; a.offset = offset; a.integer = false;
+}
+void glVertexAttribIFormat(GLuint index, GLint size, GLenum type, GLuint offset) {
+    glVertexAttribFormat(index, size, type, GL_FALSE, offset);
+    fake::vertex_arrays[fake::vertex_array].attributes.at(index).integer = true;
+}
 void glBlendEquation(GLenum mode) {}
 void glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha) {}
 void glFrontFace(GLenum) {}
@@ -153,6 +180,12 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
                        GLint dstY1, GLbitfield mask, GLenum filter) { ++fake::blits; }
 void glBufferSubData(GLenum, GLintptr, GLsizeiptr, const void*) {}
 void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
+    if (target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER) {
+        const auto name = target == GL_ARRAY_BUFFER ? fake::array_buffer : fake::vertex_arrays[fake::vertex_array].elements;
+        auto& bytes = fake::buffers[name]; bytes.resize(size);
+        if (data && size) std::memcpy(bytes.data(), data, size);
+        if (usage == GL_STATIC_DRAW) ++fake::static_buffer_uploads;
+    }
     if(data && target==GL_ARRAY_BUFFER) fake::submitted_vertices.assign(static_cast<const unsigned char*>(data),static_cast<const unsigned char*>(data)+size);
     if(target==GL_ELEMENT_ARRAY_BUFFER) fake::element_bytes=size;
     if(data && target==GL_ELEMENT_ARRAY_BUFFER) fake::submitted_indices.assign(static_cast<const std::uint16_t*>(data),static_cast<const std::uint16_t*>(data)+size/2);
@@ -173,17 +206,47 @@ void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha
 void glCompileShader(GLuint shader) {}
 GLuint glCreateProgram(void) { return ++fake::next; }
 GLuint glCreateShader(GLenum type) { return ++fake::next; }
-void glDeleteBuffers(GLsizei n, const GLuint *buffers) {}
+void glDeleteBuffers(GLsizei n, const GLuint *buffers) { for (GLsizei i = 0; i < n; ++i) fake::buffers.erase(buffers[i]); }
 void glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers) {}
 void glDeleteProgram(GLuint program) {}
 void glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers) {}
 void glDeleteShader(GLuint shader) {}
 void glDeleteSync(GLsync sync) {}
 void glDeleteTextures(GLsizei n, const GLuint *textures) {}
-void glDeleteVertexArrays(GLsizei n, const GLuint *arrays) {}
+void glDeleteVertexArrays(GLsizei n, const GLuint *arrays) { for (GLsizei i = 0; i < n; ++i) fake::vertex_arrays.erase(arrays[i]); }
 void glDepthMask(GLboolean flag) { fake::depth_mask = flag; }
 void glDisable(GLenum cap) { if (cap == GL_DEPTH_TEST) fake::depth_test = GL_FALSE; }
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+    const auto& vao = fake::vertex_arrays[fake::vertex_array];
+    if (vao.split) {
+        ++fake::split_draws;
+        const auto& elements = fake::buffers.at(vao.elements);
+        const auto offset = reinterpret_cast<std::uintptr_t>(indices);
+        const auto unit = type == GL_UNSIGNED_SHORT ? 2u : 4u;
+        if (offset + count * unit > elements.size()) throw std::runtime_error("split indices outside buffer");
+        fake::split_indices.resize(count);
+        for (GLsizei i = 0; i < count; ++i) {
+            std::uint32_t index = 0; std::memcpy(&index, elements.data() + offset + i * unit, unit); fake::split_indices[i] = index;
+        }
+        const auto vertices = *std::max_element(fake::split_indices.begin(), fake::split_indices.end()) + 1;
+        const auto& statics = vao.bindings[1];
+        const auto& data = fake::buffers.at(statics.buffer);
+        if (statics.offset + vertices * statics.stride > data.size()) throw std::runtime_error("split static vertices outside buffer");
+        fake::split_vertices.assign(data.begin() + statics.offset, data.begin() + statics.offset + vertices * statics.stride);
+        for (unsigned i = 0; i < 16; ++i) {
+            const auto& a = vao.attributes[i]; if (!a.enabled) continue;
+            if (i == 4 || i == 5) { if (a.type != GL_UNSIGNED_BYTE || !a.normalized || a.integer) throw std::runtime_error("split color format"); }
+            if (i == 14 && (!a.integer || a.type != GL_UNSIGNED_INT)) throw std::runtime_error("split matrix format");
+            if (a.binding) continue;
+            const auto& dynamic = vao.bindings[0]; const auto& bytes = fake::buffers.at(dynamic.buffer);
+            const auto size = a.size * (a.type == GL_FLOAT || a.type == GL_UNSIGNED_INT ? 4 : a.type == GL_SHORT ? 2 : 1);
+            for (unsigned v = 0; v < vertices; ++v) {
+                if (dynamic.offset + v * dynamic.stride + a.offset + size > bytes.size()) throw std::runtime_error("split dynamic vertices outside buffer");
+                std::memcpy(fake::split_vertices.data() + v * statics.stride + a.offset,
+                            bytes.data() + dynamic.offset + v * dynamic.stride + a.offset, size);
+            }
+        }
+    }
     ++fake::draws;fake::submitted_index_count=count;
     fake::draw_first = fake::first[fake::bound[3]];
     fake::draw_texture = fake::bound[3];
@@ -196,7 +259,7 @@ void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, 
     ++fake::instanced_draws; fake::instance_count = static_cast<unsigned>(instances); glDrawElements(mode, count, type, indices);
 }
 void glEnable(GLenum cap) { if (cap == GL_DEPTH_TEST) fake::depth_test = GL_TRUE; }
-void glEnableVertexAttribArray(GLuint index) {}
+void glEnableVertexAttribArray(GLuint index) { fake::vertex_arrays[fake::vertex_array].attributes.at(index).enabled = true; }
 GLsync glFenceSync(GLenum condition, GLbitfield flags) { return reinterpret_cast<GLsync>(++fake::next); }
 void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {}
 void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {

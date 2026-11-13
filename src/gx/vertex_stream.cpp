@@ -9,6 +9,21 @@
 #endif
 
 namespace starlet::gx {
+StreamEyeTransform::StreamEyeTransform(const float matrix[12]) {
+    std::copy_n(matrix, 12, matrix_.data());
+#if defined(__aarch64__)
+    for (auto value : matrix_) nonfinite_ |= !std::isfinite(value);
+    for (unsigned column = 0; column < 4; ++column) {
+        const float values[4] = {matrix[column], matrix[4 + column], matrix[8 + column], 0};
+        columns_[column] = vld1q_f32(values);
+    }
+#endif
+}
+void StreamEyeTransform::scalar(const float* m, const float* position, float* out) {
+    for (unsigned k = 0; k < 3; ++k)
+        out[k] = m[k * 4] * position[0] + m[k * 4 + 1] * position[1] + m[k * 4 + 2] * position[2] + m[k * 4 + 3];
+}
+
 namespace {
 constexpr std::size_t numeric_size[] = {1, 1, 2, 2, 4};
 constexpr std::size_t color_size[] = {2, 3, 4, 2, 3, 4};
@@ -80,16 +95,19 @@ struct InPlace {
     const std::uint8_t* data = nullptr; // Null: every read takes Arrays::read.
     std::size_t size = 0, first = std::numeric_limits<std::size_t>::max(), end = 0;
     bool native = false;
-    explicit InPlace(const Input& in) {
+    bool bounded = false;
+    explicit InPlace(const Input& in, bool known_span = false) {
         const unsigned native_unit = in.host_order ? in.unit : in.native_unit;
         if (!in.data || (native_unit && (native_unit != in.unit || ((in.stride | in.element_bytes) & (in.unit - 1u))))) return;
         data = in.data;
         size = in.size;
         native = native_unit != 0;
+        bounded = known_span;
     }
     // Null when the element needs Arrays::read.
     const std::uint8_t* find(const Input& in, std::uint16_t element, std::size_t offset, std::size_t bytes) {
         const std::size_t relative = std::size_t{element} * in.stride + offset;
+        if (bounded) return data + relative;
         if (!data || relative > size || bytes > size - relative) return nullptr;
         first = std::min(first, relative);
         end = std::max(end, relative + bytes);
@@ -164,6 +182,13 @@ void convert_color(const std::uint8_t* p, std::uint8_t* out) {
     else std::memcpy(out, p, 4);
 }
 
+void extend_bounds(std::array<float, 6>& box, const float* position) {
+    for (unsigned k = 0; k < 3; ++k) {
+        box[k] = std::min(box[k], position[k]);
+        box[k + 3] = std::max(box[k + 3], position[k]);
+    }
+}
+
 // One input across a draw's vertices; disabled vertices (null when none) are skipped.
 struct Column {
     const Input& in;
@@ -174,15 +199,23 @@ struct Column {
     std::size_t count;
     const std::uint8_t* disabled;
     Arrays& arrays;
+    bool bounded = false;
+    std::array<float, 6>* bounds = nullptr;
 };
 // Components is the per-vector component count when fixed at compile time, else 0.
 template <unsigned IndexBytes, unsigned Format, unsigned Components>
 bool numbers_column(const Column& c) {
     const auto& in = c.in;
     const unsigned components = Components ? Components : in.components;
-    InPlace array(in);
+    InPlace array(in, c.bounded);
     for (std::size_t i = 0; i < c.count; ++i) {
-        if (c.disabled && c.disabled[i]) continue;
+        if (c.disabled && c.disabled[i]) {
+            if (c.bounds) {
+                float position[3]; std::memcpy(position, c.out + i * c.out_stride, sizeof position);
+                extend_bounds(*c.bounds, position);
+            }
+            continue;
+        }
         const auto* cursor = c.fifo + i * c.fifo_stride + in.fifo_offset;
         float values[9];
         unsigned filled = components;
@@ -202,6 +235,7 @@ bool numbers_column(const Column& c) {
             convert<Format>(cursor, components, in.scale, false, values);
         }
         for (unsigned k = filled; k < in.width; ++k) values[k] = 0;
+        if (c.bounds) extend_bounds(*c.bounds, values);
         auto* target = c.out + i * c.out_stride + in.output;
         switch (in.width) {
         case 2: std::memcpy(target, values, 8); break;
@@ -216,7 +250,7 @@ bool numbers_column(const Column& c) {
 template <unsigned IndexBytes, unsigned Format>
 bool color_column(const Column& c) {
     const auto& in = c.in;
-    InPlace array(in);
+    InPlace array(in, c.bounded);
     for (std::size_t i = 0; i < c.count; ++i) {
         if (c.disabled && c.disabled[i]) continue;
         const auto* data = c.fifo + i * c.fifo_stride + in.fifo_offset;
@@ -296,7 +330,9 @@ namespace {
 // Appends one record per vertex; index-disabled vertices keep zeroed slots and are marked.
 StreamResult convert_records(const State& state, const Draw& draw, MemoryReader& memory, const StreamFormat& format,
                              std::vector<std::uint8_t>& vertices, StreamArraySpans* spans, std::vector<std::uint8_t>& disabled,
-                             std::uint16_t columns = 0xfff, bool overwrite = false) {
+                             std::uint16_t columns = 0xfff, bool overwrite = false,
+                             const StreamArraySpans* known_spans = nullptr, const std::vector<std::uint8_t>* known_disabled = nullptr,
+                             std::array<float, 6>* bounds = nullptr) {
     StreamResult result;
     auto fail = [&](VertexError error, const char* message) { result.error = error; result.message = message; return result; };
     const auto& layout = draw.layout;
@@ -331,7 +367,7 @@ StreamResult convert_records(const State& state, const Draw& draw, MemoryReader&
         in.base = in.stride = 0;
         in.data = nullptr;
         in.size = 0;
-        if (in.index_bytes) {
+        if (in.index_bytes && (columns & (1u << array))) {
             in.base = state.cp(static_cast<std::uint8_t>(0xa0 + array));
             in.stride = state.cp(static_cast<std::uint8_t>(0xb0 + array)) & 255;
             const auto view = memory.array_view(in.base);
@@ -367,10 +403,10 @@ StreamResult convert_records(const State& state, const Draw& draw, MemoryReader&
     vertices.resize(vertex_start + std::size_t{draw.vertex_count} * format.stride);
     auto restore = [&](VertexError error, const char* message) { vertices.resize(vertex_start); return fail(error, message); };
     disabled.clear();
-    if (spans) *spans = {};
+    if (spans) *spans = known_spans ? *known_spans : StreamArraySpans{};
     Arrays arrays{memory, spans, {}};
     const auto latches = format.matrices ? stream_matrix_latches(state) : std::array<std::uint32_t, 3>{};
-    const bool sentinel_possible = indexed(layout.position);
+    const bool sentinel_possible = indexed(layout.position) && !known_disabled;
     const unsigned sentinel = layout.position.mode == AttributeMode::index8 ? 255 : 65535;
     if (format.matrices || sentinel_possible) {
         for (std::size_t i = 0; i < draw.vertex_count; ++i) {
@@ -395,11 +431,14 @@ StreamResult convert_records(const State& state, const Draw& draw, MemoryReader&
             }
         }
     }
+    if (bounds) *bounds = {{INFINITY, INFINITY, INFINITY, -INFINITY, -INFINITY, -INFINITY}};
     for (unsigned k = 0; k < input_count; ++k) {
         const auto& in = inputs[k];
         if (!(columns & (1u << in.array))) continue;
+        const auto& mask = known_disabled ? *known_disabled : disabled;
+        const bool bounded = known_spans && known_spans->arrays[in.array].end > known_spans->arrays[in.array].first;
         const Column column{in, draw.vertices.data, layout.stride, vertices.data() + vertex_start, format.stride,
-                            draw.vertex_count, disabled.empty() ? nullptr : disabled.data(), arrays};
+                            draw.vertex_count, mask.empty() ? nullptr : mask.data(), arrays, bounded, in.array == 0 ? bounds : nullptr};
         if (!column_function(in)(column))
             return restore(VertexError::memory_read, in.kind == Input::color ? "GX indexed color unavailable" : "GX indexed vertex data unavailable");
     }
@@ -410,7 +449,7 @@ StreamResult convert_records(const State& state, const Draw& draw, MemoryReader&
 
 StreamResult append_stream_vertices(const State& state, const Draw& draw, MemoryReader& memory, const StreamFormat& format,
                                     std::vector<std::uint8_t>& vertices, std::vector<std::uint32_t>& indices,
-                                    std::uint32_t first_index, StreamArraySpans* spans) {
+                                    std::uint32_t first_index, StreamArraySpans* spans, std::array<float, 6>* bounds) {
     StreamResult result;
     auto fail = [&](VertexError error, const char* message) { result.error = error; result.message = message; return result; };
     const PrimitiveRun single{draw.primitive, draw.vertex_count, 0};
@@ -453,7 +492,7 @@ StreamResult append_stream_vertices(const State& state, const Draw& draw, Memory
     const auto vertex_start = vertices.size();
     const auto index_start = indices.size();
     std::vector<std::uint8_t> disabled;
-    result = convert_records(state, flat, memory, format, vertices, spans, disabled);
+    result = convert_records(state, flat, memory, format, vertices, spans, disabled, 0xfff, false, nullptr, nullptr, bounds);
     if (!result) return result;
     auto restore = [&](VertexError error, const char* message) {
         vertices.resize(vertex_start); indices.resize(index_start); return fail(error, message);
@@ -523,7 +562,8 @@ StreamResult append_stream_records(const State& state, const Draw& draw, MemoryR
 }
 
 std::size_t StreamGeometry::bytes() const {
-    std::size_t size = sizeof(*this) + vertices_.capacity() + flattened_.capacity() + indices_.capacity() * sizeof(std::uint32_t);
+    std::size_t size = sizeof(*this) + vertices_.capacity() + flattened_.capacity() + disabled_.capacity() +
+                       indices_.capacity() * sizeof(std::uint32_t);
     for (const auto& array : arrays_) size += array.bytes.capacity();
     return size;
 }
@@ -538,6 +578,7 @@ StreamResult StreamGeometry::update(const State& state, const Draw& draw, Memory
         flat.runs = nullptr; flat.run_count = 0;
     }
     changed_ = valid_ ? 0 : 0xfff;
+    StreamArraySpans known_spans;
     if (valid_) for (unsigned i = 0; i < arrays_.size(); ++i) {
         auto& old = arrays_[i];
         if (old.span.first == old.span.end) continue;
@@ -550,6 +591,7 @@ StreamResult StreamGeometry::update(const State& state, const Draw& draw, Memory
             changed_ |= 1u << i;
             continue;
         }
+        known_spans.arrays[i] = old.span;
         const auto generation = memory.range_generation(view, base + old.span.first, old.span.end - old.span.first);
         if (!full && !old.volatile_data && base == old.base && generation && generation == old.generation) continue;
         if (std::memcmp(view.bytes.data + old.span.first, old.bytes.data(), old.bytes.size())) {
@@ -561,7 +603,7 @@ StreamResult StreamGeometry::update(const State& state, const Draw& draw, Memory
     StreamArraySpans spans;
     if (!valid_) {
         vertices_.clear(); indices_.clear();
-        result_ = append_stream_vertices(state, draw, memory, format, vertices_, indices_, 0, &spans);
+        result_ = append_stream_vertices(state, draw, memory, format, vertices_, indices_, 0, &spans, &bounds_);
         if (result_) {
             flattened_.clear();
             std::unordered_map<std::string, std::uint32_t> tuples;
@@ -583,10 +625,14 @@ StreamResult StreamGeometry::update(const State& state, const Draw& draw, Memory
             vertices_.resize(tuples.size() * format.stride);
             for (auto& index : indices_) index = remap[index];
             result_.vertices = static_cast<std::uint32_t>(tuples.size());
+            disabled_.assign(result_.vertices, 1);
+            for (auto index : indices_) disabled_[index] = 0;
+            if (std::none_of(disabled_.begin(), disabled_.end(), [](auto disabled) { return disabled != 0; })) disabled_.clear();
         }
     } else if (changed_ || format.matrices) {
         std::vector<std::uint8_t> disabled;
-        const auto result = convert_records(state, flat, memory, format, vertices_, &spans, disabled, changed_, true);
+        const auto result = convert_records(state, flat, memory, format, vertices_, &spans, disabled, changed_, true,
+                                            &known_spans, &disabled_, changed_ & 1 ? &bounds_ : nullptr);
         if (!result) result_ = result;
     }
     valid_ = bool(result_) && spans.viewed;

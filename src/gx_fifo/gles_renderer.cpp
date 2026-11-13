@@ -56,7 +56,7 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 "submissions %llu batched %llu instanced %llu skipped %u; program waits %llu/%llu/%llu/%llu/%llu "
                 "(33/67/133/267 ms/longer) max %llu ms, GL-thread links %llu max %llu ms; resident copies %llu hits %llu "
                 "crops %llu materialized %llu overwritten by DMA %llu settled DMA %llu; batched with zero alpha %llu, vertex fog %llu; uniform blocks %llu shared %llu bytes %llu; "
-                "peeks %llu live %llu waited %llu snapshots refused %llu region misses %llu; stream reused %llu updated %llu verified %llu; state hits %llu misses %llu; state reused %llu raster hits %llu texture plan hits %llu; program hits %llu misses %llu; vertex bytes %llu\n",
+                "peeks %llu live %llu waited %llu snapshots refused %llu region misses %llu; stream reused %llu updated %llu verified %llu; state hits %llu misses %llu; state reused %llu raster hits %llu texture plan hits %llu; state snapshots %llu/%llu bytes %llu; program hits %llu misses %llu; vertex bytes %llu\n",
                 gpu.retraces, gpu.presented, gpu.frame_buffer, gpu.known_frame_buffer, (unsigned long long)s.draws,
                 (unsigned long long)s.display_copies, (unsigned long long)s.texture_copies,
                 (unsigned long long)s.presentations, (unsigned long long)s.shader_compiles,
@@ -80,6 +80,8 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 (unsigned long long)s.direct.stream_verified, (unsigned long long)s.direct.state_hits,
                 (unsigned long long)s.direct.state_misses, (unsigned long long)s.direct.state_reuses,
                 (unsigned long long)s.direct.raster_plan_hits, (unsigned long long)s.direct.texture_plan_hits,
+                (unsigned long long)s.direct.raster_snapshots, (unsigned long long)s.direct.texture_snapshots,
+                (unsigned long long)s.direct.state_snapshot_bytes,
                 (unsigned long long)s.direct.program_hits,
                 (unsigned long long)s.direct.program_misses, (unsigned long long)s.direct.vertex_bytes);
 }

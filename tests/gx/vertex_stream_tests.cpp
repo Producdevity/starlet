@@ -67,6 +67,26 @@ struct Fixture {
     }
 };
 
+[[gnu::noinline]] void scalar_eye(const float* m, const float* p, float* out) {
+    for (unsigned k = 0; k < 3; ++k) out[k] = m[k * 4] * p[0] + m[k * 4 + 1] * p[1] + m[k * 4 + 2] * p[2] + m[k * 4 + 3];
+}
+void eye_transform_parity() {
+    std::mt19937 random(2345);
+    for (unsigned trial = 0; trial < 200000; ++trial) {
+        float matrix[12], position[3], reference[3], actual[3];
+        const auto value = [&] {
+            std::uint32_t bits = random();
+            if (trial < 100000) bits = (bits & 0x807fffff) | ((110 + (bits >> 24) % 35) << 23);
+            float result; std::memcpy(&result, &bits, 4); return result;
+        };
+        for (auto& f : matrix) f = value();
+        for (auto& f : position) f = value();
+        const StreamEyeTransform transform(matrix);
+        transform.apply(position, actual); scalar_eye(matrix, position, reference);
+        require(!std::memcmp(reference, actual, sizeof actual), "SIMD eye transform matches scalar bits, including non-finite values");
+    }
+}
+
 void compare(Fixture& f, const Draw& draw, std::uint32_t first_index, const std::string& name) {
     const auto reference = capture_vertices(f.decoder.state(), draw, f.memory);
     const auto format = stream_format(draw.layout);
@@ -78,6 +98,16 @@ void compare(Fixture& f, const Draw& draw, std::uint32_t first_index, const std:
         const auto reused = cached.update(f.decoder.state(), draw, f.memory, format);
         require(bool(reused) == bool(result), name + ": cached acceptance differs");
         if (reused) {
+            std::array<float, 6> expected{{INFINITY, INFINITY, INFINITY, -INFINITY, -INFINITY, -INFINITY}};
+            for (unsigned v = 0; v < reused.vertices; ++v) {
+                float position[3]; std::memcpy(position, cached.vertices().data() + v * format.stride, sizeof position);
+                for (unsigned k = 0; k < 3; ++k) {
+                    expected[k] = std::min(expected[k], position[k]);
+                    expected[k + 3] = std::max(expected[k + 3], position[k]);
+                }
+            }
+            require(!std::memcmp(expected.data(), cached.position_bounds().data(), sizeof expected),
+                    name + ": gathered bounds differ from the previous full scan");
             require(cached.indices().size() == indices.size() - 3, name + ": cached index count differs");
             for (std::size_t i = 0; i < cached.indices().size(); ++i)
                 require(!std::memcmp(cached.vertices().data() + std::size_t{cached.indices()[i]} * format.stride,
@@ -365,16 +395,49 @@ void merged_tuple_updates() {
         f.cp(0xa0, pass & 1 ? 0x1000 : 0x2000);
     }
 }
+void cached_gather_bounds() {
+    Fixture f; f.cp(0x50, 2u << 9); f.cp(0x70, 1u | (3u << 1));
+    f.cp(0xa0, 0x1000); f.cp(0xb0, 6);
+    f.memory.regions[0x1000] = std::vector<std::uint8_t>(18);
+    f.memory.generations[0x1000] = 1;
+    Draw draw; draw.primitive = 0x90; draw.vertex_count = 6;
+    const std::uint8_t fifo[] = {0, 1, 2, 255, 255, 255};
+    draw.vertices = {fifo, sizeof fifo};
+    std::string error; require(f.decoder.state().vertex_layout(0, draw.layout, error), error);
+    const auto format = stream_format(draw.layout); StreamGeometry cached;
+    auto check = [&](bool accepted) {
+        std::vector<std::uint8_t> vertices; std::vector<std::uint32_t> indices;
+        const auto reference = append_stream_vertices(f.decoder.state(), draw, f.memory, format, vertices, indices, 0);
+        const auto result = cached.update(f.decoder.state(), draw, f.memory, format);
+        require(bool(reference) == accepted && bool(result) == accepted, "cached gather retains current memory bounds");
+        if (!result) return;
+        require(cached.indices().size() == indices.size(), "cached disabled primitive stays absent");
+        for (std::size_t i = 0; i < indices.size(); ++i)
+            require(!std::memcmp(vertices.data() + indices[i] * format.stride,
+                                 cached.vertices().data() + cached.indices()[i] * format.stride, format.stride),
+                    "bounded gather equals fresh conversion");
+    };
+    check(true);
+    f.memory.regions[0x1000][1] = 3; ++f.memory.generations[0x1000]; check(true);
+    f.memory.regions[0x2000] = f.memory.regions[0x1000]; f.memory.regions[0x2000][1] = 5;
+    f.memory.generations[0x2000] = 1; f.cp(0xa0, 0x2000); check(true);
+    f.memory.regions[0x2000].resize(12); check(false);
+    f.memory.regions[0x2000].resize(24); ++f.memory.generations[0x2000]; check(true);
+    f.cp(0xb0, 8); check(true);
+    f.memory.regions[0x2000][17] = 9; ++f.memory.generations[0x2000]; check(true);
+}
 }
 
 int main() {
     try {
+        eye_transform_parity();
         host_order_arrays();
         fraction_scales();
         randomized();
         partial_disable();
         changed_columns();
         merged_tuple_updates();
+        cached_gather_bounds();
         merged_runs();
     } catch (const std::exception& error) {
         std::cerr << "gx_vertex_stream_tests: " << error.what() << '\n';
