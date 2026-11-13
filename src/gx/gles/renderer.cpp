@@ -1755,29 +1755,34 @@ void GlesRenderer::copy_texture(const TextureCopy& p, std::uint8_t* destination,
     if (p.strip) throw std::runtime_error("EFB copies below the displayed frame need the direct renderer");
     std::vector<std::uint8_t> pixels(std::size_t(p.width)*p.height*4);
     try {
-        if (p.depth && p.filtered()) {
-            const auto [top, bottom] = texture_copy_filter_rows(p);
-            std::vector<std::uint8_t> rows(std::size_t(p.width)*(bottom-top+1)*4);
-            g.read_depth(p.x,g.efb_height-1-bottom,p.width,bottom-top+1,rows.data(),g.selected_snapshot);
-            pixels = filter_texture_copy(p,{rows.data(),rows.size()},top);
-        } else if (p.depth) {
-            g.read_depth(p.x,g.efb_height-p.y-p.height,p.width,p.height,pixels.data(),g.selected_snapshot);
-        } else {
-            g.reinterpret_format(p.rgba6);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER,g.framebuffer);
-            glBindBuffer(GL_PIXEL_PACK_BUFFER,0);
-            glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
-            glPixelStorei(GL_PACK_SKIP_ROWS,0); glPixelStorei(GL_PACK_SKIP_PIXELS,0);
-            if (p.filtered()) {
+        const auto read = [&g, &p, &pixels] {
+            if (p.depth && p.filtered()) {
                 const auto [top, bottom] = texture_copy_filter_rows(p);
                 std::vector<std::uint8_t> rows(std::size_t(p.width)*(bottom-top+1)*4);
-                glReadPixels(p.x,g.efb_height-1-bottom,p.width,bottom-top+1,GL_RGBA,GL_UNSIGNED_BYTE,rows.data());
+                g.read_depth(p.x,g.efb_height-1-bottom,p.width,bottom-top+1,rows.data(),g.selected_snapshot);
                 pixels = filter_texture_copy(p,{rows.data(),rows.size()},top);
+            } else if (p.depth) {
+                g.read_depth(p.x,g.efb_height-p.y-p.height,p.width,p.height,pixels.data(),g.selected_snapshot);
             } else {
-                glReadPixels(p.x,g.efb_height-p.y-p.height,p.width,p.height,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+                g.reinterpret_format(p.rgba6);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER,g.framebuffer);
+                glBindBuffer(GL_PIXEL_PACK_BUFFER,0);
+                glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
+                glPixelStorei(GL_PACK_SKIP_ROWS,0); glPixelStorei(GL_PACK_SKIP_PIXELS,0);
+                if (p.filtered()) {
+                    const auto [top, bottom] = texture_copy_filter_rows(p);
+                    std::vector<std::uint8_t> rows(std::size_t(p.width)*(bottom-top+1)*4);
+                    glReadPixels(p.x,g.efb_height-1-bottom,p.width,bottom-top+1,GL_RGBA,GL_UNSIGNED_BYTE,rows.data());
+                    pixels = filter_texture_copy(p,{rows.data(),rows.size()},top);
+                } else {
+                    glReadPixels(p.x,g.efb_height-p.y-p.height,p.width,p.height,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+                }
+                gl_check("native EFB texture-copy readback");
             }
-            gl_check("native EFB texture-copy readback");
-        }
+        };
+        // Direct draws are recorded and submitted on the GL thread; read back after them, there.
+        if (g.direct) { g.direct->flush(); g.execute(read, true); }
+        else read();
         encode_texture_copy(p,{pixels.data(),pixels.size()},destination,capacity);
         if (g.direct) g.direct->invalidate(destination, required);
         if (p.clear) clear_efb(*p.clear);

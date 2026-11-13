@@ -33,7 +33,8 @@ extern unsigned clears, uploads, draws, draw_first, sampler_seen, pack_seen, unp
 extern std::size_t pack_required, unpack_required;
 extern std::map<GLuint, GLuint> color_attachments;
 extern std::map<GLuint, GLuint> depth_attachments;
-extern unsigned uniform_ranges, read_pixels;
+extern unsigned uniform_ranges, read_pixels, draws_at_read;
+extern std::thread::id read_thread;
 extern unsigned dispatches;
 extern const char* renderer_name;
 extern unsigned instanced_draws, instance_count;
@@ -1439,6 +1440,21 @@ void direct_submission_thread() {
     check(s.draws == 4 && s.submissions >= 2 && fake::draws > before, "recorded draws are submitted in order");
     check(s.resident_copies == 1, "resident copies are created on the submission thread");
 }
+void direct_texture_copy_readback() {
+    GlesLimits limits; limits.direct.shading = DirectShading::fast;
+    GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
+    std::thread::id gl_thread;
+    renderer.start_submission([] {}, [&] { gl_thread = std::this_thread::get_id(); }, [] {});
+    const auto before = fake::draws;
+    renderer.draw_direct(f.decoder.state(), command, f.memory);
+    TextureCopy p; p.width = 8; p.height = 4; p.format = 1; p.luminance = true; p.stride = 32;
+    alignas(32) std::array<std::uint8_t, 64> bytes{};
+    const auto reads = fake::read_pixels;
+    renderer.copy_texture(p, bytes.data(), bytes.size());
+    renderer.stop_submission();
+    check(fake::read_pixels > reads && fake::read_thread == gl_thread, "direct texture copies read back on the submission thread");
+    check(fake::draws_at_read > before, "direct texture copies read back after the draws recorded before them");
+}
 // A host worker that already runs GL; tasks run in the order they are posted.
 struct HostThread {
     std::mutex mutex;
@@ -1942,7 +1958,7 @@ int main() {
         direct_clip_culling();
         direct_guard_band_discard();
         direct_indexed_clip_culling();
-        direct_submission_thread();
+        direct_submission_thread(); direct_texture_copy_readback();
         host_thread_submission();
         host_bloom();
         offscreen_pass();

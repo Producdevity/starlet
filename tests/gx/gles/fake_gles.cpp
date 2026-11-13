@@ -42,6 +42,8 @@ GLuint draw_texture = 0;
 std::map<GLuint, GLuint> color_attachments;
 std::map<GLuint, GLuint> depth_attachments;
 unsigned uniform_ranges = 0, read_pixels = 0;
+std::thread::id read_thread;
+unsigned draws_at_read = 0;
 // Compute dispatches, and the last int and ivec4 uniforms: for texel stores the buffer
 // offset and source x, y, width and row stride, in texels.
 unsigned dispatches = 0;
@@ -312,6 +314,7 @@ void glPixelStorei(GLenum pname, GLint param) {
 void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels) {
     fake::hold_readback();
     ++fake::read_pixels;
+    fake::read_thread = std::this_thread::get_id(); fake::draws_at_read = fake::draws;
     fake::pack_seen = fake::pixel[GL_PACK_SKIP_ROWS];
     fake::pack_pbo_seen = fake::pack_buffer;
     fake::pack_required = transfer_bytes(width, height, true);
