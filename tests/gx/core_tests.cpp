@@ -771,7 +771,7 @@ void sdk_state_write_cache() {
     require(!write(0xe0000123), "a repeated write to the same TEV bank is suppressed");
     write(0xfe0000ff); require(write(0xe0000155), "a masked TEV write is retained");
     require(write(0xe0000155), "a masked write invalidates the shadow value");
-    for (auto address : {0x45u, 0x47u, 0x48u, 0x52u, 0x64u, 0x65u, 0x66u, 0x80u, 0xbfu}) {
+    for (auto address : {0x0fu, 0x45u, 0x47u, 0x48u, 0x52u, 0x64u, 0x65u, 0x66u, 0x80u, 0xbfu}) {
         const auto word = address << 24;
         require(write(word) && write(word), "sync, copies, texture and TLUT operations always emit");
     }
@@ -780,6 +780,21 @@ void sdk_state_write_cache() {
     require(write(0x41000008), "an unknown list's final mask cannot consume a suppressed write");
     require(write(0x41000008), "the unknown masked result is learned only after a full write");
     require(!write(0x41000008), "full-state suppression resumes after mask consumption");
+    StarletGxStateCache arrays{};
+    std::uint32_t cp_random = 54321;
+    for (unsigned iteration = 0; iteration < 1000; ++iteration) {
+        cp_random = cp_random * 1664525u + 1013904223u;
+        const auto address = static_cast<std::uint8_t>(0xa0 + (cp_random & 31));
+        for (unsigned repeat = 0; repeat < 2; ++repeat) {
+            cp(a, address, cp_random);
+            const bool keep = starlet_gx_cp_keep(&arrays, 8, address, cp_random, 0);
+            if (keep) cp(b, address, cp_random);
+            for (unsigned reg = 0; reg < 256; ++reg)
+                require(a.state().cp(reg) == b.state().cp(reg), "array-write suppression preserves all CP registers");
+            require(keep == (repeat == 0), "equal SDK array bindings and strides are suppressed");
+        }
+        if ((iteration & 31) == 0) starlet_gx_state_forget(&arrays);
+    }
     StarletGxStateCache matrices{};
     std::uint32_t random = 0x12345678;
     for (unsigned iteration = 0; iteration < 1000; ++iteration) {

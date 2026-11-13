@@ -55,7 +55,7 @@ static inline int starlet_gx_bp_keep(StarletGxStateCache* cache, uint32_t word, 
     full = cache->full_mask;
     cache->full_mask = 1;
     /* Only pure draw state; texture loads, cache operations and sync always emit. */
-    if (!(address == 0 || (address >= 6 && address <= 0x44) || address == 0x59 ||
+    if (!(address == 0 || (address >= 6 && address <= 0x44 && address != 0x0f) || address == 0x59 ||
           address == 0x68 || (address >= 0xc0 && address < 0xfe))) return 1;
     if (address >= 0xe0 && address <= 0xe7) {
         if (!full) {
