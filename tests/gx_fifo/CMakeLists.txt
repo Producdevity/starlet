@@ -7,6 +7,11 @@ add_executable(starlet_gx_fifo_host_order_tests host_order_arrays_tests.cpp)
 target_link_libraries(starlet_gx_fifo_host_order_tests PRIVATE starlet_gx_fifo)
 add_test(NAME starlet_gx_fifo_host_order COMMAND starlet_gx_fifo_host_order_tests)
 set_tests_properties(starlet_gx_fifo_host_order PROPERTIES TIMEOUT 30)
+
+add_executable(starlet_gx_fifo_draw_sync_snapshot_tests draw_sync_snapshot_tests.cpp)
+target_link_libraries(starlet_gx_fifo_draw_sync_snapshot_tests PRIVATE starlet_gx_fifo)
+add_test(NAME starlet_gx_fifo_draw_sync_snapshot COMMAND starlet_gx_fifo_draw_sync_snapshot_tests)
+set_tests_properties(starlet_gx_fifo_draw_sync_snapshot PROPERTIES TIMEOUT 30)
 # ARAM and disc DMA over resident texture copies, against the GLES renderer on a recording GL fake.
 if(TARGET starlet_gx_gles_objects AND TARGET starlet_ar AND TARGET starlet_dvd)
     add_executable(starlet_gx_fifo_dma_tests dma_tests.cpp "${PROJECT_SOURCE_DIR}/tests/gx/gles/fake_gles.cpp")

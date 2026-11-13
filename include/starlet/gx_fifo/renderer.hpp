@@ -2,6 +2,7 @@
 
 #include "starlet/gx/decoder.hpp"
 #include "starlet/gx/display_copy.hpp"
+#include "starlet/gx/efb_peek.hpp"
 #include "starlet/gx/texture_copy.hpp"
 
 #include <cstddef>
@@ -44,6 +45,16 @@ public:
     virtual bool resident_in(const void*, std::size_t) const { return false; }
     virtual void before_dma_read(const void*, std::size_t) {}
     virtual void before_dma_write(const void*, std::size_t) {}
+    // Optional EFB snapshots (gx::EfbPeekBackend), for draw-sync callbacks that read the EFB:
+    // the GPU thread retains the EFB at their token and the callback reads it once read back.
+    // snapshot_ready and the snapshot peeks run on any thread, the rest on the GPU thread.
+    virtual int snapshot_efb(const gx::EfbRegion&) { return -1; }
+    virtual bool snapshot_ready(int) const { return true; }
+    virtual void wait_snapshot(int) {}
+    virtual bool peek_depth_snapshot(int, int, int, std::uint32_t&) const { return false; }
+    virtual bool peek_color_snapshot(int, int, int, std::uint32_t&) const { return false; }
+    virtual void select_snapshot(int) {}
+    virtual void release_snapshot(int) {}
     // Shows frame (or black) on a drawable of that size; false when nothing new was shown.
     virtual bool present(const gx::FramebufferView& frame, int drawable_width, int drawable_height, bool black) = 0;
     // Development: the EFB as RGBA8 rows from the lower left; empty when the renderer cannot read it.

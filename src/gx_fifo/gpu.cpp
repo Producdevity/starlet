@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -263,6 +264,26 @@ struct Job {
     std::function<void()> call;
 };
 
+// Token values whose draw-sync callback read the EFB, and per token value the pixels it read
+// last time (bit 56 valid, then y1, x1, y0, x0 in 10 bits each above the token). Later tokens
+// of that value snapshot the EFB, reading back that rectangle widened by peek_margin.
+std::atomic<std::uint64_t> peek_tokens[1024];
+std::atomic<std::uint64_t> peek_bounds[4096];
+constexpr int peek_margin = 32;
+
+bool token_reads_efb(std::uint16_t token) { return peek_tokens[token >> 6].load(std::memory_order_relaxed) >> (token & 63) & 1; }
+
+// The read-back region for a snapshot at token; empty (the whole EFB) before its callback read a pixel.
+EfbRegion token_region(std::uint16_t token) {
+    const std::uint64_t b = peek_bounds[token & 4095].load(std::memory_order_relaxed);
+    EfbRegion region;
+    if ((b >> 56) && (b & 0xffff) == token) {
+        const int x0 = int(b >> 16 & 0x3ff), y0 = int(b >> 26 & 0x3ff), x1 = int(b >> 36 & 0x3ff), y1 = int(b >> 46 & 0x3ff);
+        region = {x0 - peek_margin, y0 - peek_margin, x1 - x0 + 1 + 2 * peek_margin, y1 - y0 + 1 + 2 * peek_margin};
+    }
+    return region;
+}
+
 class Gpu final : public CommandSink {
 public:
     explicit Gpu(GpuSetup setup)
@@ -322,7 +343,7 @@ public:
         case 0x45:  // Draw done.
             renderer_.wait_until_idle();
             frame_event('D');
-            if (events_.draw_done) events_.draw_done();
+            deliver({true, 0, -1});
             break;
         case 0x47:
             token_.store(std::uint16_t(value), std::memory_order_release);
@@ -330,7 +351,7 @@ public:
         case 0x48:
             token_.store(std::uint16_t(value), std::memory_order_release);
             renderer_.wait_until_idle();
-            if (events_.token) events_.token(std::uint16_t(value));
+            deliver({false, std::uint16_t(value), events_.token ? token_snapshot(std::uint16_t(value)) : -1});
             break;
         case 0x52:
             copy(state, value);
@@ -346,6 +367,22 @@ public:
     std::uint32_t peek_color(int x, int y) { return renderer_.peek_color(x, y); }
     std::uint16_t token() const { return token_.load(std::memory_order_acquire); }
     void set_events(GpuEvents events) { events_ = events; }
+    bool peek_snapshot(int index, bool depth, int x, int y, std::uint32_t& value) const {
+        return depth ? renderer_.peek_depth_snapshot(index, x, y, value) : renderer_.peek_color_snapshot(index, x, y, value);
+    }
+    // GPU thread: the snapshot's value once read back; a pixel outside its read-back region
+    // comes from the retained snapshot after the queued GL work.
+    std::uint32_t peek_snapshot_wait(int index, bool depth, int x, int y) {
+        renderer_.wait_snapshot(index);
+        std::uint32_t value = 0;
+        if (peek_snapshot(index, depth, x, y, value)) return value;
+        renderer_.select_snapshot(index);
+        value = depth ? renderer_.peek_depth(x, y) : renderer_.peek_color(x, y);
+        renderer_.select_snapshot(-1);
+        return value;
+    }
+    void release_snapshot(int index) { renderer_.release_snapshot(index); }
+    int token_snapshot(std::uint16_t token) { return token_reads_efb(token) ? renderer_.snapshot_efb(token_region(token)) : -1; }
 
     void present(const void* frame_buffer, bool black) {
         frame_event('P', std::uint32_t(reinterpret_cast<std::uintptr_t>(frame_buffer)));
@@ -507,6 +544,15 @@ private:
             Job job;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
+                // A token waiting for its snapshot needs later GL work to collect the readback; with
+                // none queued (the guest may be waiting for that token) the GPU thread waits for it.
+                while (!pending_.empty() && jobs_.empty()) {
+                    if (wake_.wait_for(lock, std::chrono::milliseconds(1), [&] { return !jobs_.empty(); })) break;
+                    lock.unlock();
+                    if (!renderer_.snapshot_ready(pending_.front().snapshot)) renderer_.wait_snapshot(pending_.front().snapshot);
+                    pump();
+                    lock.lock();
+                }
                 wake_.wait(lock, [&] { return !jobs_.empty(); });
                 job = std::move(jobs_.front());
                 jobs_.pop_front();
@@ -522,6 +568,7 @@ private:
                 report(std::string("GX command failed: ") + error.what() + detail);
                 new_decoder();
             }
+            pump();
             std::lock_guard<std::mutex> lock(mutex_);
             ++completed_;
             done_.notify_all();
@@ -553,6 +600,35 @@ private:
     std::unique_ptr<Decoder> decoder_;
     std::unordered_map<std::uintptr_t, FrameBufferInfo> frame_buffers_;
     GpuEvents events_;
+    // Draw-done and token interrupts in command order; a token with a snapshot holds back
+    // itself and everything after it until its snapshot is read back.
+    struct Interrupt {
+        bool draw_done;
+        std::uint16_t token;
+        int snapshot;
+    };
+    std::deque<Interrupt> pending_;
+    void raise(const Interrupt& i) {
+        if (i.draw_done) {
+            if (events_.draw_done) events_.draw_done();
+        } else if (events_.token) {
+            events_.token(i.token, i.snapshot);
+        } else if (i.snapshot >= 0) {
+            renderer_.release_snapshot(i.snapshot);
+        }
+    }
+    void deliver(const Interrupt& i) {
+        if (pending_.empty() && i.snapshot < 0) return raise(i);
+        pending_.push_back(i);
+        pump();
+    }
+    void pump() {
+        while (!pending_.empty() && (pending_.front().snapshot < 0 || renderer_.snapshot_ready(pending_.front().snapshot))) {
+            const Interrupt i = pending_.front();
+            pending_.pop_front();
+            raise(i);
+        }
+    }
     std::atomic<std::uint16_t> token_{0};
     std::thread thread_;
     std::mutex mutex_;
@@ -570,6 +646,7 @@ private:
 };
 
 std::unique_ptr<Gpu> gpu;
+
 void (*dirty_state)() = nullptr;
 std::string last_failure;
 
@@ -646,6 +723,21 @@ void set_gpu_events(GpuEvents events) {
 }
 
 std::uint16_t gpu_token() { return gpu->token(); }
+
+void gpu_note_token_peek(std::uint16_t token, int x0, int y0, int x1, int y1) {
+    peek_tokens[token >> 6].fetch_or(std::uint64_t{1} << (token & 63), std::memory_order_relaxed);
+    peek_bounds[token & 4095].store(std::uint64_t{1} << 56 | std::uint64_t(y1) << 46 | std::uint64_t(x1) << 36 |
+                                        std::uint64_t(y0) << 26 | std::uint64_t(x0) << 16 | token,
+                                    std::memory_order_relaxed);
+}
+
+bool gpu_peek_snapshot(int index, bool depth, int x, int y, std::uint32_t& value) {
+    return gpu->peek_snapshot(index, depth, x, y, value);
+}
+
+std::uint32_t gpu_peek_snapshot_wait(int index, bool depth, int x, int y) { return gpu->peek_snapshot_wait(index, depth, x, y); }
+
+void gpu_release_snapshot(int index) { gpu->release_snapshot(index); }
 
 void gpu_present(const void* frame_buffer, bool black) {
     gpu_post([frame_buffer, black] { gpu->present(frame_buffer, black); });

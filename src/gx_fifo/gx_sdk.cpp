@@ -11,6 +11,7 @@
 #include "starlet/os/host_allocation.hpp"
 #include "starlet/sdk/gx.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -74,9 +75,25 @@ void finish_interrupt() {
 
 void raise_finish() { os::raise_interrupt(finish_interrupt); }
 
-void raise_token(std::uint16_t token) {
-    os::raise_interrupt([token] {
+// The draw-sync callback running now, with the EFB snapshot of its token (-1: peeks read the live
+// EFB) and the pixels it has read (x0 > x1: none yet).
+struct SyncCallback {
+    bool active = false;
+    std::uint16_t token = 0;
+    int snapshot = -1;
+    int x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+} sync_callback;
+
+void raise_token(std::uint16_t token, int snapshot) {
+    os::raise_interrupt([token, snapshot] {
+        const SyncCallback outer = sync_callback;
+        sync_callback = SyncCallback{};
+        sync_callback.active = true;
+        sync_callback.token = token;
+        sync_callback.snapshot = snapshot;
         if (draw_sync_callback) draw_sync_callback(token);
+        sync_callback = outer;
+        if (snapshot >= 0) gpu_post([snapshot] { gpu_release_snapshot(snapshot); });
     });
 }
 
@@ -114,19 +131,32 @@ void present(const VideoFrame& frame) {
     gpu_present(frame.frame_buffer, frame.black);
 }
 
-std::uint32_t peek_depth(int x, int y) {
-    std::uint32_t z = 0;
+// A draw-sync callback reads the EFB as of its token, as the console's interrupt follows its GPU:
+// from the token's snapshot, instead of waiting for everything queued since. Its first reads go
+// to the live EFB and teach the GPU thread to snapshot later tokens of that value.
+std::uint32_t peek(bool depth, int x, int y) {
+    std::uint32_t value = 0;
+    if (sync_callback.active) {
+        auto& c = sync_callback;
+        if (c.x0 > c.x1) {
+            c.x0 = c.x1 = x;
+            c.y0 = c.y1 = y;
+        }
+        c.x0 = std::min(c.x0, x), c.x1 = std::max(c.x1, x), c.y0 = std::min(c.y0, y), c.y1 = std::max(c.y1, y);
+        gpu_note_token_peek(c.token, c.x0, c.y0, c.x1, c.y1);
+        if (const int s = c.snapshot; s >= 0) {
+            if (gpu_peek_snapshot(s, depth, x, y, value)) return value;
+            gpu_call([s, depth, x, y, &value] { value = gpu_peek_snapshot_wait(s, depth, x, y); });
+            return value;
+        }
+    }
     flush_stage();
-    gpu_call([x, y, &z] { z = gpu_peek_depth(x, y); });
-    return z;
+    gpu_call([depth, x, y, &value] { value = depth ? gpu_peek_depth(x, y) : gpu_peek_color(x, y); });
+    return value;
 }
 
-std::uint32_t peek_color(int x, int y) {
-    std::uint32_t color = 0;
-    flush_stage();
-    gpu_call([x, y, &color] { color = gpu_peek_color(x, y); });
-    return color;
-}
+std::uint32_t peek_depth(int x, int y) { return peek(true, x, y); }
+std::uint32_t peek_color(int x, int y) { return peek(false, x, y); }
 
 }
 

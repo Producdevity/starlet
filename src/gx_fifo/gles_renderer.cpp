@@ -25,6 +25,18 @@ bool GlesBackend::resident_in(const void* data, std::size_t bytes) const { retur
 void GlesBackend::before_dma_read(const void* data, std::size_t bytes) { renderer_.before_dma_read(data, bytes); }
 void GlesBackend::before_dma_write(const void* data, std::size_t bytes) { renderer_.before_dma_write(data, bytes); }
 
+int GlesBackend::snapshot_efb(const gx::EfbRegion& region) { return renderer_.snapshot_efb(region); }
+bool GlesBackend::snapshot_ready(int index) const { return renderer_.snapshot_ready(index); }
+void GlesBackend::wait_snapshot(int index) { renderer_.wait_snapshot(index); }
+bool GlesBackend::peek_depth_snapshot(int index, int x, int y, std::uint32_t& value) const {
+    return renderer_.peek_depth_snapshot(index, x, y, value);
+}
+bool GlesBackend::peek_color_snapshot(int index, int x, int y, std::uint32_t& value) const {
+    return renderer_.peek_color_snapshot(index, x, y, value);
+}
+void GlesBackend::select_snapshot(int index) { renderer_.select_snapshot(index); }
+void GlesBackend::release_snapshot(int index) { renderer_.release_snapshot(index); }
+
 bool GlesBackend::present(const gx::FramebufferView& frame, int drawable_width, int drawable_height, bool black) {
     return renderer_.present_framebuffer(frame, drawable_width, drawable_height, black);
 }
@@ -37,7 +49,8 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 "presentations %llu, programs %llu, decoded %llu bytes; direct draws %llu zero-area %llu culled %llu unready %llu "
                 "submissions %llu batched %llu instanced %llu skipped %u; program waits %llu/%llu/%llu/%llu/%llu "
                 "(33/67/133/267 ms/longer) max %llu ms, GL-thread links %llu max %llu ms; resident copies %llu hits %llu "
-                "crops %llu materialized %llu overwritten by DMA %llu settled DMA %llu; batched with zero alpha %llu, vertex fog %llu; uniform blocks %llu shared %llu bytes %llu\n",
+                "crops %llu materialized %llu overwritten by DMA %llu settled DMA %llu; batched with zero alpha %llu, vertex fog %llu; uniform blocks %llu shared %llu bytes %llu; "
+                "peeks %llu live %llu waited %llu snapshots refused %llu region misses %llu\n",
                 gpu.retraces, gpu.presented, gpu.frame_buffer, gpu.known_frame_buffer, (unsigned long long)s.draws,
                 (unsigned long long)s.display_copies, (unsigned long long)s.texture_copies,
                 (unsigned long long)s.presentations, (unsigned long long)s.shader_compiles,
@@ -54,7 +67,9 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 (unsigned long long)s.direct.dma_overwritten, (unsigned long long)s.direct.dma_settled,
                 (unsigned long long)s.direct.zero_alpha_draws,
                 (unsigned long long)s.direct.vertex_fog_draws, (unsigned long long)s.direct.uniform_blocks,
-                (unsigned long long)s.direct.shared_blocks, (unsigned long long)s.direct.uniform_bytes);
+                (unsigned long long)s.direct.shared_blocks, (unsigned long long)s.direct.uniform_bytes,
+                (unsigned long long)s.peeks, (unsigned long long)s.live_peeks, (unsigned long long)s.peek_waits,
+                (unsigned long long)s.refused_snapshots, (unsigned long long)s.region_misses);
 }
 
 }

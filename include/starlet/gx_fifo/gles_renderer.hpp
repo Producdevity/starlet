@@ -23,6 +23,13 @@ public:
     bool resident_in(const void* data, std::size_t bytes) const override;
     void before_dma_read(const void* data, std::size_t bytes) override;
     void before_dma_write(const void* data, std::size_t bytes) override;
+    int snapshot_efb(const gx::EfbRegion& region) override;
+    bool snapshot_ready(int index) const override;
+    void wait_snapshot(int index) override;
+    bool peek_depth_snapshot(int index, int x, int y, std::uint32_t& value) const override;
+    bool peek_color_snapshot(int index, int x, int y, std::uint32_t& value) const override;
+    void select_snapshot(int index) override;
+    void release_snapshot(int index) override;
     bool present(const gx::FramebufferView& frame, int drawable_width, int drawable_height, bool black) override;
     std::vector<std::uint8_t> readback() override;
     void print_stats(const GpuCounters& gpu) override;

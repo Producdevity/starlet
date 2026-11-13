@@ -37,15 +37,27 @@ template<class F> void gpu_post(F&& call) {
 std::uint32_t gpu_peek_depth(int x, int y);
 std::uint32_t gpu_peek_color(int x, int y);
 
-// The pixel engine's interrupts, raised on the GPU thread as their commands execute (BP 0x45 draw
-// done, BP 0x48 token).
+// The pixel engine's interrupts, raised on the GPU thread in command order (BP 0x45 draw done, BP
+// 0x48 token). A token whose callback read the EFB before carries an EFB snapshot taken as it
+// executed, and it and later interrupts are raised once that snapshot is read back; the guest
+// releases it with gpu_release_snapshot. Other tokens carry -1.
 struct GpuEvents {
     void (*draw_done)() = nullptr;
-    void (*token)(std::uint16_t) = nullptr;
+    void (*token)(std::uint16_t token, int snapshot) = nullptr;
 };
 void set_gpu_events(GpuEvents events);
 // The token register (last BP 0x47 or 0x48 value executed).
 std::uint16_t gpu_token();
+
+// Guest side, in a draw-sync callback: it read EFB pixels within (x0, y0)-(x1, y1). Later tokens of
+// that value snapshot the EFB.
+void gpu_note_token_peek(std::uint16_t token, int x0, int y0, int x1, int y1);
+// Any thread: a snapshot's pixel once read back and inside its read-back region, else false.
+bool gpu_peek_snapshot(int index, bool depth, int x, int y, std::uint32_t& value);
+// GPU thread: a snapshot's pixel, waiting for its readback (and queued GL work outside its region).
+std::uint32_t gpu_peek_snapshot_wait(int index, bool depth, int x, int y);
+// GPU thread: the snapshot may be reused.
+void gpu_release_snapshot(int index);
 
 // GPU thread: native-order arrays (see starlet/compat/gx_fifo.h), in command order.
 void gpu_host_order_array(std::uintptr_t base, std::size_t bytes);
