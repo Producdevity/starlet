@@ -169,6 +169,25 @@ void wait_for_interrupt() {
     expect(OSGetTime() - start >= OSMillisecondsToTicks(15), "waited for the interrupt");
 }
 
+// Ended threads hand their native stacks back: more thread lifetimes than the pool holds stacks
+// (detached ones, as the game's task threads are, then joined ones) do not exhaust it.
+void stacks_return() {
+    static int ran = 0;
+    ran = 0;
+    for (int i = 0; i < 200; ++i) {
+        OSCreateThread(&thread_c, [](void*) -> void* { ++ran; return nullptr; }, nullptr,
+                       stack_c + sizeof stack_c, sizeof stack_c, 5, OS_THREAD_ATTR_DETACH);
+        OSResumeThread(&thread_c);
+    }
+    for (int i = 0; i < 100; ++i) {
+        OSCreateThread(&thread_a, [](void*) -> void* { ++ran; return nullptr; }, nullptr,
+                       stack_a + sizeof stack_a, sizeof stack_a, 5, 0);
+        OSResumeThread(&thread_a);
+        OSJoinThread(&thread_a, nullptr);
+    }
+    expect(ran == 300, "300 short-lived threads ran in a pool of 63 stacks");
+}
+
 int run_tests() {
     priorities();
     messages_block();
@@ -177,6 +196,7 @@ int run_tests() {
     alarms();
     disabled_interrupts();
     wait_for_interrupt();
+    stacks_return();
     return failures;
 }
 

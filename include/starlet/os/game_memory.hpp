@@ -43,6 +43,9 @@ void* map_fixed(std::uintptr_t address, std::size_t size, const char* what);
 // under each stack. Call before the first allocate_stack.
 void set_stack_pool(std::size_t size, std::uintptr_t limit, const std::uintptr_t* hints, std::size_t hint_count);
 void* allocate_stack(std::size_t size);
+// Returns a stack from allocate_stack once no thread runs on it; a later allocate_stack of the
+// same rounded size reuses it.
+void release_stack(void* stack, std::size_t size);
 
 // The game memory (arena, executable image, guest stack or fixed region) that holds size bytes at
 // the 32-bit address the game gave the hardware (a pointer, physical or uncached), or nullptr.

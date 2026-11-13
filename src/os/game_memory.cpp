@@ -1,5 +1,7 @@
 #include "starlet/os/game_memory.hpp"
 
+#include "starlet/os/host_allocation.hpp"
+
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -22,6 +24,7 @@ std::mutex mutex;
 std::uint8_t* stack_pool = nullptr;
 std::size_t stack_pool_size = 0;
 std::size_t stack_used = 0;
+std::vector<std::pair<std::uint8_t*, std::size_t>> free_stacks;
 
 struct Region {
     std::uintptr_t begin, end;
@@ -93,11 +96,25 @@ void* allocate_stack(std::size_t size) {
     size = round_up(size, page);
     std::lock_guard<std::mutex> lock(mutex);
     if (!stack_pool) throw std::logic_error("no stack pool: call set_stack_pool first");
+    for (auto it = free_stacks.begin(); it != free_stacks.end(); ++it)
+        if (it->second == size) {
+            std::uint8_t* stack = it->first;
+            free_stacks.erase(it);
+            return stack;
+        }
     if (stack_used + page + size > stack_pool_size) throw std::runtime_error("guest thread stack pool exhausted");
     std::uint8_t* guard = stack_pool + stack_used;
     mprotect(guard, page, PROT_NONE);
     stack_used += page + size;
     return guard + page;
+}
+
+void release_stack(void* stack, std::size_t size) {
+    if (!stack) return;
+    size = round_up(size, page_size());
+    host_allocation_scope host;
+    std::lock_guard<std::mutex> lock(mutex);
+    free_stacks.emplace_back(static_cast<std::uint8_t*>(stack), size);
 }
 
 void image_range(std::uintptr_t& begin, std::uintptr_t& end) {

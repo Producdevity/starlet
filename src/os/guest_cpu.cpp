@@ -40,6 +40,10 @@ struct Guest {
     bool queued = false;      // In a ready slot.
     bool started = false;     // Host thread exists.
     bool killed = false;      // Cancelled: the host thread ends when it next wakes.
+    bool reap = true;         // The host thread hands its stack back when it ends (not the main thread).
+    bool retired = false;     // The host thread queued itself for reaping; no one else joins it.
+    void* stack = nullptr;
+    std::size_t stack_size = 0;
     void* (*entry)(void*) = nullptr;
     void* parameter = nullptr;
     int priority() const { return interrupt_thread ? interrupt_priority : os->priority; }
@@ -58,6 +62,43 @@ Guest interrupt_guest;
 OSThread* interrupted = nullptr;  // The guest thread an interrupt delivery preempted.
 OSThread* last_guest = nullptr;
 thread_local Guest* self = nullptr;
+
+// Host threads that ended: the next thread creation joins them and reuses their stacks.
+struct Finished {
+    pthread_t host;
+    void* stack;
+    std::size_t size;
+};
+std::mutex finished_mutex;
+std::vector<Finished> finished;
+
+// Under the scheduler lock, before the host thread lets go of it.
+Finished retire(Guest* g) {
+    g->retired = g->reap;
+    return {pthread_self(), g->reap ? g->stack : nullptr, g->stack_size};
+}
+
+[[noreturn]] void exit_host(const Finished& done) {
+    if (done.stack) {
+        host_allocation_scope host_;
+        std::lock_guard<std::mutex> lock(finished_mutex);
+        finished.push_back(done);
+    }
+    pthread_exit(nullptr);
+}
+
+void reap_finished() {
+    std::vector<Finished> done;
+    {
+        host_allocation_scope host_;
+        std::lock_guard<std::mutex> lock(finished_mutex);
+        done.swap(finished);
+    }
+    for (const Finished& f : done) {
+        pthread_join(f.host, nullptr);
+        release_stack(f.stack, f.size);
+    }
+}
 std::atomic<bool> in_handler{false};
 
 int slot(const Guest* g) { return g->priority() + 1; }
@@ -106,8 +147,13 @@ void dispatch() {
 }
 
 [[noreturn]] void end_host_thread(std::unique_lock<std::mutex>& lock) {
+    Guest* g = self;
+    const Finished done = retire(g);
+    // A cancelled detached thread is out of the table; no one else holds it.
+    const bool detached = g->os && (g->os->attr & OS_THREAD_ATTR_DETACH);
     lock.unlock();
-    pthread_exit(nullptr);
+    if (detached) delete g;
+    exit_host(done);
 }
 
 void wait_turn(Guest* g, std::unique_lock<std::mutex>& lock) {
@@ -205,9 +251,12 @@ void* host_entry(void* argument) {
 
 void start_host_thread(Guest* g, std::size_t requested) {
     const std::size_t size = std::max(minimum_stack, requested * 4);
+    reap_finished();
+    g->stack = allocate_stack(size);
+    g->stack_size = size;
     pthread_attr_t attributes;
     pthread_attr_init(&attributes);
-    pthread_attr_setstack(&attributes, allocate_stack(size), size);
+    pthread_attr_setstack(&attributes, g->stack, size);
     const int error = pthread_create(&g->host, &attributes, host_entry, g);
     pthread_attr_destroy(&attributes);
     if (error) throw std::runtime_error("could not create a guest thread");
@@ -348,6 +397,7 @@ int run_main_thread(int (*entry)()) {
         return nullptr;
     }, nullptr, main_thread_stack_marker + sizeof main_thread_stack_marker, 0, 16, 0);
     Guest* g = guest_of(&main_thread);
+    g->reap = false;  // Joined below.
     OSResumeThread(&main_thread);
     pthread_join(g->host, nullptr);
     return result;
@@ -436,9 +486,12 @@ void OSExitThread(void* val) {
     terminate(g, val);
     running = nullptr;
     dispatch();
+    // A joiner may delete g once the lock is released.
+    const bool detached = g->os->attr & OS_THREAD_ATTR_DETACH;
+    const Finished done = retire(g);
     lock.unlock();
-    if (g->os->attr & OS_THREAD_ATTR_DETACH) delete g;
-    pthread_exit(nullptr);
+    if (detached) delete g;
+    exit_host(done);
 }
 
 void OSCancelThread(OSThread* thread) {
@@ -540,9 +593,17 @@ BOOL OSJoinThread(OSThread* thread, void** val) {
     thread->state = OS_THREAD_STATE_NULL;
     if (Guest* g = guest_of(thread)) {
         guests.erase(thread);
+        if (g->retired) {
+            // Its host thread queued itself for reaping and no longer touches g.
+            lock.unlock();
+            delete g;
+            return TRUE;
+        }
+        g->reap = false;
         pthread_t host = g->host;
         lock.unlock();
         pthread_join(host, nullptr);
+        release_stack(g->stack, g->stack_size);
         delete g;
     }
     return TRUE;
