@@ -1,6 +1,8 @@
 #include "starlet/gx/draw.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cmath>
 #include <sstream>
 #include <limits>
@@ -36,6 +38,28 @@ bool outside_viewport(const DrawPacket& packet) {
         }
         if (!outside) return false;
     }
+    return true;
+}
+
+// GLES clips away a triangle whose W is negative at every vertex; a clip-disabled draw
+// lying wholly behind the eye therefore rasterizes nothing.
+bool behind_eye(const DrawPacket& packet, const TransformEvaluator& evaluator) {
+    if (!packet.transform->pipeline.clipping_disabled) return false;
+    float first_w = 0;
+    bool any = false;
+    for (const auto& v : packet.vertices->vertices()) {
+        if (v.disabled) continue;
+        const auto value = evaluator.evaluate(v);
+        if (!value) return false;
+        const auto w = value.output.gles_clip[3];
+        if (!(w <= 0)) return false;
+        if (!any) first_w = w;
+        any = true;
+    }
+    if (!any) return false;
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "starlet: gx: dropped a clip-disabled draw behind the eye (view z=%g, w=%g)\n", -first_w, first_w);
     return true;
 }
 
@@ -310,7 +334,7 @@ GlesDrawResult plan_gles_draw(const DrawPacket& packet, FramebufferFetch fetch, 
         const auto clipping = validate_transform_clipping(packet.transform->pipeline, evaluated.output);
         if (!clipping) {
             // The raster plan already restricts the scissor to the viewport.
-            if (outside_viewport(packet)) {
+            if (outside_viewport(packet) || behind_eye(packet, evaluator)) {
                 p.discarded = true;
                 return {{}, std::move(p)};
             }

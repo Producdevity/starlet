@@ -64,6 +64,22 @@ template <class Function> void rejects(Function action, const char *message) {
     }
     check(threw, message);
 }
+void clip_disabled_draw_behind_eye() {
+    Fixture f;auto captured=f.capture();const auto base=packet(captured);
+    auto transform=base.transform->pipeline;transform.clipping_disabled=true;transform.orthographic=false;
+    auto uniforms=base.transform->uniforms;uniforms.position[2][3]=10;
+    auto behind=base;
+    behind.transform=std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,base.transform->state_revision});
+    GlesRenderer renderer;const auto before=fake::draws;
+    renderer.draw(behind);
+    check(fake::draws==before && !renderer.failed(),"a clip-disabled draw behind the eye submits nothing and latches no error");
+    renderer.draw(base);
+    check(fake::draws==before+1 && !renderer.failed(),"drawing continues after a draw behind the eye");
+    uniforms.position[2]={0,.1f,1,-15};
+    auto crossing=base;
+    crossing.transform=std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,base.transform->state_revision});
+    rejects([&]{renderer.draw(crossing);},"a clip-disabled draw crossing the eye plane still rejects");
+}
 void adjacent_draw_batches() {
     Fixture f;auto captured=f.capture();const auto first=packet(captured);
     std::array<DrawPacket,3> draws{{first,first,first}};
@@ -1860,7 +1876,7 @@ void direct_source_geometry() {
 int main() {
     explicit_completion();
     try {
-        adjacent_draw_batches(); batch_geometry_bound(); parallel_batch_preparation(); program_uniform_values(); program_working_set(); depth_query_transfer_bounds(); captured_texture_cache(); complete_mip_cache_budget(); resident_texture_cache();
+        adjacent_draw_batches(); clip_disabled_draw_behind_eye(); batch_geometry_bound(); parallel_batch_preparation(); program_uniform_values(); program_working_set(); depth_query_transfer_bounds(); captured_texture_cache(); complete_mip_cache_budget(); resident_texture_cache();
         failed_upload_poison();
         inherited_transfer_state();
         fence_failure_and_thread_owner();

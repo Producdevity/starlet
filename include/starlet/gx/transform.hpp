@@ -171,7 +171,8 @@ private:
     TransformStatus status_;
     bool lighting_normal_ = false;
 };
-// Clip-disabled draws retain positive W and the GLES depth range. X/Y clipping
+// Clip-disabled draws retain positive W and the GLES depth range; a draw with
+// non-positive W at every vertex is discarded, as GLES clipping would. X/Y clipping
 // preserves viewport pixels when scissor lies inside viewport; the GLES raster
 // planner enforces that condition. Guard-band rasterization outside it is unsupported.
 TransformStatus validate_transform_clipping(const TransformPipeline&, const TransformOutput&);

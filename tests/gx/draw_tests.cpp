@@ -97,11 +97,13 @@ void offscreen_clip_disabled_draws() {
           "same-sign negative-W triangles wholly outside viewport have no fragments");
     uniforms.position[0] = {.001f,0,0,-.2f}; uniforms.position[1] = {0,.001f,0,-.15f};
     outside.transform = std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,base.transform->state_revision});
-    check(!plan_gles_draw(outside), "negative-W geometry projecting inside viewport retains guard");
+    {const auto a = plan_gles_draw(outside), b = plan_gles_draw(outside,FramebufferFetch::none,false);
+     check(a && b && a.pipeline.discarded && b.pipeline.discarded, "negative-W geometry inside the viewport lies behind the eye and has no fragments");}
     uniforms.position[0] = {1,0,0,1000}; uniforms.position[1] = {0,1,0,0};
     uniforms.position[2] = {0,0,0,0};
     outside.transform = std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,base.transform->state_revision});
-    check(!plan_gles_draw(outside), "W=0 cannot use projected offscreen rejection");
+    {const auto a = plan_gles_draw(outside);
+     check(a && a.pipeline.discarded, "W=0 at every vertex has no fragments");}
     f.vertices.clear();
     for (unsigned i=0;i<4;++i) {
         append_float(f.vertices, i==1||i==2 ? 300 : 100); append_float(f.vertices,i>=2 ? 200 : 100);
@@ -112,6 +114,25 @@ void offscreen_clip_disabled_draws() {
     auto crossing = packet(f.capture());uniforms.position[2] = {0,0,1,0};
     crossing.transform = std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,crossing.transform->state_revision});
     check(!plan_gles_draw(crossing), "triangles crossing W=0 cannot use divided-coordinate culling");
+}
+void clip_disabled_behind_eye() {
+    Fixture f;
+    auto base = packet(f.capture());
+    auto transform = base.transform->pipeline;
+    transform.clipping_disabled = true; transform.orthographic = false;
+    auto uniforms = base.transform->uniforms;
+    uniforms.position[2][3] = 10;
+    auto behind = base;
+    behind.transform = std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,base.transform->state_revision});
+    const auto full = plan_gles_draw(behind), warm = plan_gles_draw(behind,FramebufferFetch::none,false);
+    check(full && warm && full.pipeline.discarded && warm.pipeline.discarded,
+          "clip-disabled draws with negative W at every vertex are discarded");
+    // View z = 0.1y - 15.5 runs from -5.5 to 4.5 across the quad: W changes sign.
+    uniforms.position[2] = {0,.1f,1,-15};
+    auto crossing = base;
+    crossing.transform = std::make_shared<TransformSnapshot>(TransformSnapshot{transform,uniforms,base.transform->state_revision});
+    check(!plan_gles_draw(crossing) && !plan_gles_draw(crossing,FramebufferFetch::none,false),
+          "clip-disabled draws with W of both signs still reject");
 }
 void deferred_shader_source() {
     for (unsigned variant = 0; variant < 6; ++variant) {
@@ -543,7 +564,7 @@ int main(int argc, char** argv) {
         direct_parity_cases();
         fast_program_rebuilds();
         disabled_lookup_draws();
-        clipped_texture_projection(); clip_disabled_draws(); offscreen_clip_disabled_draws(); deferred_shader_source(); mipmap_lod_controls(); perspective_integration(); inactive_indirect_inputs(); indirect_lookup_and_offsets(); rgb8_full_replacement(); rgb8_alpha_update(); rgba6_fetch_boundary(); depth_shader_order(); routing_ownership_and_keys(); automatic_repeat_coordinates(); shared_maps_and_dead_inputs(); rejection_and_limits();
+        clipped_texture_projection(); clip_disabled_draws(); offscreen_clip_disabled_draws(); clip_disabled_behind_eye(); deferred_shader_source(); mipmap_lod_controls(); perspective_integration(); inactive_indirect_inputs(); indirect_lookup_and_offsets(); rgb8_full_replacement(); rgb8_alpha_update(); rgba6_fetch_boundary(); depth_shader_order(); routing_ownership_and_keys(); automatic_repeat_coordinates(); shared_maps_and_dead_inputs(); rejection_and_limits();
         if (argc == 2) {
             Fixture f; const auto c = f.capture(); const auto p = plan_gles_draw(packet(c));
             std::ofstream(std::string(argv[1]) + ".vert") << pipeline(p).vertex;
