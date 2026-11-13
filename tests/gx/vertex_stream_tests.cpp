@@ -17,6 +17,7 @@ struct Memory final : MemoryReader {
     std::map<std::uint32_t, std::vector<std::uint8_t>> regions;
     std::map<std::uint32_t, unsigned> native_units;
     std::map<std::uint32_t, bool> host_order;
+    std::map<std::uint32_t, std::uint64_t> generations;
     bool array_views = true;
     MemoryArrayView array_view(std::uint32_t address) override {
         if (!array_views) return {};
@@ -28,6 +29,7 @@ struct Memory final : MemoryReader {
         if (offset >= it->second.size() || (unit && offset % unit)) return {};
         MemoryArrayView view{{it->second.data() + offset, it->second.size() - offset}, static_cast<std::uint8_t>(unit)};
         view.host_order = host_order[it->first];
+        view.generation = generations[it->first];
         return view;
     }
     bool copy(std::uint32_t address, std::uint8_t* destination, std::size_t size) override {
@@ -71,6 +73,18 @@ void compare(Fixture& f, const Draw& draw, std::uint32_t first_index, const std:
     std::vector<std::uint8_t> vertices(7, 0xcd);
     std::vector<std::uint32_t> indices(3, 9);
     const auto result = append_stream_vertices(f.decoder.state(), draw, f.memory, format, vertices, indices, first_index);
+    StreamGeometry cached;
+    for (unsigned repeat = 0; repeat < 2; ++repeat) {
+        const auto reused = cached.update(f.decoder.state(), draw, f.memory, format);
+        require(bool(reused) == bool(result), name + ": cached acceptance differs");
+        if (reused) {
+            require(cached.indices().size() == indices.size() - 3, name + ": cached index count differs");
+            for (std::size_t i = 0; i < cached.indices().size(); ++i)
+                require(!std::memcmp(cached.vertices().data() + std::size_t{cached.indices()[i]} * format.stride,
+                                    vertices.data() + 7 + std::size_t{indices[i + 3] - first_index} * format.stride, format.stride),
+                        name + ": cached indexed vertex differs");
+        }
+    }
     require(bool(reference) == bool(result), name + ": acceptance differs: " + reference.message + " / " + result.message);
     if (!result) {
         require(vertices.size() == 7 && indices.size() == 3, name + ": failure did not restore outputs");
@@ -285,6 +299,72 @@ void partial_disable() {
     draw.vertices = {fifo.data(), fifo.size()};
     compare(f, draw, 0, "partial disable");
 }
+
+void changed_columns() {
+    Fixture f;
+    f.cp(0x50, (2u << 9) | (2u << 11)); f.cp(0x60, 2);
+    f.cp(0x70, 1 | (4u << 1) | (4u << 10) | (1u << 21) | (3u << 22) | (8u << 25));
+    for (unsigned a : {0u, 1u, 4u}) {
+        const auto base = 0x1000u + a * 0x100;
+        f.cp(static_cast<std::uint8_t>(0xa0 + a), base);
+        f.cp(static_cast<std::uint8_t>(0xb0 + a), a == 4 ? 4 : 12);
+        f.memory.regions[base] = std::vector<std::uint8_t>(36);
+        f.memory.generations[base] = 1;
+    }
+    Draw draw; draw.primitive = 0x90; draw.vertex_count = 3;
+    std::string error;
+    require(f.decoder.state().vertex_layout(0, draw.layout, error), error);
+    const std::uint8_t fifo[] = {0, 0, 0, 1, 1, 1, 2, 2, 2};
+    draw.vertices = {fifo, sizeof fifo};
+    const auto format = stream_format(draw.layout);
+    StreamGeometry cached;
+    auto check = [&](unsigned columns) {
+        std::vector<std::uint8_t> vertices;
+        std::vector<std::uint32_t> indices;
+        const auto scalar = append_stream_vertices(f.decoder.state(), draw, f.memory, format, vertices, indices, 0);
+        const auto reused = cached.update(f.decoder.state(), draw, f.memory, format);
+        require(bool(scalar) == bool(reused), "changed columns acceptance");
+        if (scalar) require(vertices == cached.vertices() && indices == cached.indices(), "changed columns bytes");
+        require(cached.changed_columns() == columns, "only changed columns converted");
+    };
+    check(0xfff); check(0);
+    f.memory.regions[0x1000][0] = 0x3f; ++f.memory.generations[0x1000]; check(1);
+    f.memory.regions[0x2000] = f.memory.regions[0x1000]; f.memory.generations[0x2000] = 1;
+    f.cp(0xa0, 0x2000); check(0);
+    f.memory.regions[0x2000][4] = 0x40; ++f.memory.generations[0x2000]; check(1);
+    f.memory.regions[0x1400][1] = 0x80; ++f.memory.generations[0x1400]; check(1u << 4);
+    f.memory.generations[0x1400] = 0;
+    f.memory.regions[0x1400][3] = 0x40; check(1u << 4);
+    f.memory.array_views = false; check((1u << 0) | (1u << 1) | (1u << 4));
+    check(0xfff);
+}
+void merged_tuple_updates() {
+    Fixture f; f.cp(0x50, 2u << 9); f.cp(0x70, 1u | (3u << 1));
+    f.cp(0xa0, 0x1000); f.cp(0xb0, 6);
+    f.memory.regions[0x1000] = std::vector<std::uint8_t>(18);
+    f.memory.generations[0x1000] = 1;
+    const std::uint8_t fifo[] = {0,1,0,2, 0x80,0,4, 0,1,0,2};
+    const PrimitiveRun runs[] = {{0x80,4,0}, {0x80,4,7}};
+    Draw draw; draw.primitive = 0x80; draw.vertex_count = 4; draw.runs = runs; draw.run_count = 2;
+    draw.vertices = {fifo, sizeof fifo};
+    std::string error; require(f.decoder.state().vertex_layout(0, draw.layout, error), error);
+    const auto format = stream_format(draw.layout); StreamGeometry cached;
+    for (unsigned pass = 0; pass < 4; ++pass) {
+        std::vector<std::uint8_t> vertices; std::vector<std::uint32_t> indices;
+        const auto reference = append_stream_vertices(f.decoder.state(), draw, f.memory, format, vertices, indices, 0);
+        const auto result = cached.update(f.decoder.state(), draw, f.memory, format);
+        require(reference && result && result.vertices == 3 && cached.indices().size() == indices.size(),
+                "merged tuples retain distinct indices even when their current attributes are equal");
+        for (std::size_t i = 0; i < indices.size(); ++i)
+            require(!std::memcmp(vertices.data() + indices[i] * format.stride,
+                                 cached.vertices().data() + cached.indices()[i] * format.stride, format.stride),
+                    "merged tuples preserve every indexed vertex after mutation and relocation");
+        f.memory.regions[0x1000][7] = static_cast<std::uint8_t>(pass + 1);
+        ++f.memory.generations[0x1000];
+        f.memory.regions[0x2000] = f.memory.regions[0x1000]; ++f.memory.generations[0x2000];
+        f.cp(0xa0, pass & 1 ? 0x1000 : 0x2000);
+    }
+}
 }
 
 int main() {
@@ -293,6 +373,8 @@ int main() {
         fraction_scales();
         randomized();
         partial_disable();
+        changed_columns();
+        merged_tuple_updates();
         merged_runs();
     } catch (const std::exception& error) {
         std::cerr << "gx_vertex_stream_tests: " << error.what() << '\n';

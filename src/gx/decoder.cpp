@@ -43,6 +43,7 @@ Decoder::Decoder(MemoryReader& memory, CommandSink& sink, Limits limits, EfbLayo
     fast_nop_ = !limits_.host_opcodes.test(0x00);
     fast_xf_ = !limits_.host_opcodes.test(0x10) && limits_.max_command_bytes >= 69;
     for (unsigned a = 0; a < 256; ++a) {
+        notify_bp_[a] = sink.observes_bp(static_cast<std::uint8_t>(a));
         // TLUT loads, texture-cache invalidation and the mask need apply_bp.
         const bool special = a == 0x65 || a == 0x66 || a == 0xfe;
         const bool stream = !limits_.host_opcodes.test(0x61);
@@ -131,11 +132,12 @@ bool Decoder::apply_bp(std::uint32_t word) {
         state_.bp_[0xfe] = state_.bp_mask_;
     }
     if (changed) {
+        state_.program_bp(address, state_.bp_[address]);
         ++state_.revision_;
         ++state_.bp_revision_;
         if (!color_register) ++state_.bp_state_revision_;
     }
-    if (!sink_.bp_write(state_, address, state_.bp_[address])) {
+    if (notify_bp_[address] && !sink_.bp_write(state_, address, state_.bp_[address])) {
         return fail(Error::sink_rejected, "GX sink rejected BP operation");
     }
     return true;
@@ -198,11 +200,12 @@ Decoder::Fast Decoder::fast_command(const std::uint8_t* p, std::size_t remaining
         if (tev) state_.tev_registers_[(value >> 23) & 1][address - 0xe0] = value & 0x7fffff;
         if (state_.bp_[address] != value) {
             state_.bp_[address] = value;
+            state_.program_bp(address, value);
             ++state_.revision_;
             ++state_.bp_revision_;
             if (!tev || (value & 0x800000)) ++state_.bp_state_revision_;
         }
-        if (!sink_.bp_write(state_, address, value)) {
+        if (notify_bp_[address] && !sink_.bp_write(state_, address, value)) {
             fail(Error::sink_rejected, "GX sink rejected BP operation");
             return Fast::failed;
         }
@@ -279,6 +282,7 @@ void Decoder::apply_xf(std::size_t address, const std::uint8_t* words, std::size
             }
         }
         register_changed |= xf[i] != word;
+        if (xf[i] != word) state_.program_xf(static_cast<std::uint16_t>(address + i), word);
         xf[i] = word;
     }
     // Programs key on the GX_PTIDENTITY rows, so writes there act on registers too.
@@ -384,6 +388,7 @@ void Decoder::set_texture_extent(std::uint8_t map, TextureExtent extent) {
     auto& current = state_.texture_extents_[map];
     if (current == extent) return;
     current = extent;
+    state_.draw_word(262 + map, std::uint32_t{extent.width} | (std::uint32_t{extent.height} << 16), 1);
     ++state_.revision_;
     ++state_.bp_revision_;
     ++state_.bp_state_revision_;

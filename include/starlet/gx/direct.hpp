@@ -16,6 +16,15 @@ namespace starlet::gx {
 // visual-fidelity fragment model of gx_fast_shader with GL blending.
 enum class DirectShading : std::uint8_t { exact, fast };
 
+struct DirectProgramKey {
+    std::array<std::uint32_t, 5> edges{};
+    unsigned count = 0;
+    std::uint64_t hash = 0;
+    bool matches(const State&, const std::vector<std::uint32_t>&) const;
+};
+DirectProgramKey direct_program_key(const State&, const VertexLayout&, FramebufferFetch, DirectShading,
+                                    std::uint8_t latched_normal = 0);
+
 // Registers and layout presence that define the program. Equal words always
 // plan to the same program; other registers reach the GPU as uniforms/state.
 // latched_normal: components of the vectors the XF holds from an earlier vertex (0, 3 or 9);

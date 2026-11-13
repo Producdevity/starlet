@@ -634,13 +634,29 @@ void list_fast_path_matches_general_path() {
     require(b.bp(0x30) == 0x123456 && b.tev_register(true, 2) == 0x000102 && b.tev_register(false, 2) == 0x000304, "the list was applied");
 }
 
+void selective_bp_notifications() {
+    struct Selected : Sink {
+        bool observes_bp(std::uint8_t address) const override { return address == 0x45 || address == 0x52; }
+    } sink;
+    Memory memory; memory.regions[0x1000] = std::vector<std::uint8_t>(32, 0x5a);
+    Decoder decoder(memory, sink);
+    bp(decoder, 0xc0, 0x123456); bp(decoder, 0xfe, 255); bp(decoder, 0xc0, 0xabcd88);
+    bp(decoder, 0x45, 2); bp(decoder, 0x45, 2);
+    require(decoder.state().bp(0xc0) == 0x123488 && sink.bp_addresses == std::vector<std::uint8_t>({0x45, 0x45}),
+            "unobserved BP writes still apply masks and repeated observed operations retain callbacks");
+    bp(decoder, 0x64, 0x1000 >> 5); bp(decoder, 0x65, 1u << 10);
+    std::uint8_t palette[32];
+    require(memory.reads == 1 && decoder.state().read_palette(0, palette, sizeof palette) && palette[31] == 0x5a,
+            "unobserved TLUT writes still load palette memory");
+}
+
 int main() {
     try {
         bp_mask_and_order(); tev_register_banks(); texgen_fields(); layouts_and_streaming(); layout_revision_ignores_arrays(); indexed_xf_and_bounds(); indexed_xf_reader_hook();
         palettes_snapshot_and_reload(); lists_mutation_and_shared_state(); rejected_inputs_and_limits(); failed_memory_is_not_applied(); immutable_list_during_execution();
         callback_reentry_is_rejected(); processing_exceptions_latch(); merged_primitives(); every_split_boundary();
-        host_commands_and_filtered_bp(); tev_banks_in_fed_writes(); list_fast_path_matches_general_path();
-        std::cout << "GX core: 19 test groups passed\n";
+        host_commands_and_filtered_bp(); tev_banks_in_fed_writes(); list_fast_path_matches_general_path(); selective_bp_notifications();
+        std::cout << "GX core: 20 test groups passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "GX core failure: " << error.what() << '\n';

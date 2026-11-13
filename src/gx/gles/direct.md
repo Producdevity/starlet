@@ -8,8 +8,12 @@ uploads its vertices, 32-bit indices and transform uniform blocks with one
 with identical program, state, uniform blocks, textures, samplers, vertex run and
 matrix latches merge into one ranged draw.
 
-Programs are cached by `direct_program_words` (direct.md). Per-draw state is
-replanned when BP or XF-register revisions change. Draws whose vertex records
+Programs use an incremental register hash, with exact word comparisons on a hit;
+`direct_program_words` runs on misses. State plans use a bounded 2,048-entry cache
+of register-group hashes and exact keys, including the konst bank, viewport and
+host texture extents. Regular TEV colours are refreshed from the draw state on a
+cache hit. Palette and texture memory validation still happens when
+resolving textures. Draws whose vertex records
 are byte-identical are skipped: every triangle has zero area on GX and GL. The
 SDK's XF flush primitive is such a draw.
 
@@ -60,6 +64,19 @@ fresh exact-size arena that shares one vertex array per stream format and is dra
 by base vertex. Mali drivers pay per draw for every live buffer and vertex array
 object, and copy a whole buffer when submitted draws still use it, so no arena is
 written after its first draw.
+
+Streamed triangles keep a separate CPU cache of converted columns, capped at
+16 MiB or 4,096 entries. The key excludes array bases: moved arrays update only
+columns whose consumed bytes changed. Equal FIFO tuples share a converted vertex;
+different indices remain distinct even when their current values are equal.
+Unchanged generations avoid reads, with periodic byte comparisons as above.
+Missing source identities take the uncached path. `STARLET_VERIFY_STREAM=1`
+compares every referenced vertex against a fresh conversion before submission.
+Indices and the interleaved stream still upload with their segment.
+
+Recording computes per-program uniform changes and adjacent raster and texture
+changes. Submission skips unchanged groups. A skipped unready program invalidates
+the affected delta chains so its next submitted draw restores all required state.
 
 A merged draw (decoder.md) goes through the same path as one draw: one program,
 state plan and texture lookup, one conversion of all its runs, and one resident

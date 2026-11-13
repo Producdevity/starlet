@@ -338,6 +338,9 @@ public:
         }
         renderer_.draw(state, draw, memory);
     }
+    bool observes_bp(std::uint8_t address) const override {
+        return address == 0x45 || address == 0x47 || address == 0x48 || address == 0x52;
+    }
     bool bp_write(const State& state, std::uint8_t address, std::uint32_t value) override {
         switch (address) {
         case 0x45:  // Draw done.

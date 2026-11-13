@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 
 using namespace starlet::gx;
@@ -567,8 +568,60 @@ void disabled_lookup_draws() {
         fast_program_rebuild(f, "disabled-lookup program rebuilds from its words");
     }
 }
+void incremental_program_keys() {
+    Fixture f;
+    const auto layout = f.command().layout;
+    std::mt19937 random(0x5107);
+    for (unsigned i = 0; i < 4000; ++i) {
+        if (i & 1) {
+            unsigned address = random() % 256;
+            if (address == 0x65 || address == 0xfe) address = 0xf3;
+            f.bp(address, random() & 0xffffff);
+        } else f.xf(0x1000 + random() % 0x58, random());
+        for (auto shading : {DirectShading::fast, DirectShading::exact}) {
+            const auto key = direct_program_key(f.decoder.state(), layout, FramebufferFetch::none, shading, 3);
+            std::vector<std::uint32_t> words;
+            direct_program_words(f.decoder.state(), layout, FramebufferFetch::none, shading, words, 3);
+            check(key.matches(f.decoder.state(), words), "incremental program key equals full register walk");
+            words[27] ^= 1;
+            check(!key.matches(f.decoder.state(), words), "program hash hits still compare exact words");
+        }
+    }
+    f.bp(0xc0, 0x123456);
+    const auto hash = f.decoder.state().program_register_hash();
+    f.bp(0xc0, 0xabcdef); f.bp(0xc0, 0x123456);
+    check(f.decoder.state().program_register_hash() == hash, "restoring register values restores the hash");
+    f.bp(0xfe, 0xff); f.bp(0xc0, 0xabcdee);
+    const auto key = direct_program_key(f.decoder.state(), layout, FramebufferFetch::none, DirectShading::fast);
+    std::vector<std::uint32_t> words;
+    direct_program_words(f.decoder.state(), layout, FramebufferFetch::none, DirectShading::fast, words);
+    check(key.matches(f.decoder.state(), words), "masked BP write updates the key with merged bits");
+}
+void draw_register_groups() {
+    Fixture f;
+    const auto original = f.decoder.state().draw_registers();
+    f.bp(0xe2, 0x123456);
+    const auto color = f.decoder.state().draw_registers();
+    check(color.hash(true) == original.hash(true) && color.matches(original, true) && !color.matches(original, false),
+          "batched keys exclude only regular TEV colours");
+    f.bp(0xe2, 0x800055);
+    check(!f.decoder.state().draw_registers().matches(color, true), "konst changes invalidate batched keys");
+    f.bp(0xe2, 0x800000); f.bp(0xe2, 0);
+    check(f.decoder.state().draw_registers().matches(original, false) &&
+          f.decoder.state().draw_registers().hash(false) == original.hash(false), "register groups restore by value");
+    f.bp(0x47, 5); f.bp(0x48, 6); f.bp(0xfe, 0xffffff);
+    check(f.decoder.state().draw_registers().matches(original, false), "tokens and masks do not change state-plan inputs");
+    f.f(0x101a, 160);
+    check(!f.decoder.state().draw_registers().matches(original, false), "viewport changes reach state-plan keys");
+    f.f(0x101a, 320);
+    f.decoder.set_texture_extent(3, {2048, 2048});
+    check(!f.decoder.state().draw_registers().matches(original, false), "host texture extents reach state-plan keys");
+}
+
 int main(int argc, char** argv) {
     try {
+        incremental_program_keys();
+        draw_register_groups();
         direct_parity_cases();
         fast_program_rebuilds();
         disabled_lookup_draws();

@@ -52,6 +52,40 @@ std::uint8_t fast_fog(const State& state) {
 }
 }
 
+DirectProgramKey direct_program_key(const State& state, const VertexLayout& layout, FramebufferFetch fetch,
+                                    DirectShading shading, std::uint8_t latched_normal) {
+    DirectProgramKey key;
+    const auto format = stream_format(layout);
+    const bool fast = shading == DirectShading::fast;
+    const std::uint32_t latched = format.normal_vectors ? 0 : latched_normal;
+    key.edges[0] = std::uint32_t{format.normal_vectors} | (std::uint32_t{format.colors} << 4) |
+                   (std::uint32_t{format.texcoords} << 8) | (static_cast<std::uint32_t>(fetch) << 16) |
+                   (std::uint32_t{fast} << 20) | (latched << 21);
+    const auto pixel = state.bp(0x43);
+    if (fast) {
+        key.count = 5;
+        key.edges[1] = (state.bp(0x40) & 1u) | ((pixel & 7) == 1 ? (state.bp(0x42) & 0x100u) : 0u);
+        key.edges[2] = identity_post(state);
+        key.edges[3] = fast_fog(state);
+        key.edges[4] = direct_program_register_word(state, shading);
+    } else {
+        key.count = 3;
+        key.edges[1] = (state.bp(0x40) & 1u) | ((pixel & 7) == 1 ? ((state.bp(0x41) & 0xfffu) << 1) |
+                       ((state.bp(0x42) & 0x100u) << 5) : 0u);
+        for (unsigned map = 0; map < 8; ++map) key.edges[2] |= texture_filter(state, map) << (map * 3);
+    }
+    key.hash = state.program_register_hash();
+    for (unsigned i = 0; i < key.count; ++i) key.hash = (key.hash ^ key.edges[i]) * 0x100000001b3ull;
+    return key;
+}
+
+bool DirectProgramKey::matches(const State& state, const std::vector<std::uint32_t>& words) const {
+    const auto& registers = state.program_registers();
+    return words.size() == registers.size() + count && words[0] == edges[0] &&
+           !std::memcmp(words.data() + 1, registers.data(), sizeof registers) &&
+           !std::memcmp(words.data() + 1 + registers.size(), edges.data() + 1, (count - 1) * sizeof(std::uint32_t));
+}
+
 void direct_program_words(const State& state, const VertexLayout& layout, FramebufferFetch fetch, DirectShading shading,
                           std::vector<std::uint32_t>& words, std::uint8_t latched_normal) {
     words.clear();

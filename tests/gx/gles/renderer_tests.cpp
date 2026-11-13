@@ -1037,6 +1037,53 @@ GlesLimits batching_limits() {
     GlesLimits limits; limits.direct.shading = DirectShading::fast; limits.direct.background_programs = false;
     return limits;
 }
+void direct_uniform_deltas() {
+    fake::track_uniforms = true;
+    GlesRenderer renderer(batching_limits()); Fixture f;
+    f.xf(0x1040, 1u << 2); // Object-space texgen keeps these draws out of particle batches.
+    f.bp(0xe2, 100u | (200u << 12));
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+    f.f(3, 10);
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+    renderer.wait_until_idle();
+    const auto first_program = fake::current_program;
+    const auto location = fake::uniform_locations.at({first_program, "uGxTevRegisters[1]"});
+    check(std::abs(fake::uniform_values.at(location)[0] - 100.0 / 255) < 1e-6,
+          "direct uniforms use the recorded TEV value");
+    const auto updates = fake::uniform_updates;
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+    renderer.wait_until_idle();
+    check(fake::uniform_updates == updates, "new segments retain unchanged per-program uniforms");
+    f.bp(0xf3, 0x3e0011);
+    f.bp(0xe2, 80u | (160u << 12));
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+    f.bp(0xf3, 0x3f0000);
+    f.bp(0xe2, 100u | (200u << 12));
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+    f.f(3, 20);
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+    renderer.wait_until_idle();
+    check(fake::current_program == first_program &&
+          std::abs(fake::uniform_values.at(location)[0] - 100.0 / 255) < 1e-6,
+          "interleaved programs keep independent uniform delta chains");
+    fake::track_uniforms = false;
+}
+void direct_state_plan_cache() {
+    GlesRenderer renderer(batching_limits()); Fixture f;
+    f.xf(0x1040, 1u << 2);
+    for (unsigned frame = 0; frame < 3; ++frame) {
+        for (unsigned color : {10u, 20u, 10u}) {
+            f.bp(0xe2, color | (color << 12));
+            renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+        }
+        renderer.wait_until_idle();
+    }
+    const auto stats = renderer.stats().direct;
+    check(stats.state_misses == 1 && stats.state_hits >= 6, "changing TEV colours reuse state plans across segments");
+    f.f(0x101c, 8388608);
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+    check(renderer.stats().direct.state_misses == stats.state_misses + 1, "viewport change cannot reuse a cached raster plan");
+}
 void direct_batched_normals() {
     std::vector<std::uint8_t> plain;
     {
@@ -1994,6 +2041,8 @@ int main() {
         direct_batch_merging();
         direct_batched_materials();
         direct_uniform_blocks();
+        direct_uniform_deltas();
+        direct_state_plan_cache();
         direct_full_matrix_block();
         direct_batched_zero_alpha();
         direct_batched_vertex_fog();

@@ -96,6 +96,8 @@ public:
     // vertex/array/texture snapshots. The decoder does not retire GPU resources.
     virtual bool draw(const State& state, const Draw& command, MemoryReader& memory) = 0;
     virtual bool bp_write(const State& state, std::uint8_t address, std::uint32_t value) = 0;
+    // Fixed for a decoder's lifetime. False omits only the callback, never the register write or TLUT operation.
+    virtual bool observes_bp(std::uint8_t) const { return true; }
     virtual bool invalidate_vertices() = 0;
     // A command whose opcode is in Limits::host_opcodes, starting at input: sets consumed to
     // its size, which must lie within input, and may apply the commands it stands for with
@@ -209,7 +211,7 @@ private:
     enum class Fast { none, applied, failed };
     Fast fast_command(const std::uint8_t* p, std::size_t remaining, unsigned depth, Budget& budget, std::size_t& consumed);
     bool fast_nop_ = false, fast_xf_ = false;
-    std::bitset<256> plain_bp_, dropped_bp_, plain_cp_;
+    std::bitset<256> plain_bp_, dropped_bp_, plain_cp_, notify_bp_;
     Budget* budget_ = nullptr; // The running feed's budget, which injected commands share.
     Counts counts_;
 };

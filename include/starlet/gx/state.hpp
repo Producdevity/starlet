@@ -107,9 +107,25 @@ public:
     struct XfWrite { std::uint64_t revision = 0; std::uint16_t first = 0, end = 0; };
     XfWrite last_xf_memory_write() const { return last_xf_memory_write_; }
     const TextureExtent& texture_extent(std::uint8_t map) const { return texture_extents_[map & 7]; }
+    // The BP/XF words that shape a direct shader, in direct_program_words order,
+    // excluding its vertex format and shading-policy-dependent suffix.
+    const std::array<std::uint32_t, 96>& program_registers() const { return program_registers_; }
+    std::uint64_t program_register_hash() const { return program_register_hash_; }
+    struct DrawRegisters {
+        std::array<std::uint32_t, 278> words{};
+        std::array<std::uint64_t, 6> hashes{};
+        std::uint64_t hash(bool batched) const;
+        bool matches(const DrawRegisters&, bool batched) const;
+    };
+    const DrawRegisters& draw_registers() const { return draw_registers_; }
 
 private:
     friend class Decoder;
+    void program_bp(std::uint8_t address, std::uint32_t value);
+    void program_xf(std::uint16_t address, std::uint32_t value);
+    void program_word(unsigned index, std::uint32_t value);
+    void draw_word(unsigned index, std::uint32_t value, unsigned group);
+    void draw_bp(std::uint8_t address, std::uint32_t value);
     EfbLayout efb_;
     std::array<std::uint32_t, 256> bp_{};
     std::array<std::uint32_t, 256> cp_{};
@@ -124,6 +140,9 @@ private:
     std::uint64_t cp_layout_revision_ = 0, matrix_index_revision_ = 0, xf_post_light_revision_ = 0;
     XfWrite last_xf_memory_write_;
     std::array<TextureExtent, 8> texture_extents_{};
+    std::array<std::uint32_t, 96> program_registers_{};
+    std::uint64_t program_register_hash_ = 0;
+    DrawRegisters draw_registers_;
 };
 
 } // namespace starlet::gx

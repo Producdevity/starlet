@@ -73,4 +73,31 @@ StreamResult append_stream_vertices(const State&, const Draw&, MemoryReader&, co
 StreamResult append_stream_records(const State&, const Draw&, MemoryReader&, const StreamFormat&,
                                    std::vector<std::uint8_t>& vertices);
 
+// Converted columns for one unchanged display-list payload and vertex layout. Array
+// bases may move; callers must discard this object when the payload or layout changes.
+class StreamGeometry {
+public:
+    StreamResult update(const State&, const Draw&, MemoryReader&, const StreamFormat&);
+    const std::vector<std::uint8_t>& vertices() const { return vertices_; }
+    const std::vector<std::uint32_t>& indices() const { return indices_; }
+    std::uint16_t changed_columns() const { return changed_; }
+    std::size_t bytes() const;
+private:
+    struct Array {
+        StreamArraySpans::Span span;
+        std::uint32_t base = 0, stride = 0;
+        std::uint64_t generation = 0;
+        bool volatile_data = false;
+        std::vector<std::uint8_t> bytes;
+    };
+    std::array<Array, 12> arrays_;
+    std::vector<std::uint8_t> vertices_;
+    std::vector<std::uint8_t> flattened_;
+    std::vector<std::uint32_t> indices_;
+    StreamResult result_;
+    std::uint16_t changed_ = 0;
+    bool valid_ = false;
+    unsigned updates_ = 0;
+};
+
 } // namespace starlet::gx
