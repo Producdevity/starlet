@@ -124,7 +124,7 @@ GlesRasterResult plan_gles_raster(const RasterSnapshot& r, bool rgba6_copy, Guar
         (r.scissor.x < r.viewport.left || r.scissor.y < gl_y ||
          double(r.scissor.x) + r.scissor.width > r.viewport.left + r.viewport.width ||
          double(r.scissor.y) + r.scissor.height > gl_y + r.viewport.height))
-        return reject("GX guard-band clipping outside the viewport is not implemented");
+        return {{RasterError::guard_band, "GX guard-band clipping outside the viewport is not implemented"}, {}};
     if (r.gen_mode & ((1u << 8) | (1u << 9) | (1u << 19)))
         return reject("flat shading, multisampling or Z-freeze is not implemented");
     if ((r.pixel_control & 0x3f) != (rgba6_copy ? 1u : 0u))

@@ -72,6 +72,9 @@ instead of one per strip.
 handled. `GuardBand::reject` refuses them, as GX clips at its guard band and GL at
 the viewport. `GuardBand::clip_to_viewport` intersects the scissor with the
 viewport, which matches a port whose renderer clips at the viewport too (Aurora's).
+A small single-matrix draw `GuardBand::reject` refuses is dropped without an error
+when every corner of its position box has W > 0 and their screen bounds miss the
+scissor: GX writes no pixel outside the scissor.
 
 `GlesDirectLimits::fractional_viewport` selects how a viewport off the pixel grid is
 handled. `FractionalViewport::reject` refuses it, since `glViewport` takes whole

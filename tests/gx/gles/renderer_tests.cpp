@@ -1327,6 +1327,41 @@ void direct_clip_culling() {
         check(renderer.stats().direct.culled_draws == 1, "clip-disabled draws are never culled");
     }
 }
+// A scissor reaching past the viewport is a guard-band rejection, unless the draw's
+// screen bounds miss the scissor: then no pixel can be written and it is dropped silently.
+void direct_guard_band_discard() {
+    // The fixture quad lands on EFB x 251..314, y 200..222 inside a 200x100 viewport at 220,178.
+    const auto setup = [](Fixture& f, int left, int top, int right, int bottom) {
+        f.f(0x101a, 100); f.f(0x101b, -50);
+        f.bp(0x20, std::uint32_t(left + 342) << 12 | std::uint32_t(top + 342));
+        f.bp(0x21, std::uint32_t(right + 342) << 12 | std::uint32_t(bottom + 342));
+    };
+    const auto rejected = [](GlesRenderer& renderer, Fixture& f) {
+        try { renderer.draw_direct(f.decoder.state(), f.command(), f.memory); }
+        catch (const std::runtime_error& e) { return std::string(e.what()).find("guard-band") != std::string::npos; }
+        return false;
+    };
+    const int misses[4][4] = {{0, 0, 240, 455}, {320, 0, 639, 455}, {0, 0, 639, 190}, {0, 230, 639, 455}};
+    for (const auto shading : {DirectShading::exact, DirectShading::fast}) {
+        GlesLimits limits; limits.direct.shading = shading;
+        for (const auto& box : misses) {
+            GlesRenderer renderer(limits); Fixture f; setup(f, box[0], box[1], box[2], box[3]);
+            renderer.draw_direct(f.decoder.state(), f.command(), f.memory);
+            renderer.wait_until_idle();
+            const auto s = renderer.stats().direct;
+            check(s.culled_draws == 1 && s.submissions == 0 && !renderer.failed(), "draws missing the scissor are dropped silently");
+        }
+        GlesRenderer renderer(limits); Fixture f; setup(f, 0, 0, 639, 455);
+        check(rejected(renderer, f), "draws overlapping a guard-band scissor are still rejected");
+        GlesRenderer behind(limits); Fixture g; setup(g, 0, 0, 240, 455);
+        g.xf(0x1005, 1); g.xf(0x1026, 0);
+        for (unsigned i = 0; i < 4; ++i) {
+            const float z = .5f; std::uint32_t bits; std::memcpy(&bits, &z, 4);
+            for (unsigned b = 0; b < 4; ++b) g.vertices[i * 32 + 8 + b] = std::uint8_t(bits >> (24 - b * 8));
+        }
+        check(rejected(behind, g), "draws with W <= 0 are still rejected");
+    }
+}
 void direct_indexed_clip_culling() {
     // Particle quads index a shared corner array and move through the position matrix.
     struct Positions : Memory {
@@ -1905,6 +1940,7 @@ int main() {
         direct_batched_zero_alpha();
         direct_batched_vertex_fog();
         direct_clip_culling();
+        direct_guard_band_discard();
         direct_indexed_clip_culling();
         direct_submission_thread();
         host_thread_submission();

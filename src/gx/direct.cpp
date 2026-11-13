@@ -258,7 +258,8 @@ DrawStatus plan_direct_state(const State& state, const DirectProgram& program, T
     if (!raster) return reject(DrawError::raster, raster.status.message);
     const auto plan = program.fast ? plan_gles_raster_fast(*raster.snapshot, guard_band, fractional)
                                    : plan_gles_raster(*raster.snapshot, program.rgba6, guard_band, fractional);
-    if (!plan) return reject(DrawError::raster, plan.status.message);
+    if (!plan)
+        return reject(plan.status.error == RasterError::guard_band ? DrawError::guard_band : DrawError::raster, plan.status.message);
     out.raster = plan.plan;
     if (out.raster.early_depth != program.early_depth) return reject(DrawError::unsupported_state, "early depth differs from program");
     const auto& fog = out.raster.fog;

@@ -1808,6 +1808,11 @@ struct GlesDirect::Impl {
     // positions alone, before any program, state or vertex conversion work. Positions are
     // dequantized as conversion does. Larger draws keep their cached boxes.
     bool early_outside_clip(const State& state, const Draw& draw, MemoryReader& memory) const {
+        std::array<float, 6> box;
+        return position_box(state, draw, memory, box) && outside_clip(state, state.matrix_index(0), box);
+    }
+    // Object-space bounds of a small single-matrix draw's positions; false when not read.
+    bool position_box(const State& state, const Draw& draw, MemoryReader& memory, std::array<float, 6>& out) const {
         const auto& position = draw.layout.position;
         if (draw.merged() || position.mode == AttributeMode::none || position.format > 4 || draw.vertex_count < 3 ||
             draw.vertex_count > 64)
@@ -1866,7 +1871,49 @@ struct GlesDirect::Impl {
                 box[3 + k] = std::max(box[3 + k], value);
             }
         }
-        return outside_clip(state, row, box);
+        out = box;
+        return true;
+    }
+    // True when the draw provably writes no pixel: its scissor reaches past the viewport, but
+    // the screen bounds of its position box miss the scissor. GX rasterizes only inside the
+    // scissor, and with W > 0 at every corner the box projects inside the corners' bounds.
+    // Lines and points widen past their positions and are never discarded.
+    bool misses_scissor(const State& state, const Draw& draw, MemoryReader& memory) const {
+        std::array<float, 6> box;
+        if (line_point(draw) || !position_box(state, draw, memory, box)) return false;
+        float m[12], p[6], v[6];
+        std::memcpy(m, state.xf_data() + state.matrix_index(0) * 4, sizeof m);
+        for (unsigned i = 0; i < 6; ++i) {
+            auto word = state.xf(static_cast<std::uint16_t>(0x1020 + i)); std::memcpy(&p[i], &word, 4);
+            word = state.xf(static_cast<std::uint16_t>(0x101a + i)); std::memcpy(&v[i], &word, 4);
+        }
+        const bool ortho = state.xf(0x1026) != 0;
+        float low[2] = {INFINITY, INFINITY}, high[2] = {-INFINITY, -INFINITY};
+        for (unsigned c = 0; c < 8; ++c) {
+            const float x = box[c & 1 ? 3 : 0], y = box[c & 2 ? 4 : 1], z = box[c & 4 ? 5 : 2];
+            const float ex = m[0] * x + m[1] * y + m[2] * z + m[3];
+            const float ey = m[4] * x + m[5] * y + m[6] * z + m[7];
+            const float ez = m[8] * x + m[9] * y + m[10] * z + m[11];
+            const float w = ortho ? 1.0f : -ez;
+            if (!std::isfinite(w) || !(w > 0)) return false;
+            const float screen[2] = {(ex * p[0] + (ortho ? p[1] : ez * p[1])) / w * v[0] + v[3],
+                                     (ey * p[2] + (ortho ? p[3] : ez * p[3])) / w * v[1] + v[4]};
+            for (unsigned a = 0; a < 2; ++a) {
+                if (!std::isfinite(screen[a])) return false;
+                low[a] = std::min(low[a], screen[a]); high[a] = std::max(high[a], screen[a]);
+            }
+        }
+        // Viewport and scissor share the quad offset, so both compare in GX screen units.
+        // A scissor the offset wraps past 2048 keeps the rejection.
+        const std::uint32_t words[2] = {state.bp(0x20), state.bp(0x21)}, offset = state.bp(0x59);
+        for (unsigned a = 0; a < 2; ++a) {
+            const int first = int((words[0] >> (a ? 0 : 12)) & 0x7ff), last = int((words[1] >> (a ? 0 : 12)) & 0x7ff);
+            const int q = int((offset >> (a ? 10 : 0)) & 0x3ff) * 2;
+            if (first - q + 2048 < (a ? EfbLayout::rows : EfbLayout::width)) return false;
+            // A pixel is written when its centre is covered; edges on the boundary cover none.
+            if (high[a] <= float(first) || low[a] >= float(last + 1)) return true;
+        }
+        return false;
     }
     // Small draws stream eye-space positions with their TEV registers so that
     // consecutive ones differing only in those merge into a single GL draw.
@@ -1937,7 +1984,11 @@ struct GlesDirect::Impl {
             states.emplace_back();
             const auto status = plan_direct_state(state, *p->plan, cmpr, states.back(), limits.guard_band,
                                                    limits.fractional_viewport);
-            if (!status) { states.pop_back(); throw std::runtime_error(status.message); }
+            if (!status) {
+                states.pop_back();
+                if (status.error == DrawError::guard_band && misses_scissor(state, draw, memory)) { ++stats.culled_draws; return true; }
+                throw std::runtime_error(status.message);
+            }
             // Culling applies to triangles only; the quads drawn for lines and points keep every face.
             if (expanded) states.back().raster.cull = 0;
             ++stats.state_plans;
@@ -2097,7 +2148,11 @@ struct GlesDirect::Impl {
             states.emplace_back();
             const auto status = plan_direct_state(state, *p.plan, cmpr, states.back(), limits.guard_band,
                                                    limits.fractional_viewport);
-            if (!status) { states.pop_back(); throw std::runtime_error(status.message); }
+            if (!status) {
+                states.pop_back();
+                if (status.error == DrawError::guard_band && misses_scissor(state, draw, memory)) { ++stats.culled_draws; return; }
+                throw std::runtime_error(status.message);
+            }
             last_state = {true, state.bp_revision(), state.xf_register_revision(), segment, &p, static_cast<std::uint32_t>(states.size() - 1)};
             for (unsigned a = 0; a < 256; ++a) planned_bp[a] = state.bp(static_cast<std::uint8_t>(a));
             for (unsigned i = 0; i < 16; ++i) planned_tev[i] = state.tev_register(i >= 8, static_cast<std::uint8_t>(i & 7));

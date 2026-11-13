@@ -29,7 +29,7 @@ struct RasterSnapshot {
     std::array<std::uint32_t, 11> fog{}; // BP e8..f2, including range coefficients.
     std::uint64_t state_revision = 0;
 };
-enum class RasterError { none, invalid_viewport, unsupported_state };
+enum class RasterError { none, invalid_viewport, unsupported_state, guard_band };
 struct RasterStatus {
     RasterError error = RasterError::none;
     std::string message;

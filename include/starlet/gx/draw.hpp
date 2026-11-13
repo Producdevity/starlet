@@ -27,7 +27,7 @@ struct DrawPacket {
     std::uint8_t texture_mask = 0;
     std::size_t retained_bytes = 0;
 };
-enum class DrawError { none, vertices, transform, tev, raster, texture, missing_input, storage_limit, unsupported_state };
+enum class DrawError { none, vertices, transform, tev, raster, texture, missing_input, storage_limit, unsupported_state, guard_band };
 struct DrawStatus {
     DrawError error = DrawError::none;
     std::string message;
