@@ -425,9 +425,29 @@ void depth_query_transfer_bounds() {
     check(fake::draws==calls,"invalid depth query performs no GL draw");
     glPixelStorei(GL_PACK_SKIP_ROWS,5);glPixelStorei(GL_PACK_SKIP_PIXELS,9);glBindBuffer(GL_PIXEL_PACK_BUFFER,123);
     renderer.peek_depth(639,455);
-    check(fake::pack_seen==0&&fake::pack_pbo_seen==0&&fake::pack_required==4,"depth read resets pack state for exactly one RGBA pixel");
-    fake::error=GL_INVALID_OPERATION;rejects([&]{renderer.peek_depth(0,0);},"driver depth failure reported");
-    rejects([&]{renderer.peek_depth(0,0);},"failed depth renderer remains poisoned");
+    check(fake::pack_seen==0&&fake::pack_pbo_seen==0&&fake::pack_required==640u*456u*4u,"depth read resets pack state for the EFB's RGBA depth");
+    GlesRenderer failing;
+    fake::error=GL_INVALID_OPERATION;rejects([&]{failing.peek_depth(0,0);},"driver depth failure reported");
+    rejects([&]{failing.peek_depth(0,0);},"failed depth renderer remains poisoned");
+}
+// Live depth peeks with no EFB write between them share one readback of the whole EFB's depth;
+// an EFB write in between makes the next peek read it again.
+void live_depth_peeks_share_a_readback() {
+    GlesRenderer renderer; Fixture f; const auto command=f.command();
+    renderer.draw_direct(f.decoder.state(),command,f.memory);
+    auto reads=fake::read_pixels;
+    renderer.peek_depth(10,10); renderer.peek_depth(20,30); renderer.peek_depth(600,400);
+    check(fake::read_pixels==reads+1 && fake::pack_required==640u*456u*4u && renderer.stats().live_peeks==3,
+          "three peeks with no EFB write between them read the EFB's depth once");
+    reads=fake::read_pixels;
+    renderer.draw_direct(f.decoder.state(),command,f.memory);
+    renderer.peek_depth(10,10); renderer.peek_depth(11,10);
+    check(fake::read_pixels==reads+1,"an EFB write between peeks makes the next one read again");
+    reads=fake::read_pixels;
+    EfbClear clear; clear.rectangle={0,0,640,456}; clear.color_write=true; clear.depth_write=true;
+    renderer.clear_efb(clear);
+    renderer.peek_depth(10,10);
+    check(fake::read_pixels==reads+1,"an EFB clear counts as a write");
 }
 void validation_precedes_mutation() {
     GlesRenderer renderer;
@@ -1935,7 +1955,7 @@ int main() {
         validation_precedes_mutation();
         warm_shader_validation(); rgb8_replacement_boundary(); clear_boundary(); efb_layout_boundary();
         display_copy_boundary(); repeated_presentation();
-        direct_draw_path();
+        direct_draw_path(); live_depth_peeks_share_a_readback();
         rejected_program_skips_draws();
         unready_program_policy();
         program_reuse_across_tev_colours();

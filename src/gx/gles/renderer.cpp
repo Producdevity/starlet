@@ -365,6 +365,10 @@ struct GlesRenderer::Impl {
     // last one shares its slot instead of packing the same depth again.
     std::vector<unsigned> snapshot_refs;
     int last_snapshot = -1;
+    // The EFB's packed depth, read whole by the first live depth peek after efb_writes reached
+    // live_depth_writes; later peeks before the next EFB write read it (bottom row first).
+    std::vector<std::uint8_t> live_depth;
+    std::uint64_t live_depth_writes = ~std::uint64_t{0};
     std::uint64_t efb_writes = 0, last_snapshot_writes = 0;
     // Each packed snapshot is read back asynchronously into its buffer; once the fence
     // signals, the GL thread maps it and publishes the generation, so peeks read single
@@ -1271,6 +1275,7 @@ GlesRenderer::GlesRenderer(GlesLimits limits) : impl_(std::make_unique<Impl>(lim
 GlesRenderer::~GlesRenderer() = default;
 void GlesRenderer::clear(std::array<std::uint8_t, 3> color) {
     auto& g = *impl_; g.require_ready();
+    ++g.efb_writes;
     try {
         glBindFramebuffer(GL_FRAMEBUFFER, g.framebuffer);
         glDisable(GL_SCISSOR_TEST); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); glDepthMask(GL_TRUE);
@@ -1342,6 +1347,7 @@ void GlesRenderer::end_bloom(const EfbBloom& bloom) {
     auto& g = *impl_; g.require_ready();
     if (!g.bloom_open) throw std::logic_error("native bloom ended without begin");
     g.bloom_open = false;
+    ++g.efb_writes;
     g.execute([&g, bloom] { g.end_bloom_gl(bloom); }, false);
 }
 void GlesRenderer::Impl::bloom_resources() {
@@ -2186,11 +2192,16 @@ std::uint32_t GlesRenderer::peek_depth(int x, int y) {
     g.require_ready();
     if (const auto* pixel = g.peek_snapshot(x, y, false)) return packed_depth(pixel);
     ++g.stats.live_peeks;
-    std::array<std::uint8_t,4> pixel{};
-    g.execute([&] {
-        try { g.read_depth(x,g.efb_height-1-y,1,1,pixel.data(),-1); } catch (...) {g.failed=true;throw;}
-    }, true);
-    return packed_depth(pixel.data());
+    // Points tested in a row with no EFB write between them (RE4's lens flares and glows test 12
+    // each) wait for queued GL work once: the first reads the whole EFB's depth as of that point.
+    if (g.live_depth_writes != g.efb_writes) {
+        g.live_depth.resize(std::size_t(g.efb_width) * g.efb_height * 4);
+        g.execute([&] {
+            try { g.read_depth(0,0,g.efb_width,g.efb_height,g.live_depth.data(),-1); } catch (...) {g.failed=true;throw;}
+        }, true);
+        g.live_depth_writes = g.efb_writes;
+    }
+    return packed_depth(&g.live_depth[(std::size_t(g.efb_height-1-y) * g.efb_width + x) * 4]);
 }
 std::uint32_t GlesRenderer::peek_color(int x, int y) {
     auto& g = *impl_; g.check_owner();
