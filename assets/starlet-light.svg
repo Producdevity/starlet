@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="160 240 1400 445" width="2240" height="712" role="img" aria-label="Starlet GX to GLES logo, light theme">
+  <title>Starlet — light theme</title>
+  <desc>Clean vector Starlet wordmark. A is a GX vertex triangle; three separate console-inspired input streams converge to one output.</desc>
+
+  <rect x="0" y="0" width="1672" height="941" fill="#F7F8FA"/>
+  
+  <g id="wordmark" fill="#101724" fill-rule="evenodd">
+    <!-- Hand-drawn cubic outlines: no trace, font or embedded bitmap. -->
+    <path id="S" d="M388 343 H250 C220 343 195 367 195 395 C195 425 221 445 255 445 H329 C343 445 350 451 350 462 C350 473 343 481 330 481 H222 C212 481 208 485 204 493 L193 518 H332 C368 518 392 497 392 469 C392 438 367 412 335 412 H258 C246 412 240 407 240 397 C240 387 247 378 260 378 H369 Z"/>
+    <path id="T1" d="M412 343 H585 L570 371 C568 376 565 378 559 378 H506 V518 H462 V378 H390 L406 348 Q408 343 412 343 Z"/>
+    <path id="R" d="M805 343 H925 C965 343 988 361 988 393 C988 423 968 447 935 451 H919 L986 518 H936 L868 451 H850 V518 H805 Z M850 378 V416 H929 C940 416 945 408 945 398 C945 387 936 378 926 378 Z"/>
+    <path id="L" d="M1007 343 H1051 V481 H1158 L1141 511 C1139 516 1136 518 1131 518 H1037 C1017 518 1007 506 1007 490 Z"/>
+    <path id="E" d="M1199 343 H1334 L1317 373 C1315 376 1313 378 1308 378 H1212 V412 H1320 L1306 440 C1304 444 1300 446 1295 446 H1212 V481 H1350 L1335 511 C1333 516 1329 518 1325 518 H1201 C1178 518 1167 504 1167 481 V378 C1167 359 1180 343 1199 343 Z"/>
+    <path id="T2" d="M1359 343 H1529 L1513 373 C1511 376 1507 378 1503 378 H1455 V518 H1411 V378 H1339 L1356 347 Q1358 343 1359 343 Z"/>
+  </g>
+
+  
+  <g id="geometry-a" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- A is made from one triangle and three spokes; nodes cover line ends exactly. -->
+    <path id="outer-triangle" d="M659 315 L550 489 H763 Z" stroke="#101724" stroke-width="12.5"/>
+    <path id="input-indigo" d="M659 315 V423" stroke="#6B5CB1" stroke-width="12"/>
+    <path id="input-blue" d="M550 489 L659 423" stroke="#34B4ED" stroke-width="12"/>
+    <path id="input-grey" d="M763 489 L659 423" stroke="#8C8C8C" stroke-width="12"/>
+  </g>
+  <g id="vertices" fill="#101724">
+    <circle cx="659" cy="315" r="19"/>
+    <circle cx="550" cy="489" r="19"/>
+    <circle cx="763" cy="489" r="19"/>
+    <circle cx="659" cy="423" r="19"/>
+  </g>
+
+  
+  <g id="TEV-underline">
+    <!-- Three precise bands merge into a single output. -->
+    <path id="stream-gamecube" fill="#6B5CB1" d="M238 546 H1020 C1055 546 1071 559 1097 572 C1066 573 1049 563 1020 563 H229 Z"/>
+    <path id="stream-wii-blue" fill="#34B4ED" d="M223 573 H1030 C1060 573 1074 582 1094 582 V591 H214 Z"/>
+    <path id="stream-wii-grey" fill="#8C8C8C" d="M209 600 H1030 C1058 600 1075 591 1097 591 C1075 610 1053 618 1021 618 H199 Z"/>
+    <!-- One solid neutral output, rather than a palette claim about GX. -->
+    <path id="tev-output" fill="#101724" d="M1094 573 H1301 L1291 591 H1094 Z"/>
+    <g id="slashes" fill="#101724">
+      <path d="M1328 562 H1364 L1340 596 H1305 Z"/>
+      <path d="M1382 562 H1417 L1393 596 H1358 Z"/>
+      <path d="M1437 562 H1472 L1448 596 H1413 Z"/>
+    </g>
+  </g>
+
+</svg>

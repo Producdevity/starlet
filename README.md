@@ -1,4 +1,10 @@
-# Starlet
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/starlet-transparent.svg">
+    <img src="assets/starlet-light.svg" alt="Starlet" width="640">
+  </picture>
+</div>
+<br/>
 
 Starlet is a source-level GameCube and Wii compatibility layer for decompilation
 ports to Linux ARM handhelds: OpenGL ES 3.1 on Mali-class GPUs, the firmware's
