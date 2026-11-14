@@ -1,7 +1,9 @@
 #include "starlet/gx/vertex_stream.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <limits>
 #include <unordered_map>
 #if defined(__aarch64__)
@@ -569,6 +571,42 @@ std::size_t StreamGeometry::bytes() const {
     return size;
 }
 
+std::string StreamGeometry::describe_sources(const State& state, MemoryReader& memory) const {
+    std::string text = "updates=" + std::to_string(updates_) + " changed=" + std::to_string(changed_) + "\n";
+    char line[512];
+    for (unsigned i = 0; i < arrays_.size(); ++i) {
+        const auto& a = arrays_[i];
+        if (a.span.first == a.span.end) continue;
+        const auto base = state.cp(static_cast<std::uint8_t>(0xa0 + i));
+        const auto view = memory.array_view(base);
+        std::size_t first = SIZE_MAX, last = 0;
+        std::uint64_t generation = 0;
+        if (view.bytes.data && a.span.end <= view.bytes.size) {
+            generation = memory.range_generation(view, base + a.span.first, a.span.end - a.span.first);
+            for (std::size_t k = 0; k < a.bytes.size(); ++k)
+                if (view.bytes.data[a.span.first + k] != a.bytes[k]) { if (first == SIZE_MAX) first = k; last = k; }
+        }
+        std::snprintf(line, sizeof line, "  array %u base=%08x snapbase=%08x stride=%u span=[%zu,%zu) volatile=%d snapgen=%llu nowgen=%llu diff=%s",
+                      i, base, a.base, a.stride, a.span.first, a.span.end, int(a.volatile_data),
+                      (unsigned long long)a.generation, (unsigned long long)generation, first == SIZE_MAX ? "none" : "yes");
+        text += line;
+        if (first != SIZE_MAX) {
+            std::snprintf(line, sizeof line, " bytes[%zu..%zu] (span off %zu) snap=", first, last, a.span.first + first);
+            text += line;
+            for (std::size_t k = first; k < std::min(first + 16, a.bytes.size()); ++k) { std::snprintf(line, 8, "%02x", a.bytes[k]); text += line; }
+            text += " now=";
+            for (std::size_t k = first; k < std::min(first + 16, a.bytes.size()); ++k) { std::snprintf(line, 8, "%02x", view.bytes.data[a.span.first + k]); text += line; }
+        }
+        text += "\n";
+    }
+    return text;
+}
+
+bool StreamGeometry::settled() const {
+    for (const auto& array : arrays_) if (array.untrusted) return false;
+    return true;
+}
+
 StreamResult StreamGeometry::update(const State& state, const Draw& draw, MemoryReader& memory, const StreamFormat& format) {
     const bool full = (++updates_ & 63) == 0;
     // Equal FIFO tuples keep the same source attributes even when the arrays move.
@@ -583,6 +621,7 @@ StreamResult StreamGeometry::update(const State& state, const Draw& draw, Memory
     if (valid_) for (unsigned i = 0; i < arrays_.size(); ++i) {
         auto& old = arrays_[i];
         if (old.span.first == old.span.end) continue;
+        if (old.untrusted) { changed_ |= 1u << i; continue; }
         const auto base = state.cp(static_cast<std::uint8_t>(0xa0 + i));
         const auto stride = state.cp(static_cast<std::uint8_t>(0xb0 + i)) & 255;
         const auto view = memory.array_view(base);
@@ -600,6 +639,20 @@ StreamResult StreamGeometry::update(const State& state, const Draw& draw, Memory
             changed_ |= 1u << i;
         }
         else { old.base = base; old.generation = generation; }
+    }
+    // A writer may change an array while it is converted. The snapshot is the bytes before the
+    // conversion, so the cache never holds a snapshot newer than the vertices it describes.
+    struct Before { std::vector<std::uint8_t> bytes; std::uint64_t generation = 0; bool read = false; };
+    std::array<Before, 12> before;
+    for (unsigned i = 0; i < arrays_.size(); ++i) {
+        const auto& old = arrays_[i];
+        if (!(changed_ & (1u << i)) || old.span.first == old.span.end) continue;
+        const auto base = state.cp(static_cast<std::uint8_t>(0xa0 + i));
+        const auto view = memory.array_view(base);
+        if (!view.bytes.data || old.span.end > view.bytes.size) continue;
+        before[i].generation = memory.range_generation(view, base + old.span.first, old.span.end - old.span.first);
+        before[i].bytes.assign(view.bytes.data + old.span.first, view.bytes.data + old.span.end);
+        before[i].read = true;
     }
     StreamArraySpans spans;
     if (!valid_) {
@@ -640,8 +693,10 @@ StreamResult StreamGeometry::update(const State& state, const Draw& draw, Memory
     if (!result_) return result_;
     for (unsigned i = 0; i < arrays_.size(); ++i) if (changed_ & (1u << i)) {
         auto& out = arrays_[i];
+        const auto previous = out.span;
         out.span = spans.arrays[i];
         out.bytes.clear();
+        out.untrusted = false;
         if (out.span.first == out.span.end) continue;
         out.base = state.cp(static_cast<std::uint8_t>(0xa0 + i));
         out.stride = state.cp(static_cast<std::uint8_t>(0xb0 + i)) & 255;
@@ -649,6 +704,12 @@ StreamResult StreamGeometry::update(const State& state, const Draw& draw, Memory
         if (!view.bytes.data || out.span.end > view.bytes.size) { valid_ = false; continue; }
         out.generation = memory.range_generation(view, out.base + out.span.first, out.span.end - out.span.first);
         out.bytes.assign(view.bytes.data + out.span.first, view.bytes.data + out.span.end);
+        // Unchanged bytes across the conversion prove it read them. Without an earlier read of
+        // this range, a tracked array's reported writes still bump its generation; an untracked
+        // one is converted again by the next update, which then has the earlier read.
+        const bool same_range = before[i].read && previous.first == out.span.first && previous.end == out.span.end;
+        if (same_range && before[i].bytes == out.bytes) out.generation = before[i].generation;
+        else if (same_range || !out.generation) out.untrusted = true;
     }
     return result_;
 }

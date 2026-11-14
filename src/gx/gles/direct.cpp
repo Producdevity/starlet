@@ -1712,12 +1712,18 @@ struct GlesDirect::Impl {
             entry.fifo.assign(draw.vertices.data, draw.vertices.data + draw.vertices.size);
         }
         entry.generation = identity.generation;
+        static const bool verify = std::getenv("STARLET_VERIFY_STREAM") != nullptr;
+        // The source memory is written while it is read: the cache is only wrong when the memory
+        // held the same bytes before the update and after the comparison conversion.
+        std::vector<std::uint8_t> before_vertices;
+        std::vector<std::uint32_t> before_indices;
+        StreamResult before;
+        if (verify) before = append_stream_vertices(state, draw, memory, format, before_vertices, before_indices, 0);
         const auto result = entry.stream.update(state, draw, memory, format);
         converted_bytes = converted_bytes - old_bytes + bytes();
         if (!result) return result;
         if (entry.stream.changed_columns()) ++stats.stream_updates;
         else ++stats.stream_reuses;
-        static const bool verify = std::getenv("STARLET_VERIFY_STREAM") != nullptr;
         if (verify) {
             std::vector<std::uint8_t> reference_vertices;
             std::vector<std::uint32_t> reference_indices;
@@ -1728,9 +1734,10 @@ struct GlesDirect::Impl {
                                 entry.stream.vertices().data() + std::size_t{entry.stream.indices()[i]} * format.stride, format.stride)) {
                     equal = false; break;
                 }
-            if (!equal)
-                throw std::runtime_error("cached stream differs from scalar conversion");
-            ++stats.stream_verified;
+            const bool memory_stable = before.error == reference.error && before_vertices == reference_vertices && before_indices == reference_indices;
+            if (!equal && memory_stable && entry.stream.settled())
+                throw std::runtime_error("cached stream differs from scalar conversion: " + entry.stream.describe_sources(state, memory));
+            if (equal) ++stats.stream_verified;
         }
         if (object_bounds) *object_bounds = entry.stream.position_bounds();
         if (retained && result.vertices >= 8 && !format.registers) {

@@ -4,6 +4,7 @@
 #include "starlet/gx/vertex.hpp"
 
 #include <cstring>
+#include <string>
 #include <cmath>
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -114,12 +115,18 @@ public:
     std::uint16_t changed_columns() const { return changed_; }
     const std::array<float, 6>& position_bounds() const { return bounds_; }
     std::size_t bytes() const;
+    // False while a consumed array may hold bytes the conversion did not read: the next update
+    // converts it again.
+    bool settled() const;
+    // Debug text: each consumed array's snapshot against the bytes in memory now.
+    std::string describe_sources(const State&, MemoryReader&) const;
 private:
     struct Array {
         StreamArraySpans::Span span;
         std::uint32_t base = 0, stride = 0;
         std::uint64_t generation = 0;
         bool volatile_data = false;
+        bool untrusted = false;
         std::vector<std::uint8_t> bytes;
     };
     std::array<Array, 12> arrays_;

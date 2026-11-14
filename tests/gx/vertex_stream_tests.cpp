@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <functional>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -19,6 +20,12 @@ struct Memory final : MemoryReader {
     std::map<std::uint32_t, bool> host_order;
     std::map<std::uint32_t, std::uint64_t> generations;
     bool array_views = true;
+    unsigned range_generation_calls_before_hook = 0;
+    std::function<void()> on_range_generation; // A writer running while a snapshot is taken.
+    std::uint64_t range_generation(const MemoryArrayView& view, std::uint32_t address, std::size_t size) override {
+        if (on_range_generation && range_generation_calls_before_hook-- == 0) { auto hook = std::move(on_range_generation); on_range_generation = nullptr; hook(); }
+        return MemoryReader::range_generation(view, address, size);
+    }
     MemoryArrayView array_view(std::uint32_t address) override {
         if (!array_views) return {};
         auto it = regions.upper_bound(address);
@@ -455,6 +462,43 @@ void large_merged_tuple_updates() {
     }
 }
 
+void write_during_conversion() {
+    Fixture f; f.cp(0x50, 2u << 9); f.cp(0x70, 1u | (3u << 1));
+    f.cp(0xa0, 0x1000); f.cp(0xb0, 6);
+    f.memory.regions[0x1000] = std::vector<std::uint8_t>(18);
+    // Untracked writes: the generation stays 0.
+    Draw draw; draw.primitive = 0x90; draw.vertex_count = 6;
+    const std::uint8_t fifo[] = {0, 1, 2, 0, 1, 2};
+    draw.vertices = {fifo, sizeof fifo};
+    std::string error; require(f.decoder.state().vertex_layout(0, draw.layout, error), error);
+    const auto format = stream_format(draw.layout); StreamGeometry cached;
+    auto fresh_equals_cached = [&] {
+        std::vector<std::uint8_t> vertices; std::vector<std::uint32_t> indices;
+        require(bool(append_stream_vertices(f.decoder.state(), draw, f.memory, format, vertices, indices, 0)), "fresh conversion");
+        require(indices.size() == cached.indices().size(), "index count");
+        for (std::size_t i = 0; i < indices.size(); ++i)
+            require(!std::memcmp(vertices.data() + indices[i] * format.stride,
+                                 cached.vertices().data() + cached.indices()[i] * format.stride, format.stride),
+                    "a write after the conversion read the array is not served as converted data");
+    };
+    // The writer runs after the first conversion read the array and before its snapshot.
+    f.memory.on_range_generation = [&] { f.memory.regions[0x1000][1] = 7; };
+    require(bool(cached.update(f.decoder.state(), draw, f.memory, format)), "cold update");
+    require(!cached.settled(), "a snapshot newer than the conversion is not trusted");
+    require(bool(cached.update(f.decoder.state(), draw, f.memory, format)), "refresh");
+    fresh_equals_cached();
+    require(cached.settled(), "a conversion over unchanged memory is trusted");
+    // The same race on an update that already knows the array's extent.
+    f.memory.regions[0x1000][4] = 9;
+    f.memory.range_generation_calls_before_hook = 2; // Past the change check and the earlier read.
+    f.memory.on_range_generation = [&] { f.memory.regions[0x1000][3] = 5; };
+    require(bool(cached.update(f.decoder.state(), draw, f.memory, format)), "changed update");
+    require(!cached.settled(), "a write during an update of a known array is detected");
+    require(bool(cached.update(f.decoder.state(), draw, f.memory, format)), "second refresh");
+    fresh_equals_cached();
+    require(cached.settled(), "memory stable across the conversion settles");
+}
+
 int main() {
     try {
         eye_transform_parity();
@@ -466,6 +510,7 @@ int main() {
         merged_tuple_updates();
         large_merged_tuple_updates();
         cached_gather_bounds();
+        write_during_conversion();
         merged_runs();
     } catch (const std::exception& error) {
         std::cerr << "gx_vertex_stream_tests: " << error.what() << '\n';
