@@ -617,11 +617,33 @@ void draw_register_groups() {
     f.decoder.set_texture_extent(3, {2048, 2048});
     check(!f.decoder.state().draw_registers().matches(original, false), "host texture extents reach state-plan keys");
 }
+void lazy_register_sync() {
+    // Keys read after every write against keys read after bursts: the same final registers give the same keys.
+    Fixture eager, lazy;
+    std::mt19937 random(0x1a2b);
+    for (unsigned i = 0; i < 6000; ++i) {
+        const bool bp = random() & 1;
+        unsigned address = bp ? (random() % 4 ? 0xe0 + random() % 8 : random() % 256) : 0x1000 + random() % 0x58;
+        if (address == 0x65 || address == 0xfe) address = 0xf3;
+        const std::uint32_t value = (random() % 3 ? random() : 0) & (bp ? 0xffffff : ~0u);
+        for (auto* f : {&eager, &lazy}) { if (bp) f->bp(address, value); else f->xf(address, value); }
+        const auto& a = eager.decoder.state();
+        const auto registers = a.draw_registers();
+        const auto program_hash = a.program_register_hash();
+        if (random() % 24 == 0) {
+            const auto& b = lazy.decoder.state();
+            check(b.draw_registers().matches(registers, false) && b.draw_registers().hash(false) == registers.hash(false) &&
+                  b.draw_registers().hash(true) == registers.hash(true) && b.program_register_hash() == program_hash &&
+                  b.program_registers() == a.program_registers(), "burst-read register keys equal per-write keys");
+        }
+    }
+}
 
 int main(int argc, char** argv) {
     try {
         incremental_program_keys();
         draw_register_groups();
+        lazy_register_sync();
         direct_parity_cases();
         fast_program_rebuilds();
         disabled_lookup_draws();

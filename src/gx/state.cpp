@@ -4,15 +4,19 @@
 #include <cstring>
 #include <stdexcept>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 namespace starlet::gx {
 namespace {
 constexpr auto register_coefficients = [] {
-    std::array<std::uint64_t, 278> result{};
+    std::array<std::uint32_t, 278> result{};
     for (std::size_t i = 0; i < result.size(); ++i) {
         auto value = (i + 1) * 0x9e3779b97f4a7c15ull;
         value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
         value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
-        result[i] = (value ^ (value >> 31)) | 1;
+        result[i] = static_cast<std::uint32_t>(value ^ (value >> 31)) | 1;
     }
     return result;
 }();
@@ -20,7 +24,6 @@ constexpr auto register_coefficients = [] {
 struct RegisterMapping {
     std::uint16_t program = 0xffff, draw = 0xffff;
     std::uint32_t mask = ~0u;
-    std::uint8_t group = 0;
 };
 constexpr auto bp_mapping = [] {
     std::array<RegisterMapping, 256> result{};
@@ -33,10 +36,10 @@ constexpr auto bp_mapping = [] {
         else if (a == 0xf3) { m.program = 85; m.mask = 0xff0000u; }
         else if (a >= 0xf5 && a < 0xfe) m.program = 86 + a - 0xf5;
         else if (a == 0x43) m.program = 95;
-        if (a >= 0x80 && a < 0xc0) { m.draw = a; m.group = 1; }
-        else if (a >= 0xe8 && a <= 0xf2) { m.draw = a; m.group = 3; }
+        if (a >= 0x80 && a < 0xc0) m.draw = a;
+        else if (a >= 0xe8 && a <= 0xf2) m.draw = a;
         else if (a == 0 || (a >= 0x20 && a <= 0x22) || (a >= 0x30 && a <= 0x44) || a == 0x59 || a == 0x68) {
-            m.draw = a; m.group = 2;
+            m.draw = a;
         } else if ((a >= 6 && a < 0x20) || (a >= 0x25 && a < 0x30) ||
                    (a >= 0xc0 && a < 0xe0) || (a >= 0xf3 && a < 0xfe)) m.draw = a;
     }
@@ -46,7 +49,7 @@ constexpr auto xf_mapping = [] {
     std::array<RegisterMapping, 88> result{};
     for (unsigned a = 0; a < result.size(); ++a) {
         auto& m = result[a];
-        if (a >= 0x1a && a < 0x20) { m.draw = 256 + a - 0x1a; m.group = 4; }
+        if (a >= 0x1a && a < 0x20) m.draw = 256 + a - 0x1a;
         if (a == 5) m.program = 0;
         else if (a == 9) m.program = 1;
         else if (a >= 0x0e && a <= 0x12) m.program = 2 + a - 0x0e;
@@ -89,38 +92,128 @@ State::State(EfbLayout efb) : efb_(efb) {
     bp_[0xfe] = bp_mask_;
 }
 
-void State::program_word(unsigned index, std::uint32_t value) {
+void State::program_word(unsigned index, std::uint32_t value) const {
     auto& old = program_registers_[index];
     if (old == value) return;
-    program_register_hash_ += (std::uint64_t{value} - old) * register_coefficients[index];
+    program_lanes_[index & 3] += (value - old) * register_coefficients[index];
     old = value;
 }
 
-void State::program_bp(std::uint8_t address, std::uint32_t value) {
+void State::program_bp(std::uint8_t address) const {
     const auto& mapping = bp_mapping[address];
-    if (address >= 0xe0 && address <= 0xe7)
-        draw_word(value & 0x800000 ? address : 270 + address - 0xe0, value & 0x7fffff, value & 0x800000 ? 0 : 5);
-    else if (mapping.draw != 0xffff) draw_word(mapping.draw, value, mapping.group);
+    const auto value = bp_[address];
+    if (address >= 0xe0 && address <= 0xe7) {
+        // Each bank keeps its own value, so both are read back whichever one the last write hit.
+        draw_word(address, tev_registers_[1][address - 0xe0]);
+        draw_word(270 + address - 0xe0, tev_registers_[0][address - 0xe0]);
+    } else if (mapping.draw != 0xffff) draw_word(mapping.draw, value);
     if (mapping.program != 0xffff) program_word(mapping.program, value & mapping.mask);
 }
 
-void State::program_xf(std::uint16_t address, std::uint32_t value) {
-    if (address < 0x1000 || address >= 0x1058) return;
+void State::program_xf(std::uint16_t address) const {
     const auto& mapping = xf_mapping[address - 0x1000];
-    if (mapping.draw != 0xffff) draw_word(mapping.draw, value, mapping.group);
+    const auto value = xf_[address];
+    if (mapping.draw != 0xffff) draw_word(mapping.draw, value);
     if (mapping.program != 0xffff) program_word(mapping.program, value);
 }
 
+namespace {
+// Lane l holds the sum of word * coefficient over indices congruent to l mod 4, in 32-bit arithmetic.
+void weighted_lanes(const std::uint32_t* words, unsigned first, unsigned count, std::uint32_t* lanes) {
+    std::uint32_t sums[4] = {};
+    unsigned i = 0;
+    for (; i < count && ((first + i) & 3); ++i) sums[(first + i) & 3] += words[i] * register_coefficients[first + i];
+#if defined(__ARM_NEON)
+    auto acc = vld1q_u32(sums);
+    for (; i + 4 <= count; i += 4) acc = vmlaq_u32(acc, vld1q_u32(words + i), vld1q_u32(register_coefficients.data() + first + i));
+    vst1q_u32(sums, acc);
+#else
+    for (; i + 4 <= count; i += 4)
+        for (unsigned l = 0; l < 4; ++l) sums[l] += words[i + l] * register_coefficients[first + i + l];
+#endif
+    for (; i < count; ++i) sums[(first + i) & 3] += words[i] * register_coefficients[first + i];
+    std::memcpy(lanes, sums, sizeof sums);
+}
+}
+
+// Every key word and hash from the register images: the same result as applying each changed
+// register, at a flat cost, for draws that follow many register writes.
+void State::rebuild_registers() const {
+    static constexpr auto draw_mask = [] {
+        std::array<std::uint32_t, 256> mask{};
+        for (unsigned a = 0; a < 256; ++a) mask[a] = bp_mapping[a].draw != 0xffff ? ~0u : 0u;
+        return mask;
+    }();
+    auto& w = draw_registers_.words;
+    for (unsigned a = 0; a < 256; ++a) w[a] = bp_[a] & draw_mask[a];
+    for (unsigned i = 0; i < 8; ++i) {
+        w[0xe0 + i] = tev_registers_[1][i];
+        w[270 + i] = tev_registers_[0][i];
+    }
+    for (unsigned i = 0; i < 6; ++i) w[256 + i] = xf_[0x101a + i];
+    weighted_lanes(w.data(), 0, 270, draw_registers_.lanes.data());
+    weighted_lanes(w.data() + 270, 270, 8, draw_registers_.lanes.data() + 4);
+    auto& p = program_registers_;
+    p[0] = xf_[0x1005];
+    p[1] = xf_[0x1009];
+    for (unsigned i = 0; i < 5; ++i) p[2 + i] = xf_[0x100e + i];
+    p[7] = xf_[0x1026];
+    p[8] = xf_[0x103f];
+    for (unsigned i = 0; i < 8; ++i) {
+        p[9 + i] = xf_[0x1040 + i];
+        p[17 + i] = xf_[0x1050 + i];
+    }
+    p[25] = bp_[0] & ~0xc000u;
+    for (unsigned i = 0; i < 16; ++i) p[26 + i] = bp_[0x10 + i];
+    for (unsigned i = 0; i < 11; ++i) p[42 + i] = bp_[0x25 + i];
+    for (unsigned i = 0; i < 32; ++i) p[53 + i] = bp_[0xc0 + i];
+    p[85] = bp_[0xf3] & 0xff0000u;
+    for (unsigned i = 0; i < 9; ++i) p[86 + i] = bp_[0xf5 + i];
+    p[95] = bp_[0x43];
+    weighted_lanes(p.data(), 0, 96, program_lanes_.data());
+}
+
+void State::sync_dirty() const {
+    // Registers that no key covers are dropped here, in four mask operations.
+    static constexpr auto covered = [] {
+        std::array<std::uint64_t, 4> bits{};
+        for (unsigned a = 0; a < 256; ++a)
+            if (bp_mapping[a].program != 0xffff || bp_mapping[a].draw != 0xffff || (a >= 0xe0 && a <= 0xe7))
+                bits[a >> 6] |= std::uint64_t{1} << (a & 63);
+        return bits;
+    }();
+    std::array<std::uint64_t, 4> bp;
+    unsigned count = __builtin_popcountll(xf_dirty_[0]) + __builtin_popcountll(xf_dirty_[1]);
+    for (unsigned w = 0; w < 4; ++w) {
+        bp[w] = bp_dirty_[w] & covered[w];
+        bp_dirty_[w] = 0;
+        count += __builtin_popcountll(bp[w]);
+    }
+    // Past a handful of changes the flat rebuild is cheaper than updating each word.
+    if (count > 6) {
+        xf_dirty_ = {};
+        rebuild_registers();
+        return;
+    }
+    for (unsigned w = 0; w < 4; ++w)
+        for (auto bits = bp[w]; bits; bits &= bits - 1) program_bp(static_cast<std::uint8_t>(w * 64 + __builtin_ctzll(bits)));
+    for (unsigned w = 0; w < 2; ++w) {
+        auto bits = xf_dirty_[w];
+        xf_dirty_[w] = 0;
+        for (; bits; bits &= bits - 1) program_xf(static_cast<std::uint16_t>(0x1000 + w * 64 + __builtin_ctzll(bits)));
+    }
+}
+
 std::uint64_t State::DrawRegisters::hash(bool batched) const {
-    return hashes[0] ^ hashes[1] ^ hashes[2] ^ hashes[3] ^ hashes[4] ^ (batched ? 0 : hashes[5]);
+    return fold_lanes(lanes.data()) ^ (batched ? 0 : fold_lanes(lanes.data() + 4) * 0xd6e8feb86659fd93ull);
 }
 bool State::DrawRegisters::matches(const DrawRegisters& other, bool batched) const {
     return !std::memcmp(words.data(), other.words.data(), (batched ? 270 : words.size()) * sizeof(words[0]));
 }
-void State::draw_word(unsigned index, std::uint32_t value, unsigned group) {
+void State::draw_word(unsigned index, std::uint32_t value) const {
     auto& old = draw_registers_.words[index];
     if (old == value) return;
-    draw_registers_.hashes[group] += (std::uint64_t{value} - old) * register_coefficients[index];
+    draw_registers_.lanes[(index >= 270 ? 4 : 0) + (index & 3)] += (value - old) * register_coefficients[index];
     old = value;
 }
 std::uint32_t State::tev_register(bool konst, std::uint8_t half) const {

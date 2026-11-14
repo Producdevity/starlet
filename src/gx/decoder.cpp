@@ -135,7 +135,7 @@ bool Decoder::apply_bp(std::uint32_t word) {
         state_.bp_[0xfe] = state_.bp_mask_;
     }
     if (changed) {
-        state_.program_bp(address, state_.bp_[address]);
+        state_.mark_bp(address);
         ++state_.revision_;
         ++state_.bp_revision_;
         if (!color_register) ++state_.bp_state_revision_;
@@ -205,7 +205,7 @@ Decoder::Fast Decoder::fast_command(const std::uint8_t* p, std::size_t remaining
             if (tev) state_.tev_registers_[(value >> 23) & 1][address - 0xe0] = value & 0x7fffff;
             if (state_.bp_[address] != value) {
                 state_.bp_[address] = value;
-                state_.program_bp(address, value);
+                state_.mark_bp(address);
                 ++state_.revision_;
                 ++state_.bp_revision_;
                 if (!tev || (value & 0x800000)) ++state_.bp_state_revision_;
@@ -305,7 +305,7 @@ void Decoder::apply_xf(std::size_t address, const std::uint8_t* words, std::size
             }
         }
         register_changed |= xf[i] != word;
-        if (xf[i] != word) state_.program_xf(static_cast<std::uint16_t>(address + i), word);
+        state_.mark_xf(address + i);
         xf[i] = word;
     }
     // Programs key on the GX_PTIDENTITY rows, so writes there act on registers too.
@@ -411,7 +411,7 @@ void Decoder::set_texture_extent(std::uint8_t map, TextureExtent extent) {
     auto& current = state_.texture_extents_[map];
     if (current == extent) return;
     current = extent;
-    state_.draw_word(262 + map, std::uint32_t{extent.width} | (std::uint32_t{extent.height} << 16), 1);
+    state_.draw_word(262 + map, std::uint32_t{extent.width} | (std::uint32_t{extent.height} << 16));
     ++state_.revision_;
     ++state_.bp_revision_;
     ++state_.bp_state_revision_;

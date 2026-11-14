@@ -708,7 +708,7 @@ struct GlesDirect::Impl {
             }
             if (!same_regular) {
                 std::copy_n(registers.words.data() + 270, 8, cached.registers.words.data() + 270);
-                cached.registers.hashes[5] = registers.hashes[5];
+                std::copy_n(registers.lanes.data() + 4, 4, cached.registers.lanes.data() + 4);
             }
         } else {
             ++stats.state_misses;

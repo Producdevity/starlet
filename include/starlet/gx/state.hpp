@@ -109,22 +109,42 @@ public:
     const TextureExtent& texture_extent(std::uint8_t map) const { return texture_extents_[map & 7]; }
     // The BP/XF words that shape a direct shader, in direct_program_words order,
     // excluding its vertex format and shading-policy-dependent suffix.
-    const std::array<std::uint32_t, 96>& program_registers() const { return program_registers_; }
-    std::uint64_t program_register_hash() const { return program_register_hash_; }
+    const std::array<std::uint32_t, 96>& program_registers() const { sync_registers(); return program_registers_; }
+    std::uint64_t program_register_hash() const { sync_registers(); return fold_lanes(program_lanes_.data()); }
     struct DrawRegisters {
         std::array<std::uint32_t, 278> words{};
-        std::array<std::uint64_t, 6> hashes{};
+        // Four 32-bit lane sums of word * coefficient per word-index residue: words below 270, then the regular TEV colours.
+        std::array<std::uint32_t, 8> lanes{};
         std::uint64_t hash(bool batched) const;
         bool matches(const DrawRegisters&, bool batched) const;
     };
-    const DrawRegisters& draw_registers() const { return draw_registers_; }
+    const DrawRegisters& draw_registers() const { sync_registers(); return draw_registers_; }
 
 private:
     friend class Decoder;
-    void program_bp(std::uint8_t address, std::uint32_t value);
-    void program_xf(std::uint16_t address, std::uint32_t value);
-    void program_word(unsigned index, std::uint32_t value);
-    void draw_word(unsigned index, std::uint32_t value, unsigned group);
+    // Register writes only mark their address. The key words and hashes below are brought up to date
+    // from the register images when a draw reads them, so a register rewritten between draws, or one
+    // no key covers, costs a bit set instead of a table walk. Single-threaded, like the rest of State.
+    void mark_bp(std::uint8_t address) { bp_dirty_[address >> 6] |= std::uint64_t{1} << (address & 63); }
+    void mark_xf(std::size_t address) {
+        const std::size_t i = address - 0x1000;
+        if (i < 88) xf_dirty_[i >> 6] |= std::uint64_t{1} << (i & 63);
+    }
+    void sync_registers() const {
+        if (bp_dirty_[0] | bp_dirty_[1] | bp_dirty_[2] | bp_dirty_[3] | xf_dirty_[0] | xf_dirty_[1]) sync_dirty();
+    }
+    static std::uint64_t fold_lanes(const std::uint32_t* lanes) {
+        auto h = (std::uint64_t{lanes[0]} | std::uint64_t{lanes[1]} << 32) ^
+                 ((std::uint64_t{lanes[2]} | std::uint64_t{lanes[3]} << 32) * 0x9e3779b97f4a7c15ull);
+        h = (h ^ (h >> 32)) * 0xd6e8feb86659fd93ull;
+        return h ^ (h >> 29);
+    }
+    void sync_dirty() const;
+    void program_bp(std::uint8_t address) const;
+    void program_xf(std::uint16_t address) const;
+    void program_word(unsigned index, std::uint32_t value) const;
+    void draw_word(unsigned index, std::uint32_t value) const;
+    void rebuild_registers() const;
     EfbLayout efb_;
     std::array<std::uint32_t, 256> bp_{};
     std::array<std::uint32_t, 256> cp_{};
@@ -139,9 +159,11 @@ private:
     std::uint64_t cp_layout_revision_ = 0, matrix_index_revision_ = 0, xf_post_light_revision_ = 0;
     XfWrite last_xf_memory_write_;
     std::array<TextureExtent, 8> texture_extents_{};
-    std::array<std::uint32_t, 96> program_registers_{};
-    std::uint64_t program_register_hash_ = 0;
-    DrawRegisters draw_registers_;
+    mutable std::array<std::uint32_t, 96> program_registers_{};
+    mutable std::array<std::uint32_t, 4> program_lanes_{};
+    mutable DrawRegisters draw_registers_;
+    mutable std::array<std::uint64_t, 4> bp_dirty_{};
+    mutable std::array<std::uint64_t, 2> xf_dirty_{};
 };
 
 } // namespace starlet::gx
