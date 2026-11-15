@@ -16,13 +16,23 @@ namespace starlet::os {
 //
 // The GX's copy destination and TLUT load registers hold an address shifted right by 5 in 21 bits,
 // so what the GX writes or loads that way must lie in the first 64 MiB of the window.
+//
+// The executable image keeps its link address, so its physical addresses need not be window_base
+// + p: with window_base 0x80000000 and an image at 0x200000, the GX copy into a static buffer at
+// 0x700000 carries physical 0x700000, which would name 0x80700000. Physical addresses of the image
+// therefore resolve to the image, and the native range they would name (image_alias) holds no
+// other game memory: set_arena, map_fixed and set_stack_pool refuse it.
 inline constexpr std::uint32_t gx_window_size = std::uint32_t{1} << 26;
 
 struct MemoryMap {
     std::uintptr_t window_base = 0;
 };
+// Call before set_arena, map_fixed and set_stack_pool.
 void set_memory_map(MemoryMap map);
 const MemoryMap& memory_map();
+// The native range window_base + native_to_physical(image), reserved for the executable image's
+// physical addresses; empty (begin == end) when the image sits at window_base + its physical address.
+void image_alias(std::uintptr_t& begin, std::uintptr_t& end);
 
 // The physical address the hardware would see for a game pointer.
 std::uint32_t native_to_physical(const void* pointer);
@@ -50,7 +60,8 @@ void release_stack(void* stack, std::size_t size);
 // The game memory (arena, executable image, guest stack or fixed region) that holds size bytes at
 // the 32-bit address the game gave the hardware (a pointer, physical or uncached), or nullptr.
 void* hardware_to_native(std::uint32_t address, std::size_t size);
-// Physical address p as a native pointer: window_base + (p & 0x3FFFFFFF).
+// Physical address p as a native pointer: the executable image for its own physical addresses,
+// otherwise window_base + (p & 0x3FFFFFFF).
 void* physical_to_native(std::uint32_t address);
 
 // True when [pointer, pointer + size) lies in game memory.
