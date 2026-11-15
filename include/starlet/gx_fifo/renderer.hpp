@@ -59,6 +59,7 @@ public:
     virtual bool peek_color_snapshot(int, int, int, std::uint32_t&) const { return false; }
     virtual void select_snapshot(int) {}
     virtual void release_snapshot(int) {}
+    virtual void retain_snapshot(int) {}
     // The EFB's depth as of this point, read back without waiting for the work before it
     // (gx::GlesRenderer::request_depth_readback); -1 when the backend reads it live only.
     virtual int request_depth_readback() { return -1; }

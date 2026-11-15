@@ -2280,6 +2280,12 @@ void GlesRenderer::release_snapshot(int index) {
     if (g.selected_snapshot == index) g.selected_snapshot = -1;
     if (g.last_snapshot == index) g.last_snapshot = -1;
 }
+void GlesRenderer::retain_snapshot(int index) {
+    auto& g = *impl_; g.check_owner();
+    if (index < 0 || index >= static_cast<int>(g.snapshot_busy.size()) || !g.snapshot_busy[std::size_t(index)])
+        throw std::out_of_range("unknown EFB snapshot");
+    ++g.snapshot_refs[std::size_t(index)];
+}
 void GlesRenderer::adopt_thread() { impl_->owner = std::this_thread::get_id(); }
 void GlesRenderer::start_submission(std::function<void()> release, std::function<void()> bind, std::function<void()> unbind) {
     auto& g = *impl_; g.require_ready();

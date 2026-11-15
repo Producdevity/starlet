@@ -92,6 +92,7 @@ public:
     bool peek_color_snapshot(int index, int x, int y, std::uint32_t& value) const override;
     void select_snapshot(int) override;
     void release_snapshot(int) override;
+    void retain_snapshot(int) override;
     // Moves ownership to the calling thread, which must have the GL context current.
     void adopt_thread();
     // Direct path: GL work moves to a submission thread that runs it in call order,

@@ -31,6 +31,7 @@ public:
     bool peek_color_snapshot(int index, int x, int y, std::uint32_t& value) const override;
     void select_snapshot(int index) override;
     void release_snapshot(int index) override;
+    void retain_snapshot(int index) override;
     int request_depth_readback() override;
     bool depth_readback_value(int handle, int x, int y, std::uint32_t& value) const override;
     void wait_depth_readback(int handle) override;

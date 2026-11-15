@@ -276,6 +276,8 @@ bool token_reads_efb(std::uint16_t token) { return peek_tokens[token >> 6].load(
 
 // GpuSetup::sync_reads, fixed before the GPU thread starts.
 bool sync_reads = false;
+// GpuSetup::peek_lag.
+bool peek_lag = false;
 // Peek groups and draw-sync callbacks answered from a snapshot one frame earlier, for the stats line.
 std::atomic<std::uint64_t> late_reads{0};
 
@@ -666,6 +668,9 @@ private:
         std::uint16_t token;
         unsigned ordinal, frame;
         int snapshot;
+        // With peek_lag: the snapshot of the frame before, held by the group (older_frame its frame).
+        int older = -1;
+        unsigned older_frame = 0;
     };
     std::vector<TokenGroup> token_groups_;
     std::vector<std::pair<std::uint16_t, unsigned>> token_counts_;
@@ -687,13 +692,35 @@ private:
         else ordinal = count->second++;
         auto group = std::find_if(token_groups_.begin(), token_groups_.end(),
                                   [&](const TokenGroup& g) { return g.token == token && g.ordinal == ordinal; });
-        if (group == token_groups_.end()) group = token_groups_.insert(token_groups_.end(), {token, ordinal, ~0u, -1});
+        if (group == token_groups_.end()) group = token_groups_.insert(token_groups_.end(), TokenGroup{token, ordinal, ~0u, -1});
         const int current = renderer_.snapshot_efb(region);
         Interrupt i{false, token, -1};
-        if (group->snapshot >= 0 && group->frame + 1 == display_frame_ && !poked_) {
+        if (peek_lag && group->snapshot >= 0 && group->frame + 1 == display_frame_ && !poked_) {
+            // The group keeps the last frame's snapshot as its older one; the callback gets a new
+            // reference to it, or to the one before when the last frame's is not read back yet.
+            const bool use_older = group->older >= 0 && group->older_frame + 2 == display_frame_ &&
+                                   !renderer_.snapshot_ready(group->snapshot) && renderer_.snapshot_ready(group->older);
+            if (use_older) {
+                i.snapshot = group->older;
+                gx::sync_stats::note("token: answered from the snapshot two frames back", 0);
+            } else {
+                i.snapshot = group->snapshot;
+                renderer_.retain_snapshot(group->snapshot);
+                if (group->older >= 0) renderer_.release_snapshot(group->older);
+                gx::sync_stats::note("token: answered from last frame's snapshot", 0);
+            }
+            group->older = group->snapshot;
+            group->older_frame = group->frame;
+            late_reads.fetch_add(1, std::memory_order_relaxed);
+        } else if (group->snapshot >= 0 && group->frame + 1 == display_frame_ && !poked_) {
             i.snapshot = group->snapshot;
             late_reads.fetch_add(1, std::memory_order_relaxed);
+            gx::sync_stats::note("token: answered from last frame's snapshot", 0);
         } else {
+            if (group->older >= 0) { renderer_.release_snapshot(group->older); group->older = -1; }
+            gx::sync_stats::note(group->snapshot < 0 ? "token: first appearance of its group, own snapshot"
+                                 : group->frame + 1 != display_frame_ ? "token: group skipped a frame, own snapshot"
+                                 : "token: EFB poked this frame, own snapshot", 0);
             if (group->snapshot >= 0) renderer_.release_snapshot(group->snapshot);
             if (current >= 0) i.snapshot = renderer_.snapshot_efb(region);
         }
@@ -712,6 +739,7 @@ private:
                 continue;
             }
             if (it->snapshot >= 0) renderer_.release_snapshot(it->snapshot);
+            if (it->older >= 0) renderer_.release_snapshot(it->older);
             it = token_groups_.erase(it);
         }
     }
@@ -779,6 +807,8 @@ void start_gpu(GpuSetup setup) {
     if (gpu) throw std::logic_error("the GPU thread is already running");
     const char* exact = std::getenv("STARLET_GX_SYNC_READS");
     sync_reads = setup.sync_reads || (exact && std::strcmp(exact, "1") == 0);
+    const char* lag = std::getenv("STARLET_GX_PEEK_LAG");
+    peek_lag = (setup.peek_lag || (lag && std::strcmp(lag, "1") == 0)) && !sync_reads;
     const char* ahead = std::getenv("STARLET_GX_FRAME_AHEAD");
     setup.frame_ahead = setup.frame_ahead || (ahead && std::strcmp(ahead, "1") == 0);
     host_allocation_scope host;

@@ -36,6 +36,8 @@ public:
     virtual void select_snapshot(int) {}
     // The snapshot at index may be reused; other retained snapshots stay valid.
     virtual void release_snapshot(int) {}
+    // Another reference to a held snapshot, released with release_snapshot.
+    virtual void retain_snapshot(int) {}
     // Every snapshot taken so far may be reused.
     virtual void release_snapshots() {}
 };
