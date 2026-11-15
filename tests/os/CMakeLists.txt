@@ -10,3 +10,9 @@ target_compile_options(starlet_os_game_memory_tests PRIVATE -fno-pie)
 target_link_options(starlet_os_game_memory_tests PRIVATE -no-pie)
 add_test(NAME starlet_os_game_memory COMMAND starlet_os_game_memory_tests)
 
+# Without PIE, as in a port: the report names functions from the image's symbol table.
+add_executable(starlet_os_crash_report_tests crash_report_tests.cpp)
+target_link_libraries(starlet_os_crash_report_tests PRIVATE starlet::os)
+target_compile_options(starlet_os_crash_report_tests PRIVATE -fno-pie)
+target_link_options(starlet_os_crash_report_tests PRIVATE -no-pie)
+add_test(NAME starlet_os_crash_report COMMAND starlet_os_crash_report_tests)

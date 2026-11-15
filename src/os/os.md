@@ -26,4 +26,5 @@ A port checks its decompilation's SDK layouts against `starlet/sdk/os.h` by incl
 `STARLET_SDK_TYPES_ONLY` before its own headers and asserting sizes and offsets.
 
 Linux only. Test: `tests/os` (threads, priorities, messages, mutexes, conditions, interrupts,
-alarms, disabled interrupts, waiting for an interrupt; the image's physical addresses).
+alarms, disabled interrupts, waiting for an interrupt; the image's physical addresses; crash
+reports after another handler raised the signal again).

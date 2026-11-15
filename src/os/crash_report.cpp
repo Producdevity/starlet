@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <link.h>
 #include <execinfo.h>
+#include <unwind.h>
 #include <cstdio>
 #include <csignal>
 
@@ -171,32 +172,120 @@ namespace {
 char build_id_text[41] = "unknown";
 const char* program_name = "starlet";
 std::atomic<bool> reporting{false};
+void (*fault_details)(const void*) = nullptr;
 
 void report_frame(const char* label, std::uintptr_t address) { report_frames(label, &address, 1); }
+
+void report_decimal(unsigned long value) {
+    char digits[24];
+    int n = 23;
+    digits[n] = 0;
+    do digits[--n] = char('0' + value % 10);
+    while (value /= 10);
+    report_text(digits + n);
+}
+
+#if defined(__aarch64__) && defined(__linux__)
+// The kernel's signal frame: the handler starts with its stack pointer here and receives pointers to
+// both members.
+struct SignalFrame {
+    siginfo_t info;
+    ucontext_t context;
+};
+
+// The vDSO's __kernel_rt_sigreturn, where a signal handler returns: mov x8, #139; svc #0.
+bool is_sigreturn(std::uintptr_t pc) {
+    Dl_info module{};
+    if (!dladdr(reinterpret_cast<void*>(pc), &module)) return false;
+    const auto* code = reinterpret_cast<const std::uint32_t*>(pc);
+    return code[0] == 0xd2801168u && code[1] == 0xd4000001u;
+}
+
+struct FrameSearch {
+    const siginfo_t* own;
+    bool past_own;
+    const SignalFrame* found;
+};
+
+// A frame returning to the sigreturn trampoline is a signal handler, and its CFA is its kernel
+// frame. The first is this handler's own (a check of the layout); the next is the handler that
+// raised the signal again, interrupted by the original fault.
+_Unwind_Reason_Code find_signal_frame(_Unwind_Context* context, void* argument) {
+    auto& search = *static_cast<FrameSearch*>(argument);
+    if (!is_sigreturn(_Unwind_GetIP(context))) return _URC_NO_REASON;
+    const auto* frame = reinterpret_cast<const SignalFrame*>(_Unwind_GetCFA(context));
+    if (!search.past_own) {
+        if (&frame->info != search.own) return _URC_END_OF_STACK;
+        search.past_own = true;
+        return _URC_NO_REASON;
+    }
+    search.found = frame;
+    return _URC_END_OF_STACK;
+}
+#endif
 
 void fatal_signal(int signal, siginfo_t* info, void* context) {
     // One report: a thread that faults while another reports waits for the process to end.
     if (reporting.exchange(true))
         for (;;) pause();
+    bool raised_again = false;
+    const void* address = info->si_code > 0 ? info->si_addr : nullptr;
+#if defined(__aarch64__) && defined(__linux__)
+    // A library that catches the signal first (SDL restoring the console) restores this handler and
+    // raises the signal again from its own handler, whose kernel frame holds the original fault.
+    // The kernel keeps a thread's last fault address in every frame; the siginfo is there only for a
+    // handler installed with SA_SIGINFO.
+    if (info->si_code <= 0) {
+        FrameSearch search{info, false, nullptr};
+        _Unwind_Backtrace(find_signal_frame, &search);
+        if (search.found) {
+            context = const_cast<ucontext_t*>(&search.found->context);
+            raised_again = true;
+        }
+        if (signal == SIGSEGV || signal == SIGBUS)
+            address = reinterpret_cast<const void*>(static_cast<ucontext_t*>(context)->uc_mcontext.fault_address);
+        if (search.found && search.found->info.si_signo == signal && search.found->info.si_code > 0)
+            address = search.found->info.si_addr;
+    }
+#endif
     const char number[] = {char('0' + signal / 10 % 10), char('0' + signal % 10), 0};
     report_text(program_name);
     report_text(": fatal signal ");
     report_text(number[0] == '0' ? number + 1 : number);
-    report_text(" at 0x");
-    report_hex(reinterpret_cast<std::uintptr_t>(info->si_addr));
+    if (info->si_code <= 0 && !raised_again) {
+        report_text(" sent by process ");
+        report_decimal(static_cast<unsigned long>(info->si_pid));
+        if (address) report_text(", last fault");
+    }
+    if (address || info->si_code > 0) {
+        report_text(" at 0x");
+        report_hex(reinterpret_cast<std::uintptr_t>(address));
+    }
     report_text(", build ");
     report_text(build_id_text);
     report_text("\n");
-#if defined(__aarch64__)
+    if (raised_again) report_text("  raised again by another signal handler; the original fault:\n");
+#if defined(__aarch64__) && defined(__linux__)
     const auto& registers = static_cast<ucontext_t*>(context)->uc_mcontext;
     // brk #0x550b is -fsanitize-trap=return: decompiled code with no return statement.
     if (signal == SIGTRAP && *reinterpret_cast<const std::uint32_t*>(registers.pc) == 0xd42aa160u)
         report_text("  a decompiled function ended without returning its value\n");
     report_frame("  pc ", registers.pc);
     report_frame("  lr ", registers.regs[30]);
-#else
-    (void)context;
+    for (int i = 0; i < 32; ++i) {
+        report_text(i % 4 ? " " : "  ");
+        if (i < 31) {
+            report_text("x");
+            report_decimal(unsigned(i));
+        } else {
+            report_text("sp");
+        }
+        report_text("=0x");
+        report_hex(i < 31 ? registers.regs[i] : registers.sp);
+        if (i % 4 == 3) report_text("\n");
+    }
 #endif
+    if (fault_details) fault_details(context);
     void* frames[48];
     const int count = backtrace(frames, 48);
     std::uintptr_t addresses[48];
@@ -211,6 +300,8 @@ void fatal_signal(int signal, siginfo_t* info, void* context) {
 }
 
 const char* build_id() { return build_id_text; }
+
+void set_fault_details(void (*details)(const void* context)) { fault_details = details; }
 
 void install_fatal_signal_report(const char* program) {
     program_name = program;
