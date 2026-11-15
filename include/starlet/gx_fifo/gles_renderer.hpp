@@ -24,6 +24,7 @@ public:
     void before_dma_read(const void* data, std::size_t bytes) override;
     void before_dma_write(const void* data, std::size_t bytes) override;
     int snapshot_efb(const gx::EfbRegion& region) override;
+    int snapshot_efb_exact(const gx::EfbRegion& region) override;
     bool snapshot_ready(int index) const override;
     void wait_snapshot(int index) override;
     bool peek_depth_snapshot(int index, int x, int y, std::uint32_t& value) const override;

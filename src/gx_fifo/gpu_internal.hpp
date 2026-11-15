@@ -65,6 +65,22 @@ bool gpu_depth_readback_value(int handle, int x, int y, std::uint32_t& value);
 void gpu_wait_depth_readback(int handle);
 void gpu_release_depth_readback(int handle);
 
+// GpuSetup::sync_reads, or STARLET_GX_SYNC_READS=1.
+bool gpu_sync_reads();
+// Guest peek groups (gx_sdk.cpp peek): two frames of up to four groups, in slots. GPU thread, in
+// command order: the slot's snapshot becomes an exact one of the EFB region (x, y, width, height;
+// empty: all of it) as of now, for that guest frame, and the one it held is released;
+// gpu_release_group_snapshot only releases it. Any thread: the slot's snapshot if it was taken
+// for frame, else -1.
+constexpr int peek_group_slots = 8;
+void gpu_take_group_snapshot(int slot, std::uint32_t frame, int x, int y, int width, int height);
+void gpu_release_group_snapshot(int slot);
+int gpu_group_snapshot(int slot, std::uint32_t frame);
+// GPU thread, in command order: the CPU wrote EFB pixels (note_efb_poke).
+void gpu_note_poke();
+// Any thread: a peek group was answered from a snapshot one frame earlier (for the stats line).
+void gpu_count_late_read();
+
 // GPU thread: native-order arrays (see starlet/compat/gx_fifo.h), in command order.
 void gpu_host_order_array(std::uintptr_t base, std::size_t bytes);
 void gpu_big_endian_array(std::uintptr_t base, std::size_t bytes);
@@ -78,5 +94,8 @@ void flush_dirty_state();
 
 // Guest side: hands the staged bytes of a linked FIFO to the GPU thread.
 void flush_stage();
+
+// Guest side, at VIFlush: a frame of peek groups ends (gx_sdk.cpp).
+void end_peek_frame();
 
 }

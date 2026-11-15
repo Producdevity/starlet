@@ -1,5 +1,7 @@
 // The video interface: a 59.94 Hz retrace interrupt, the frame buffer the next retrace shows, and the
 // retrace callbacks.
+#include "gpu_internal.hpp"
+
 #include "starlet/gx_fifo/frame_trace.hpp"
 #include "starlet/gx_fifo/video.hpp"
 #include "starlet/os/guest_cpu.hpp"
@@ -92,6 +94,7 @@ void VIFlush() {
     const BOOL enabled = OSDisableInterrupts();
     flush_pending = true;
     OSRestoreInterrupts(enabled);
+    end_peek_frame();
 }
 
 void VISetNextFrameBuffer(void* fb) {

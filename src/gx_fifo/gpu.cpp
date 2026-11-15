@@ -273,6 +273,20 @@ constexpr int peek_margin = 32;
 
 bool token_reads_efb(std::uint16_t token) { return peek_tokens[token >> 6].load(std::memory_order_relaxed) >> (token & 63) & 1; }
 
+// GpuSetup::sync_reads, fixed before the GPU thread starts.
+bool sync_reads = false;
+// Peek groups and draw-sync callbacks answered from a snapshot one frame earlier, for the stats line.
+std::atomic<std::uint64_t> late_reads{0};
+
+// The guest peek groups' snapshots (gpu_internal.hpp). The GPU thread publishes index, then
+// frame; held is its own record of the snapshot it must release.
+struct GroupSlot {
+    std::atomic<int> index{-1};
+    std::atomic<std::uint32_t> frame{~0u};
+    int held = -1;
+};
+GroupSlot group_slots[peek_group_slots];
+
 // The read-back region for a snapshot at token; empty (the whole EFB) before its callback read a pixel.
 EfbRegion token_region(std::uint16_t token) {
     const std::uint64_t b = peek_bounds[token & 4095].load(std::memory_order_relaxed);
@@ -354,7 +368,7 @@ public:
         case 0x48:
             token_.store(std::uint16_t(value), std::memory_order_release);
             renderer_.wait_until_idle();
-            deliver({false, std::uint16_t(value), events_.token ? token_snapshot(std::uint16_t(value)) : -1});
+            deliver(token_interrupt(std::uint16_t(value)));
             break;
         case 0x52:
             copy(state, value);
@@ -391,7 +405,23 @@ public:
     }
     void wait_depth_readback(int handle) { renderer_.wait_depth_readback(handle); }
     void release_depth_readback(int handle) { renderer_.release_depth_readback(handle); }
-    int token_snapshot(std::uint16_t token) { return token_reads_efb(token) ? renderer_.snapshot_efb(token_region(token)) : -1; }
+    // Guest peek groups (gx_sdk.cpp): the slot's snapshot for a guest frame.
+    void take_group_snapshot(int slot, std::uint32_t frame, const EfbRegion& region) {
+        auto& s = group_slots[slot];
+        s.frame.store(~0u, std::memory_order_relaxed);
+        if (s.held >= 0) renderer_.release_snapshot(s.held);
+        s.held = renderer_.snapshot_efb_exact(region);
+        s.index.store(s.held, std::memory_order_relaxed);
+        s.frame.store(frame, std::memory_order_release);
+    }
+    void release_group_snapshot(int slot) {
+        auto& s = group_slots[slot];
+        s.frame.store(~0u, std::memory_order_relaxed);
+        if (s.held >= 0) renderer_.release_snapshot(s.held);
+        s.held = -1;
+        s.index.store(-1, std::memory_order_relaxed);
+    }
+    void note_poke() { poked_ = true; }
 
     void present(const void* frame_buffer, bool black) {
         frame_event('P', std::uint32_t(reinterpret_cast<std::uintptr_t>(frame_buffer)));
@@ -418,6 +448,7 @@ public:
             counters.known_frame_buffer = found != frame_buffers_.end();
             counters.decoded_bytes = decoded_;
             counters.skipped_draws = draw_failures_;
+            counters.late_reads = late_reads.load(std::memory_order_relaxed);
             renderer_.print_stats(counters);
             print_decoder_counts();
         }
@@ -521,6 +552,7 @@ private:
             }
             renderer_.copy_display(plan, destination, bytes);
             PageGenerations::get().wrote(destination, bytes);
+            next_display_frame();
             // VISetNextFrameBuffer names the XFB by its pointer.
             frame_buffers_[reinterpret_cast<std::uintptr_t>(destination)] = {unsigned(plan.width), unsigned(plan.height), plan.stride};
         } else {
@@ -617,6 +649,61 @@ private:
         int snapshot;
     };
     std::deque<Interrupt> pending_;
+    // Draw-sync callbacks that read the EFB, by token value and its ordinal among that value's
+    // tokens in the frame (display copies end frames): the snapshot taken at it in its frame.
+    struct TokenGroup {
+        std::uint16_t token;
+        unsigned ordinal, frame;
+        int snapshot;
+    };
+    std::vector<TokenGroup> token_groups_;
+    std::vector<std::pair<std::uint16_t, unsigned>> token_counts_;
+    unsigned display_frame_ = 0;
+    // The CPU wrote EFB pixels in this frame.
+    bool poked_ = false;
+    // A token whose callback reads the EFB carries the snapshot it reads, which the guest
+    // releases. With sync_reads, a snapshot taken at the token. Otherwise the snapshot the same
+    // token took one frame earlier, read back long since; the first time, after a frame without
+    // it, and after a CPU write into the EFB, the token's own snapshot (another reference to the
+    // one kept for the next frame). Either way the token takes a snapshot for the next frame.
+    Interrupt token_interrupt(std::uint16_t token) {
+        if (!events_.token || !token_reads_efb(token)) return {false, token, -1};
+        const EfbRegion region = token_region(token);
+        if (sync_reads) return {false, token, renderer_.snapshot_efb(region)};
+        unsigned ordinal = 0;
+        auto count = std::find_if(token_counts_.begin(), token_counts_.end(), [&](const auto& c) { return c.first == token; });
+        if (count == token_counts_.end()) token_counts_.push_back({token, 1});
+        else ordinal = count->second++;
+        auto group = std::find_if(token_groups_.begin(), token_groups_.end(),
+                                  [&](const TokenGroup& g) { return g.token == token && g.ordinal == ordinal; });
+        if (group == token_groups_.end()) group = token_groups_.insert(token_groups_.end(), {token, ordinal, ~0u, -1});
+        const int current = renderer_.snapshot_efb(region);
+        Interrupt i{false, token, -1};
+        if (group->snapshot >= 0 && group->frame + 1 == display_frame_ && !poked_) {
+            i.snapshot = group->snapshot;
+            late_reads.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (group->snapshot >= 0) renderer_.release_snapshot(group->snapshot);
+            if (current >= 0) i.snapshot = renderer_.snapshot_efb(region);
+        }
+        group->frame = display_frame_;
+        group->snapshot = current;
+        return i;
+    }
+    // A display copy ends the frame; snapshots of tokens that did not recur are released.
+    void next_display_frame() {
+        ++display_frame_;
+        token_counts_.clear();
+        poked_ = false;
+        for (auto it = token_groups_.begin(); it != token_groups_.end();) {
+            if (it->frame + 1 >= display_frame_) {
+                ++it;
+                continue;
+            }
+            if (it->snapshot >= 0) renderer_.release_snapshot(it->snapshot);
+            it = token_groups_.erase(it);
+        }
+    }
     void raise(const Interrupt& i) {
         if (i.draw_done) {
             if (events_.draw_done) events_.draw_done();
@@ -678,6 +765,8 @@ void start_gpu(GpuSetup setup) {
     if (!setup.efb.valid()) throw std::invalid_argument("GpuSetup has an invalid EFB layout");
     arrays_host_order = setup.arrays_host_order;
     if (gpu) throw std::logic_error("the GPU thread is already running");
+    const char* exact = std::getenv("STARLET_GX_SYNC_READS");
+    sync_reads = setup.sync_reads || (exact && std::strcmp(exact, "1") == 0);
     host_allocation_scope host;
     dirty_state = setup.flush_dirty_state;
     gpu = std::make_unique<Gpu>(std::move(setup));
@@ -754,6 +843,20 @@ bool gpu_depth_readback_value(int handle, int x, int y, std::uint32_t& value) {
 }
 void gpu_wait_depth_readback(int handle) { gpu->wait_depth_readback(handle); }
 void gpu_release_depth_readback(int handle) { gpu->release_depth_readback(handle); }
+
+bool gpu_sync_reads() { return sync_reads; }
+
+void gpu_take_group_snapshot(int slot, std::uint32_t frame, int x, int y, int width, int height) {
+    gpu->take_group_snapshot(slot, frame, EfbRegion{x, y, width, height});
+}
+void gpu_release_group_snapshot(int slot) { gpu->release_group_snapshot(slot); }
+int gpu_group_snapshot(int slot, std::uint32_t frame) {
+    const auto& s = group_slots[slot];
+    if (s.frame.load(std::memory_order_acquire) != frame) return -1;
+    return s.index.load(std::memory_order_relaxed);
+}
+void gpu_note_poke() { gpu->note_poke(); }
+void gpu_count_late_read() { late_reads.fetch_add(1, std::memory_order_relaxed); }
 
 void gpu_present(const void* frame_buffer, bool black) {
     gpu_post([frame_buffer, black] { gpu->present(frame_buffer, black); });

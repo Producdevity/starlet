@@ -26,6 +26,7 @@ void GlesBackend::before_dma_read(const void* data, std::size_t bytes) { rendere
 void GlesBackend::before_dma_write(const void* data, std::size_t bytes) { renderer_.before_dma_write(data, bytes); }
 
 int GlesBackend::snapshot_efb(const gx::EfbRegion& region) { return renderer_.snapshot_efb(region); }
+int GlesBackend::snapshot_efb_exact(const gx::EfbRegion& region) { return renderer_.snapshot_efb_exact(region); }
 bool GlesBackend::snapshot_ready(int index) const { return renderer_.snapshot_ready(index); }
 void GlesBackend::wait_snapshot(int index) { renderer_.wait_snapshot(index); }
 bool GlesBackend::peek_depth_snapshot(int index, int x, int y, std::uint32_t& value) const {
@@ -56,7 +57,7 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 "submissions %llu batched %llu instanced %llu skipped %u; program waits %llu/%llu/%llu/%llu/%llu "
                 "(33/67/133/267 ms/longer) max %llu ms, GL-thread links %llu max %llu ms; resident copies %llu hits %llu "
                 "crops %llu materialized %llu overwritten by DMA %llu settled DMA %llu; batched with zero alpha %llu, vertex fog %llu; uniform blocks %llu shared %llu bytes %llu; "
-                "peeks %llu live %llu waited %llu snapshots refused %llu region misses %llu; stream reused %llu updated %llu verified %llu; state hits %llu misses %llu; state reused %llu raster hits %llu texture plan hits %llu; state snapshots %llu/%llu bytes %llu; program hits %llu misses %llu; vertex bytes %llu\n",
+                "peeks %llu live %llu waited %llu snapshots refused %llu region misses %llu late %llu; stream reused %llu updated %llu verified %llu; state hits %llu misses %llu; state reused %llu raster hits %llu texture plan hits %llu; state snapshots %llu/%llu bytes %llu; program hits %llu misses %llu; vertex bytes %llu\n",
                 gpu.retraces, gpu.presented, gpu.frame_buffer, gpu.known_frame_buffer, (unsigned long long)s.draws,
                 (unsigned long long)s.display_copies, (unsigned long long)s.texture_copies,
                 (unsigned long long)s.presentations, (unsigned long long)s.shader_compiles,
@@ -75,7 +76,7 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 (unsigned long long)s.direct.vertex_fog_draws, (unsigned long long)s.direct.uniform_blocks,
                 (unsigned long long)s.direct.shared_blocks, (unsigned long long)s.direct.uniform_bytes,
                 (unsigned long long)s.peeks, (unsigned long long)s.live_peeks, (unsigned long long)s.peek_waits,
-                (unsigned long long)s.refused_snapshots, (unsigned long long)s.region_misses,
+                (unsigned long long)s.refused_snapshots, (unsigned long long)s.region_misses, (unsigned long long)gpu.late_reads,
                 (unsigned long long)s.direct.stream_reuses, (unsigned long long)s.direct.stream_updates,
                 (unsigned long long)s.direct.stream_verified, (unsigned long long)s.direct.state_hits,
                 (unsigned long long)s.direct.state_misses, (unsigned long long)s.direct.state_reuses,

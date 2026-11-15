@@ -115,6 +115,96 @@ struct PokeModes {
     GXCompare z_function = GX_ALWAYS;
 } poke;
 
+// Command chunks handed to the GPU thread so far: peeks with none between them see the same EFB.
+std::uint64_t submissions = 0;
+
+// Peek groups (GpuSetup::sync_reads off). Peeks outside draw-sync callbacks with no command
+// between them form a group, numbered in the order the groups occur in a frame (VIFlush ends a
+// frame). A group's first peek has the GPU thread snapshot the EFB at that point. Its peeks are
+// answered from the snapshot of the same group one frame earlier, when that group began at the
+// same call site and the CPU wrote no EFB pixel in this frame; otherwise they read the EFB as of
+// their own point. A snapshot covers the pixels its group read one frame earlier, widened by
+// peek_margin, or the whole EFB.
+constexpr int peek_groups = peek_group_slots / 2;
+constexpr int peek_margin = 32;
+struct PeekGroup {
+    std::uint32_t frame = ~0u;
+    std::uintptr_t site = 0;
+    int x0 = 1, y0 = 1, x1 = 0, y1 = 0;  // the pixels read (x0 > x1: none)
+};
+PeekGroup peek_history[2][peek_groups];  // by frame parity
+std::uint32_t frame_number = 0;
+std::uint32_t poked_frame = ~0u;
+// The group the last peek belonged to, and the slot whose snapshot answers it (-1: none).
+struct CurrentGroup {
+    std::uint32_t frame = ~0u;
+    std::uint64_t submissions = 0;
+    int ordinal = -1;
+    int answer = -1;
+    bool counted = false;
+} group;
+
+void begin_group(std::uint32_t frame, std::uintptr_t site) {
+    group.ordinal = group.frame == frame ? group.ordinal + 1 : 0;
+    group.frame = frame;
+    group.submissions = submissions;
+    group.answer = -1;
+    group.counted = false;
+    if (group.ordinal >= peek_groups) return;
+    const PeekGroup& before = peek_history[(frame - 1) & 1][group.ordinal];
+    const bool repeated = before.frame == frame - 1 && before.site == site;
+    int x = 0, y = 0, width = 0, height = 0;
+    if (repeated && before.x0 <= before.x1) {
+        x = before.x0 - peek_margin;
+        y = before.y0 - peek_margin;
+        width = before.x1 - before.x0 + 1 + 2 * peek_margin;
+        height = before.y1 - before.y0 + 1 + 2 * peek_margin;
+    }
+    PeekGroup& now = peek_history[frame & 1][group.ordinal];
+    now = PeekGroup{};
+    now.frame = frame;
+    now.site = site;
+    const int slot = int(frame & 1) * peek_groups + group.ordinal;
+    gpu_post([slot, frame, x, y, width, height] { gpu_take_group_snapshot(slot, frame, x, y, width, height); });
+    if (repeated && poked_frame != frame) group.answer = int((frame - 1) & 1) * peek_groups + group.ordinal;
+}
+
+// A peek of a group answered from the group's snapshot one frame earlier; false when it reads
+// the EFB as of its own point instead.
+bool late_peek(bool depth, int x, int y, std::uintptr_t site, std::uint32_t& value) {
+    if (gpu_sync_reads()) return false;
+    const std::uint32_t frame = frame_number;
+    if (group.frame != frame || group.submissions != submissions) begin_group(frame, site);
+    if (group.ordinal >= peek_groups) return false;
+    PeekGroup& now = peek_history[frame & 1][group.ordinal];
+    if (now.x0 > now.x1) {
+        now.x0 = now.x1 = x;
+        now.y0 = now.y1 = y;
+    }
+    now.x0 = std::min(now.x0, x), now.x1 = std::max(now.x1, x), now.y0 = std::min(now.y0, y), now.y1 = std::max(now.y1, y);
+    if (group.answer < 0) return false;
+    const int slot = group.answer;
+    const std::uint32_t taken = frame - 1;
+    const int snapshot = gpu_group_snapshot(slot, taken);
+    if (snapshot >= 0 && gpu_peek_snapshot(snapshot, depth, x, y, value)) {
+        if (!group.counted) gpu_count_late_read();
+        group.counted = true;
+        return true;
+    }
+    // Not read back yet, outside its region, or not yet taken: the GPU thread reads that
+    // snapshot, waiting for it. A snapshot the renderer refused leaves the live read.
+    bool answered = false;
+    gpu_call([slot, taken, depth, x, y, &value, &answered] {
+        const int s = gpu_group_snapshot(slot, taken);
+        if (s < 0) return;
+        value = gpu_peek_snapshot_wait(s, depth, x, y);
+        answered = true;
+    });
+    if (answered && !group.counted) gpu_count_late_read();
+    group.counted = group.counted || answered;
+    return answered;
+}
+
 }
 
 void flush_stage() {
@@ -124,8 +214,28 @@ void flush_stage() {
     os::host_allocation_scope host;
     chunk->resize(used);
     gpu_submit(std::move(*chunk));
+    ++submissions;
     delete chunk;
     new_chunk();
+}
+
+void end_peek_frame() {
+    const std::uint32_t next = ++frame_number;
+    // The groups of the frame before the last one are not read again.
+    for (int g = 0; g < peek_groups; ++g) {
+        PeekGroup& old = peek_history[next & 1][g];
+        if (old.frame == ~0u) continue;
+        old = PeekGroup{};
+        const int slot = int(next & 1) * peek_groups + g;
+        gpu_post([slot] { gpu_release_group_snapshot(slot); });
+    }
+}
+
+void note_efb_poke() {
+    flush_stage();
+    ++submissions;
+    poked_frame = frame_number;
+    gpu_post([] { gpu_note_poke(); });
 }
 
 void present(const VideoFrame& frame) {
@@ -133,10 +243,11 @@ void present(const VideoFrame& frame) {
     gpu_present(frame.frame_buffer, frame.black);
 }
 
-// A draw-sync callback reads the EFB as of its token, as the console's interrupt follows its GPU:
-// from the token's snapshot, instead of waiting for everything queued since. Its first reads go
-// to the live EFB and teach the GPU thread to snapshot later tokens of that value.
-std::uint32_t peek(bool depth, int x, int y) {
+// A draw-sync callback reads the EFB from the snapshot its token carries (gpu.cpp
+// token_interrupt), instead of waiting for everything queued since. Its first reads go to the live
+// EFB and teach the GPU thread to snapshot later tokens of that value. Other peeks form groups
+// (late_peek). site: the game's call, which tells groups apart.
+std::uint32_t peek(bool depth, int x, int y, std::uintptr_t site) {
     std::uint32_t value = 0;
     if (sync_callback.active) {
         auto& c = sync_callback;
@@ -153,12 +264,13 @@ std::uint32_t peek(bool depth, int x, int y) {
         }
     }
     flush_stage();
+    if (!sync_callback.active && late_peek(depth, x, y, site, value)) return value;
     gpu_call([depth, x, y, &value] { value = depth ? gpu_peek_depth(x, y) : gpu_peek_color(x, y); });
     return value;
 }
 
-std::uint32_t peek_depth(int x, int y) { return peek(true, x, y); }
-std::uint32_t peek_color(int x, int y) { return peek(false, x, y); }
+std::uint32_t peek_depth(int x, int y) { return peek(true, x, y, 0); }
+std::uint32_t peek_color(int x, int y) { return peek(false, x, y, 0); }
 
 int request_depth_readback() {
     flush_stage();
@@ -290,6 +402,7 @@ void GXSetGPFifo(GXFifoObj* fifo) {
             bytes.insert(bytes.end(), f->base, write);
         }
         gpu_submit(std::move(bytes));
+        ++submissions;
         f->rdPtr = f->wrPtr;
         f->count = 0;
     }
@@ -433,8 +546,10 @@ void GXDrawDone() {
     GXWaitDrawDone();
 }
 
-void GXPeekZ(u16 x, u16 y, u32* z) { *z = peek_depth(x, y); }
-void GXPeekARGB(u16 x, u16 y, u32* color) { *color = peek_color(x, y); }
+void GXPeekZ(u16 x, u16 y, u32* z) { *z = peek(true, x, y, reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))); }
+void GXPeekARGB(u16 x, u16 y, u32* color) {
+    *color = peek(false, x, y, reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)));
+}
 
 GXDrawSyncCallback GXSetDrawSyncCallback(GXDrawSyncCallback callback) {
     const BOOL enabled = OSDisableInterrupts();

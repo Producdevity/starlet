@@ -1,0 +1,345 @@
+// EFB peeks answered one frame late (GpuSetup::sync_reads off). Peeks with no command between them
+// form a group; a group seen for the first time reads the EFB as of its point and leaves a
+// snapshot, and the same group one frame (VIFlush) later is answered from that snapshot without
+// waiting for the GPU thread. Draw-sync callbacks that read the EFB get the snapshot their token
+// took one frame (display copy) earlier. A CPU write into the EFB (note_efb_poke) makes the rest of
+// the frame exact. With the argument "exact" (run under STARLET_GX_SYNC_READS=1) every peek reads
+// the EFB as of its point.
+#include "starlet/compat/gx_fifo.h"
+#include "starlet/gx_fifo/gpu.hpp"
+#include "starlet/gx_fifo/renderer.hpp"
+#include "starlet/os/game_memory.hpp"
+#include "starlet/os/guest_cpu.hpp"
+#include "starlet/sdk/gx.h"
+#include "starlet/sdk/vi.h"
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace starlet;
+using namespace starlet::sdk;
+
+namespace {
+
+void require(bool value, const char* what) {
+    if (!value) {
+        std::fprintf(stderr, "read_groups: %s\n", what);
+        std::fflush(nullptr);
+        std::_Exit(1);
+    }
+}
+
+// The EFB's value is the number of idle points (draw done and tokens) the GPU thread has passed.
+// Snapshots hold that value as of the point they were taken; released slots are reused.
+class GroupRenderer final : public gx_fifo::Renderer {
+public:
+    void draw(const gx::State&, const gx::Draw&, gx::MemoryReader&) override {}
+    void wait_until_idle() override {
+        while (hold.load()) std::this_thread::yield();
+        ++idle_;
+    }
+    void copy_display(const gx::DisplayCopy&, std::uint8_t*, std::size_t) override {}
+    void copy_texture(const gx::TextureCopy&, std::uint8_t*, std::size_t, std::uint32_t) override {}
+    std::uint32_t peek_depth(int, int) override {
+        ++live_peeks;
+        return selected_ >= 0 ? values_[selected_] : idle_.load();
+    }
+    std::uint32_t peek_color(int x, int y) override { return peek_depth(x, y) | 0xff000000u; }
+    bool present(const gx::FramebufferView&, int, int, bool) override { return true; }
+    std::vector<std::uint8_t> readback() override { return {}; }
+    void print_stats(const gx_fifo::GpuCounters&) override {}
+
+    int snapshot_efb(const gx::EfbRegion& region) override { return take(region, false); }
+    int snapshot_efb_exact(const gx::EfbRegion& region) override { return take(region, true); }
+    bool snapshot_ready(int index) const override { return ready_[index].load(); }
+    void wait_snapshot(int index) override {
+        ++forced_waits;
+        ready_[index] = true;
+    }
+    bool peek_depth_snapshot(int index, int x, int y, std::uint32_t& value) const override {
+        if (!ready_[index] || !regions_[index].contains(x, y)) return false;
+        ++snapshot_peeks;
+        value = values_[index];
+        return true;
+    }
+    bool peek_color_snapshot(int index, int x, int y, std::uint32_t& value) const override {
+        if (!peek_depth_snapshot(index, x, y, value)) return false;
+        value |= 0xff000000u;
+        return true;
+    }
+    void select_snapshot(int index) override { selected_ = index; }
+    void release_snapshot(int index) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        require(held_[index], "a snapshot is released once");
+        held_[index] = false;
+        ++released;
+    }
+
+    int held() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        int n = 0;
+        for (bool h : held_) n += h;
+        return n;
+    }
+    gx::EfbRegion last_region() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_region_;
+    }
+
+    static constexpr int slots = 16;
+    std::atomic<bool> ready_at_once{true}, hold{false};
+    std::atomic<int> taken{0}, exact{0}, released{0}, live_peeks{0}, forced_waits{0};
+    mutable std::atomic<int> snapshot_peeks{0};
+
+private:
+    int take(const gx::EfbRegion& region, bool full) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        int index = 0;
+        while (index < slots && held_[index]) ++index;
+        require(index < slots, "too many snapshots held");
+        ++taken;
+        exact += full;
+        values_[index] = idle_.load();
+        regions_[index] = region;
+        last_region_ = region;
+        ready_[index] = ready_at_once.load();
+        held_[index] = true;
+        return index;
+    }
+    std::mutex mutex_;
+    std::atomic<std::uint32_t> idle_{0};
+    std::uint32_t values_[slots] = {};
+    gx::EfbRegion regions_[slots], last_region_;
+    std::atomic<bool> ready_[slots] = {};
+    bool held_[slots] = {};
+    int selected_ = -1;
+};
+
+GroupRenderer renderer;
+std::uint8_t* arena = nullptr;
+bool exact_mode = false;
+std::vector<u32> peeked;
+
+void bp(std::uint8_t address, std::uint32_t value) {
+    GX_WRITE_U8(GX_FIFO_CMD_LOAD_BP_REG);
+    GX_WRITE_U32(std::uint32_t{address} << 24 | (value & 0xffffff));
+}
+
+void token(std::uint16_t value) {
+    bp(0x48, value);
+    bp(0x47, value);
+}
+
+// A display copy into an XFB: the GPU thread's frame ends.
+void display_copy() {
+    std::uint8_t* xfb = arena + 4 * 64 * 1024;
+    bp(0x4e, 256);
+    bp(0x49, 0);
+    bp(0x4a, (447u << 10) | 639u);
+    bp(0x4d, 640 * 2 / 32);
+    bp(0x4b, os::native_to_physical(xfb) >> 5);
+    bp(0x52, 1u << 14);
+}
+
+// One call site for every group of the tests, and another.
+__attribute__((noinline)) u32 peek_z(u16 x, u16 y) {
+    u32 z = 0;
+    GXPeekZ(x, y, &z);
+    return z;
+}
+__attribute__((noinline)) u32 peek_z_elsewhere(u16 x, u16 y) {
+    u32 z = 1;
+    GXPeekZ(x, y, &z);
+    return z;
+}
+
+// The live EFB, read exactly: a CPU write makes the rest of the frame read the EFB.
+u32 current_efb() {
+    GXDrawDone();
+    gx_fifo::note_efb_poke();
+    return peek_z(0, 0);
+}
+
+void exact_reads() {
+    // Every peek reads the EFB as of its point, frame after frame; no group snapshots.
+    for (int frame = 0; frame < 3; ++frame) {
+        token(1);
+        const int live = renderer.live_peeks;
+        const u32 a = peek_z(10, 10);
+        const u32 b = peek_z(11, 10);
+        require(renderer.live_peeks == live + 2 && a == b, "exact peeks read the live EFB");
+        token(1);
+        require(peek_z(10, 10) == a + 1, "an exact peek sees every command before it");
+        VIFlush();
+    }
+    require(renderer.exact == 0, "exact reads take no group snapshots");
+}
+
+int guest_main() {
+    GXFifoObj fifo{};
+    __GXFifoInit();
+    GXInitFifoBase(&fifo, arena, 64 * 1024);
+    GXSetCPUFifo(&fifo);
+    GXSetGPFifo(&fifo);
+    __GXPEInit();
+    if (exact_mode) {
+        exact_reads();
+        require(gx_fifo::gpu_failure()[0] == 0, "no command stream failure");
+        return 0;
+    }
+
+    // Frame 0: two groups, a token between them. Each is new: it reads the EFB as of its point
+    // and leaves an exact snapshot there for the next frame.
+    token(1);
+    int live = renderer.live_peeks;
+    const u32 g0 = peek_z(100, 200);
+    require(peek_z(110, 190) == g0, "peeks of a group read one EFB");
+    token(1);
+    const u32 g1 = peek_z(300, 50);
+    require(renderer.live_peeks == live + 3, "a group seen for the first time reads the live EFB");
+    require(g1 == g0 + 1, "the second group reads the EFB after the token between them");
+    GXDrawDone();
+    require(renderer.exact == 2, "each group's first peek takes a snapshot");
+    VIFlush();
+
+    // Frame 1: the same groups are answered from frame 0's snapshots, without the GPU thread.
+    token(1);
+    GXDrawDone();
+    live = renderer.live_peeks;
+    renderer.hold = true;
+    token(1);  // the GPU thread now waits in this token until released
+    GXFlush();
+    const u32 late0 = peek_z(105, 205);
+    const u32 late0b = peek_z(100, 200);
+    token(1);
+    const u32 late1 = peek_z(300, 50);
+    renderer.hold = false;
+    require(late0 == g0 && late0b == g0 && late1 == g1, "groups are answered from the same group one frame earlier");
+    require(renderer.live_peeks == live, "late answers do not read the live EFB");
+    GXDrawDone();
+    const gx::EfbRegion r = renderer.last_region();
+    require(!r.empty() && r.contains(300, 50) && !r.contains(300 + 40, 50), "a repeated group's snapshot covers its pixels with a margin");
+    require(renderer.exact == 4, "every group occurrence takes a snapshot for the next frame");
+    VIFlush();
+
+    // Frame 2: a group starting at another call site is not the same group; it reads the live EFB.
+    token(1);
+    live = renderer.live_peeks;
+    peek_z_elsewhere(100, 200);
+    require(renderer.live_peeks == live + 1, "a group from another call site reads the live EFB");
+    VIFlush();
+
+    // Frames 3 to 5: a group missing from the previous frame is new again; then it is late again.
+    token(1);
+    VIFlush();
+    token(1);
+    live = renderer.live_peeks;
+    const u32 fresh = peek_z(100, 200);
+    require(renderer.live_peeks == live + 1, "a group missing from the previous frame reads the live EFB");
+    VIFlush();
+    token(1);
+    live = renderer.live_peeks;
+    require(peek_z(100, 200) == fresh && renderer.live_peeks == live, "and is answered late in the next frame");
+    VIFlush();
+
+    // Frame 6: the snapshot frame 5 took covers the pixels read in frame 4 and a margin. A peek
+    // outside it still reads that snapshot, through the GPU thread.
+    token(1);
+    live = renderer.live_peeks;
+    const u32 before_poke = peek_z(100, 200);
+    require(renderer.live_peeks == live && before_poke == fresh + 1, "the group is late");
+    const int waits = renderer.forced_waits;
+    require(peek_z(600, 400) == before_poke && renderer.live_peeks == live + 1 && renderer.forced_waits == waits + 1,
+            "a peek outside the snapshot's region reads the retained snapshot");
+    // A CPU write into the EFB makes the rest of the frame exact.
+    live = renderer.live_peeks;
+    gx_fifo::note_efb_poke();
+    const u32 after_poke = peek_z(100, 200);
+    require(renderer.live_peeks == live + 1 && after_poke != before_poke, "peeks after a CPU write read the live EFB");
+    token(1);
+    require(peek_z(100, 200) == after_poke + 1 && renderer.live_peeks == live + 2, "the whole frame after the write is exact");
+    VIFlush();
+
+    // Frame 7: late again, from the snapshot frame 6's group took before the write.
+    token(1);
+    live = renderer.live_peeks;
+    require(peek_z(100, 200) == after_poke && renderer.live_peeks == live, "the next frame is late again");
+    VIFlush();
+    VIFlush();
+    GXDrawDone();
+    require(renderer.held() == 0, "groups that stop are released");
+
+    // Draw-sync callbacks: the first reads the live EFB and teaches the token; later tokens take a
+    // snapshot. A token seen in the previous frame answers from that frame's snapshot.
+    GXSetDrawSyncCallback([](u16 value) {
+        if (value != 0x10) return;
+        u32 z = 0;
+        GXPeekZ(100, 200, &z);
+        peeked.push_back(z);
+    });
+    token(0x10);
+    GXDrawDone();
+    require(peeked.size() == 1, "the first callback runs");
+    display_copy();
+    const int taken = renderer.taken;
+    token(0x10);
+    GXDrawDone();
+    const u32 frame1 = peeked.back();
+    require(renderer.taken > taken && frame1 == current_efb() - 2, "a token seen for the first time reads its own snapshot");
+    display_copy();
+    renderer.ready_at_once = false;
+    const int forced = renderer.forced_waits;
+    token(1);
+    token(0x10);
+    token(1);
+    GXDrawDone();
+    require(peeked.back() == frame1 && renderer.forced_waits == forced, "the next frame's token reads the previous frame's snapshot");
+    renderer.ready_at_once = true;
+    display_copy();
+    gx_fifo::note_efb_poke();
+    token(0x10);
+    GXDrawDone();
+    require(peeked.back() == current_efb() - 2, "after a CPU write the token reads its own snapshot");
+    display_copy();
+    display_copy();
+    display_copy();
+    GXSetDrawSyncCallback(nullptr);
+    VIFlush();
+    VIFlush();
+    GXDrawDone();
+    require(renderer.held() == 0, "tokens that stop release their snapshots");
+    require(gx_fifo::gpu_failure()[0] == 0, "no command stream failure");
+    return 0;
+}
+
+}
+
+int main(int argc, char** argv) {
+    exact_mode = argc > 1 && std::strcmp(argv[1], "exact") == 0;
+    if (exact_mode) {
+        const char* sync = std::getenv("STARLET_GX_SYNC_READS");
+        require(sync && std::strcmp(sync, "1") == 0, "exact mode runs under STARLET_GX_SYNC_READS=1");
+    }
+    constexpr std::size_t arena_size = 16 * 1024 * 1024;
+    arena = static_cast<std::uint8_t*>(os::map_fixed(0x10000000, arena_size, "test arena"));
+    os::set_memory_map({0x10000000});
+    os::set_arena(arena, arena_size);
+    const std::uintptr_t hints[] = {0x30000000, 0x20000000};
+    os::set_stack_pool(8 * 1024 * 1024, 0x40000000, hints, 2);
+
+    gx_fifo::GpuSetup setup;
+    setup.renderer = &renderer;
+    setup.efb.height = 448;
+    setup.flush_dirty_state = [] {};
+    gx_fifo::start_gpu(setup);
+    const int result = os::run_main_thread(guest_main);
+    std::printf("read_groups%s: %s\n", exact_mode ? " (exact)" : "", result == 0 ? "passed" : "failed");
+    std::fflush(nullptr);
+    std::_Exit(result);
+}

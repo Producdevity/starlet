@@ -88,6 +88,39 @@ either way.
   game fills with native 32-bit numbers for `GXSetArray` are registered with
   `starlet_gx_host_order_array` and released before reuse.
 
+## EFB peeks
+
+`GXPeekARGB` and `GXPeekZ` read the EFB at their point in the command stream.
+By default (`GpuSetup::sync_reads` off) the game does not wait for the GPU
+there:
+
+- Peeks with no command written between them form a group. Groups are numbered
+  in the order they occur in a frame; `VIFlush` ends a frame.
+- A group's first peek has the GPU thread snapshot the EFB at that point
+  (`Renderer::snapshot_efb_exact`). The group's peeks are answered from the
+  snapshot of the same group one frame earlier, when that group began at the
+  same call site.
+- A group seen for the first time, a group missing from the previous frame,
+  more than four groups in a frame, and every group after `note_efb_poke` in
+  that frame read the EFB as of their own point, waiting for the GPU thread.
+- A snapshot covers the pixels its group read one frame earlier, widened by 32
+  pixels. A peek outside it, or before its readback arrived, reads that
+  snapshot through the GPU thread.
+
+Draw-sync callbacks that read the EFB (`GXSetDrawSyncCallback`) read the
+snapshot their token took one frame earlier, by token value and its ordinal in
+the frame; display copies end these frames. The first callback reads the live
+EFB, the next one (and the first after a frame without that token or after
+`note_efb_poke`) its own token's snapshot, and its interrupt waits for that
+readback. Every token of such a value takes a snapshot for the next frame.
+
+`sync_reads` on, or `STARLET_GX_SYNC_READS=1`, makes every peek exact: the
+peek waits for the GPU thread, and a draw-sync callback's interrupt waits for
+its token's snapshot. Starlet does not provide `GXPokeARGB` and `GXPokeZ`; a
+port that writes EFB pixels from the CPU calls `note_efb_poke()` after each
+write. The stats line counts peek groups and draw-sync callbacks answered one
+frame late as `late`.
+
 ## Host transfers
 
 `start_gpu` observes `starlet::os::before_dma_read` and `before_dma_write`. A
@@ -109,6 +142,9 @@ draws are logged once per message.
 ## Tests
 
 `tests/gx_fifo` (host, Linux): staging across chunks, unlinked FIFOs and wrap,
-token and draw-done order, peeks, a display copy presented by VI. With GLES
+token and draw-done order, peeks, a display copy presented by VI.
+`read_groups_tests.cpp` covers peek groups, late answers and their exceptions,
+and exact reads under `STARLET_GX_SYNC_READS=1`; `draw_sync_snapshot_tests.cpp`
+runs the exact draw-sync snapshots. With GLES
 headers, `dma_tests.cpp` runs ARAM and disc DMA over resident texture copies of
 the GLES renderer on a recording GL fake.

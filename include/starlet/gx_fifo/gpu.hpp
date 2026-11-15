@@ -51,6 +51,13 @@ struct GpuSetup {
     // except ranges registered with starlet_gx_big_endian_array. Off: arrays are canonical GX bytes
     // except ranges registered with starlet_gx_host_order_array.
     bool arrays_host_order = false;
+    // EFB reads (GXPeekARGB, GXPeekZ, draw-sync callbacks that read the EFB). Off: peeks with no
+    // command between them form a group, and each group is answered from the same group's read one
+    // frame earlier, so the game does not wait for the GPU; a group seen for the first time, and
+    // groups after note_efb_poke, read the EFB as of their point in the command stream. On: every
+    // peek reads the EFB as of its point in the command stream, waiting for the GPU (exact reads).
+    // STARLET_GX_SYNC_READS=1 in the environment turns it on as well.
+    bool sync_reads = false;
     Diagnostics diagnostics;
 };
 
@@ -63,9 +70,14 @@ void stop_gpu();
 // so far. Guest CPU only.
 void present(const VideoFrame& frame);
 
-// Guest CPU: EFB reads after every command written so far (GXPeekZ, GXPeekARGB).
+// Guest CPU: EFB reads (GXPeekZ, GXPeekARGB) at this point of the command stream, answered as
+// GpuSetup::sync_reads describes.
 std::uint32_t peek_depth(int x, int y);
 std::uint32_t peek_color(int x, int y);
+// Guest CPU: the game wrote EFB pixels from the CPU (GXPokeARGB, GXPokeZ, which Starlet does not
+// provide; a port that provides them calls this after each write). Peeks until the next frame
+// read the EFB as of their point in the command stream, so they see the write.
+void note_efb_poke();
 // Guest CPU: the EFB's depth as of every command written so far, without waiting for the GPU to
 // execute them. request returns a handle, or -1 when only live reads exist (peek_depth then);
 // readback_depth returns what peek_depth would have returned at the request, waiting for the

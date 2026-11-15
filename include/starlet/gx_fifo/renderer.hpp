@@ -19,6 +19,7 @@ struct GpuCounters {
     bool known_frame_buffer = false;     // a display copy wrote that XFB
     std::uint64_t decoded_bytes = 0;
     unsigned skipped_draws = 0;    // draws the renderer refused
+    std::uint64_t late_reads = 0;  // peek groups and draw-sync callbacks answered one frame late (GpuSetup::sync_reads)
 };
 
 // What the GPU thread hands decoded commands to. Every call comes from the GPU thread, in command
@@ -49,6 +50,9 @@ public:
     // the GPU thread retains the EFB at their token and the callback reads it once read back.
     // snapshot_ready and the snapshot peeks run on any thread, the rest on the GPU thread.
     virtual int snapshot_efb(const gx::EfbRegion&) { return -1; }
+    // As snapshot_efb, at full resolution: peeks read exactly what peek_depth and peek_color
+    // would have read at that point (EFB peeks outside draw-sync callbacks).
+    virtual int snapshot_efb_exact(const gx::EfbRegion& region) { return snapshot_efb(region); }
     virtual bool snapshot_ready(int) const { return true; }
     virtual void wait_snapshot(int) {}
     virtual bool peek_depth_snapshot(int, int, int, std::uint32_t&) const { return false; }
