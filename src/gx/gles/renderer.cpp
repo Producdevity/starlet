@@ -357,7 +357,8 @@ struct GlesRenderer::Impl {
             if (destination == data) return serial;
         return 0;
     }
-    struct Snapshot { GLuint texture = 0, framebuffer = 0, pack = 0; GLsync ready = nullptr; bool busy = false; };
+    // scale: the resolution divisor its texture and pack buffer were made for (GL thread).
+    struct Snapshot { GLuint texture = 0, framebuffer = 0, pack = 0; GLsync ready = nullptr; bool busy = false; int scale = 0; };
     std::vector<Snapshot> snapshots;
     // Snapshot slot use as seen by the recording thread; GL objects follow by index.
     std::vector<bool> snapshot_busy;
@@ -396,9 +397,11 @@ struct GlesRenderer::Impl {
     // that is mapped; set by the recording thread before the slot's generation is published.
     std::array<EfbRegion, snapshot_slots> snapshot_region{};
     std::array<std::size_t, snapshot_slots> snapshot_mapped_from{}, snapshot_mapped_bytes{};
+    // Each slot's resolution divisor, set with its region.
+    std::array<int, snapshot_slots> snapshot_slot_scale{};
     std::array<std::uint8_t, 4> region_miss_pixel{};
     const std::uint8_t* snapshot_pixel(std::size_t index, int x, int y, bool color) const {
-        return snapshot_pixels[index] + snapshot_offset(x, y, color) - snapshot_mapped_from[index];
+        return snapshot_pixels[index] + snapshot_offset(x, y, color, snapshot_slot_scale[index]) - snapshot_mapped_from[index];
     }
     struct PendingRead { std::size_t index; std::uint64_t generation; };
     std::vector<PendingRead> pending_reads;
@@ -431,6 +434,8 @@ struct GlesRenderer::Impl {
     // The selected snapshot's bytes for an EFB pixel, once its readback is mapped;
     // null when peeks go to the live EFB.
     const std::uint8_t* peek_snapshot(int x, int y, bool color);
+    // snapshot_efb at a resolution divisor of 1, 2 or 4.
+    int snapshot(const EfbRegion& requested, int scale);
     // GL thread: publishes the depth readbacks whose fence has signalled, so readers need not wait.
     bool depth_readbacks_pending() const {
         for (const auto& d : depth_readbacks) if (d.fence) return true;
@@ -850,24 +855,24 @@ texels[uOffset+p.y*uSource.w+p.x]=packUnorm4x8(texelFetch(uImage,uSource.xy+p,0)
     // The snapshot's rows from row0, its depth and then colour columns from column0, into its
     // buffer at the offsets a whole readback would use.
     void store_snapshot(const Snapshot& snapshot, int row0, int row_count, int column0, int column_count) {
-        const int columns = efb_width / snapshot_scale();
+        const int columns = efb_width / snapshot.scale;
         for (int block = 0; block < 2; ++block)
             store_texels(snapshot.texture, snapshot.pack, block * columns + column0, row0, column_count, row_count,
                          row0 * 2 * columns + block * columns + column0, 2 * columns);
     }
     // Fast shading keeps draw-sync snapshots at quarter resolution unless the limits ask
     // for another; the deferred callbacks peek single pixels and read the nearest sample.
+    // snapshot_efb_exact snapshots are always full resolution.
     int snapshot_scale() const {
         if (limits.direct.snapshot_scale) return limits.direct.snapshot_scale;
         return limits.direct.shading == DirectShading::fast ? 4 : 1;
     }
-    GLsizeiptr snapshot_bytes() const {
-        const int scale = snapshot_scale();
+    GLsizeiptr snapshot_bytes(int scale) const {
         return GLsizeiptr(2 * (efb_width / scale)) * (efb_height / scale) * 4;
     }
     // Snapshot rows hold the packed depth, then the colour, of one scaled EFB row.
-    std::size_t snapshot_offset(int x, int y, bool color) const {
-        const int scale = snapshot_scale(), width = efb_width / scale;
+    std::size_t snapshot_offset(int x, int y, bool color, int scale) const {
+        const int width = efb_width / scale;
         return (std::size_t((efb_height - 1 - y) / scale) * 2 * width + (color ? width : 0) + x / scale) * 4;
     }
     void copy_surface() {
@@ -1315,7 +1320,7 @@ void GlesRenderer::Impl::pack_efb(GLuint target, int x, int y, int width, int he
 void GlesRenderer::Impl::read_depth(int x, int y, int width, int height, std::uint8_t* pixels, int snapshot_index) {
     if (snapshot_index >= 0) {
         const auto& snapshot = snapshots.at(static_cast<std::size_t>(snapshot_index));
-        const int scale = snapshot_scale();
+        const int scale = snapshot.scale;
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, snapshot.framebuffer);
@@ -1997,8 +2002,10 @@ void GlesRenderer::wait_until_idle() {
     }, true);
 }
 int GlesRenderer::snapshot_efb() { return snapshot_efb(EfbRegion{}); }
-int GlesRenderer::snapshot_efb(const EfbRegion& requested) {
-    auto& g = *impl_; g.require_ready();
+int GlesRenderer::snapshot_efb(const EfbRegion& requested) { return impl_->snapshot(requested, impl_->snapshot_scale()); }
+int GlesRenderer::snapshot_efb_exact(const EfbRegion& requested) { return impl_->snapshot(requested, 1); }
+int GlesRenderer::Impl::snapshot(const EfbRegion& requested, int scale) {
+    auto& g = *this; g.require_ready();
     if (!g.direct) return -1;
     EfbRegion region;
     if (!requested.empty()) {
@@ -2013,7 +2020,7 @@ int GlesRenderer::snapshot_efb(const EfbRegion& requested) {
                                 wanted.x + wanted.width <= held.x + held.width && wanted.y + wanted.height <= held.y + held.height);
     };
     if (g.last_snapshot >= 0 && g.last_snapshot_writes == g.efb_writes && g.snapshot_busy[std::size_t(g.last_snapshot)] &&
-        covers(g.snapshot_region[std::size_t(g.last_snapshot)], region)) {
+        g.snapshot_slot_scale[std::size_t(g.last_snapshot)] == scale && covers(g.snapshot_region[std::size_t(g.last_snapshot)], region)) {
         ++g.snapshot_refs[std::size_t(g.last_snapshot)];
         return g.last_snapshot;
     }
@@ -2031,7 +2038,7 @@ int GlesRenderer::snapshot_efb(const EfbRegion& requested) {
     g.last_snapshot_writes = g.efb_writes;
     // The readback covers whole rows of the packed texture between the region's first and
     // last row; within them only the region's depth and colour columns are transferred.
-    const int scale = g.snapshot_scale(), columns = g.efb_width / scale, rows = g.efb_height / scale;
+    const int columns = g.efb_width / scale, rows = g.efb_height / scale;
     int row0 = 0, row_count = rows, column0 = 0, column_count = columns;
     if (!region.empty()) {
         row0 = (g.efb_height - region.y - region.height) / scale;
@@ -2040,36 +2047,43 @@ int GlesRenderer::snapshot_efb(const EfbRegion& requested) {
         column_count = (region.x + region.width - 1) / scale - column0 + 1;
     }
     g.snapshot_region[index] = region;
+    g.snapshot_slot_scale[index] = scale;
     g.snapshot_mapped_from[index] = std::size_t(row0) * 2 * std::size_t(columns) * 4;
     g.snapshot_mapped_bytes[index] = std::size_t(row_count) * 2 * std::size_t(columns) * 4;
     const auto generation = g.snapshot_generation[index].fetch_add(1, std::memory_order_relaxed) + 1;
-    g.execute([&g, index, generation, row0, row_count, column0, column_count] {
+    g.execute([&g, index, generation, scale, row0, row_count, column0, column_count] {
         try {
-            if (index == g.snapshots.size()) {
-                Impl::Snapshot created;
-                glActiveTexture(GL_TEXTURE0); glGenTextures(1, &created.texture); glBindTexture(GL_TEXTURE_2D, created.texture);
-                const int scale = g.snapshot_scale();
-                glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 2 * (g.efb_width / scale), g.efb_height / scale);
-                glGenFramebuffers(1, &created.framebuffer); glBindFramebuffer(GL_FRAMEBUFFER, created.framebuffer);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, created.texture, 0);
-                if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-                    throw std::runtime_error("EFB snapshot framebuffer is incomplete");
-                g.snapshots.push_back(created);
-            }
-            // Callbacks read single pixels from the readback a frame later, when the pack
-            // has long retired, instead of waiting for it now.
-            const int scale = g.snapshot_scale();
+            if (index == g.snapshots.size()) g.snapshots.emplace_back();
             auto& snapshot = g.snapshots[index];
-            g.pack_efb(snapshot.framebuffer, 0, 0, g.efb_width / scale, g.efb_height / scale, scale, true);
-            const auto bytes = g.snapshot_bytes();
-            if (!snapshot.pack) {
-                glGenBuffers(1, &snapshot.pack); glBindBuffer(GL_PIXEL_PACK_BUFFER, snapshot.pack);
-                glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
-            }
             if (snapshot.ready) {
                 glDeleteSync(snapshot.ready); snapshot.ready = nullptr;
                 g.pending_reads.erase(std::remove_if(g.pending_reads.begin(), g.pending_reads.end(),
                     [&](const Impl::PendingRead& r) { return r.index == index; }), g.pending_reads.end());
+            }
+            if (snapshot.texture && snapshot.scale != scale) {
+                // The slot held a snapshot of another resolution: its objects are made anew.
+                if (g.snapshot_pixels[index]) {
+                    glBindBuffer(GL_PIXEL_PACK_BUFFER, snapshot.pack); glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); g.snapshot_pixels[index] = nullptr;
+                }
+                glDeleteBuffers(1, &snapshot.pack); glDeleteFramebuffers(1, &snapshot.framebuffer); glDeleteTextures(1, &snapshot.texture);
+                snapshot.pack = snapshot.framebuffer = snapshot.texture = 0;
+            }
+            if (!snapshot.texture) {
+                glActiveTexture(GL_TEXTURE0); glGenTextures(1, &snapshot.texture); glBindTexture(GL_TEXTURE_2D, snapshot.texture);
+                glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 2 * (g.efb_width / scale), g.efb_height / scale);
+                glGenFramebuffers(1, &snapshot.framebuffer); glBindFramebuffer(GL_FRAMEBUFFER, snapshot.framebuffer);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, snapshot.texture, 0);
+                if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                    throw std::runtime_error("EFB snapshot framebuffer is incomplete");
+                snapshot.scale = scale;
+            }
+            // Callbacks read single pixels from the readback a frame later, when the pack
+            // has long retired, instead of waiting for it now.
+            g.pack_efb(snapshot.framebuffer, 0, 0, g.efb_width / scale, g.efb_height / scale, scale, true);
+            if (!snapshot.pack) {
+                glGenBuffers(1, &snapshot.pack); glBindBuffer(GL_PIXEL_PACK_BUFFER, snapshot.pack);
+                glBufferData(GL_PIXEL_PACK_BUFFER, g.snapshot_bytes(scale), nullptr, GL_STREAM_READ);
             }
             glBindBuffer(GL_PIXEL_PACK_BUFFER, snapshot.pack);
             if (g.snapshot_pixels[index]) { glUnmapBuffer(GL_PIXEL_PACK_BUFFER); g.snapshot_pixels[index] = nullptr; }
@@ -2236,7 +2250,7 @@ const std::uint8_t* GlesRenderer::Impl::peek_snapshot(int x, int y, bool color) 
         ++stats.region_misses;
         execute([&] {
             try {
-                const int scale = snapshot_scale();
+                const int scale = snapshots[std::size_t(snapshot)].scale;
                 glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); glPixelStorei(GL_PACK_ALIGNMENT, 1);
                 glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
                 glBindFramebuffer(GL_READ_FRAMEBUFFER, snapshots[std::size_t(snapshot)].framebuffer);

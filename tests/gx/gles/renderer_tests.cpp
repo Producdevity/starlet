@@ -1817,6 +1817,41 @@ void full_resolution_snapshots() {
     try { GlesRenderer invalid(bad); } catch (const std::invalid_argument&) { refused = true; }
     check(refused, "snapshot scales other than 1, 2 and 4 are refused");
 }
+// Exact snapshots (EFB peeks outside draw-sync callbacks) are full resolution where draw-sync
+// snapshots are quarter resolution, never share a slot with those, and a slot reused at the
+// other resolution reads back at its new one.
+void exact_snapshots() {
+    GlesLimits limits; limits.direct.shading = DirectShading::fast;
+    GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
+    renderer.draw_direct(f.decoder.state(), command, f.memory);
+    const int quarter = renderer.snapshot_efb();
+    check(quarter >= 0 && fake::pack_required == 320 * 114 * 4, "draw-sync snapshots stay quarter resolution");
+    const int exact = renderer.snapshot_efb_exact(EfbRegion{});
+    check(exact >= 0 && exact != quarter && fake::pack_required == 1280 * 456 * 4,
+          "an exact snapshot of the same EFB reads back every pixel in a slot of its own");
+    check(renderer.snapshot_efb_exact(EfbRegion{}) == exact, "exact snapshots of an unchanged EFB share their slot");
+    fake::map_pattern = true;
+    const auto full = [](int x, int y) {
+        const auto at = std::uint32_t(((455 - y) * 1280 + 640 + x) * 4);
+        const auto byte = [&](std::uint32_t k) { return std::uint32_t((at + k) % 251); };
+        return byte(3) << 24 | byte(0) << 16 | byte(1) << 8 | byte(2);
+    };
+    std::uint32_t a = 0, b = 0;
+    renderer.wait_snapshot(exact);
+    check(renderer.peek_color_snapshot(exact, 13, 7, a) && renderer.peek_color_snapshot(exact, 14, 7, b) && a == full(13, 7) &&
+          b == full(14, 7) && a != b, "exact snapshot peeks answer each pixel");
+    renderer.release_snapshots();
+    renderer.draw_direct(f.decoder.state(), command, f.memory);
+    const int reused = renderer.snapshot_efb_exact(EfbRegion{});
+    check(reused == quarter && fake::pack_required == 1280 * 456 * 4, "a quarter-resolution slot is reused at full resolution");
+    renderer.wait_snapshot(reused);
+    check(renderer.peek_color_snapshot(reused, 13, 7, a) && a == full(13, 7), "and answers at full resolution");
+    renderer.draw_direct(f.decoder.state(), command, f.memory);
+    const int back = renderer.snapshot_efb();
+    check(back == exact && fake::pack_required == 320 * 114 * 4, "and a full-resolution slot at quarter resolution");
+    fake::map_pattern = false;
+    renderer.release_snapshots();
+}
 // Panfrost reads back through compute passes into buffers, at the offsets glReadPixels uses.
 void panfrost_readback() {
     const char* name = fake::renderer_name;
@@ -2212,6 +2247,7 @@ int main() {
         shared_depth_snapshots();
         snapshot_layout();
         full_resolution_snapshots();
+        exact_snapshots();
         region_snapshots(); panfrost_readback();
         texture_generations();
         present_mapping(); no_blits_on_the_frame_path();

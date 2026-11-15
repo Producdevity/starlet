@@ -133,6 +133,11 @@ samples the 160x114 one rather than its box-filtered half; on SP the
 consecutive-frame comparison against the GX passes differed by a mean of 0.1-0.4
 in static regions.
 
+Draw-sync snapshots (`snapshot_efb`) keep `GlesDirectLimits::snapshot_scale`;
+`snapshot_efb_exact` snapshots are full resolution, so their peeks equal
+`peek_depth` and `peek_color` at that point. A slot reused at the other
+resolution is made anew.
+
 A resident texture copy whose clear covers the whole EFB and rewrites an attachment the
 copy does not read (depth for colour copies; colour, alpha included, for depth copies)
 invalidates that attachment first, so the pass the copy ends does not write it back.

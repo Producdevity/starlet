@@ -81,6 +81,9 @@ public:
     // of the EFB's packed D24 depth and colour; otherwise snapshot_efb declines.
     int snapshot_efb() override;
     int snapshot_efb(const EfbRegion&) override;
+    // As snapshot_efb(region), at full resolution whatever GlesDirectLimits::snapshot_scale
+    // says: its peeks answer exactly what peek_depth and peek_color would have.
+    int snapshot_efb_exact(const EfbRegion&);
     bool snapshot_ready(int) const override;
     void wait_snapshot(int) override;
     bool peek_depth_snapshot(int index, int x, int y, std::uint32_t& value) const override;
