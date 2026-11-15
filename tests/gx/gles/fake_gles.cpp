@@ -83,6 +83,8 @@ const char* renderer_name = "private dispatch fixture";
 // Shader sources in compile order; depth state as last set.
 std::vector<std::string> shader_sources;
 std::vector<GLenum> invalidated;
+// Fences in creation order, and the fences glClientWaitSync waited for.
+std::vector<GLsync> fences, waited_fences;
 GLenum depth_func = GL_LESS;
 GLboolean depth_mask = GL_TRUE, depth_test = GL_FALSE;
 // While hold_readbacks is set, glReadPixels and glClientWaitSync wait for it to clear;
@@ -202,7 +204,11 @@ void glInvalidateFramebuffer(GLenum, GLsizei count, const GLenum* attachments) {
 }
 void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {}
 void glClearDepthf(GLfloat d) {}
-GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) { fake::hold_readback(); return fake::wait_result; }
+GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
+    fake::hold_readback();
+    fake::waited_fences.push_back(sync);
+    return fake::wait_result;
+}
 void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {}
 void glCompileShader(GLuint shader) {}
 GLuint glCreateProgram(void) { return ++fake::next; }
@@ -262,7 +268,10 @@ void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, 
 }
 void glEnable(GLenum cap) { if (cap == GL_DEPTH_TEST) fake::depth_test = GL_TRUE; }
 void glEnableVertexAttribArray(GLuint index) { fake::vertex_arrays[fake::vertex_array].attributes.at(index).enabled = true; }
-GLsync glFenceSync(GLenum condition, GLbitfield flags) { return reinterpret_cast<GLsync>(++fake::next); }
+GLsync glFenceSync(GLenum condition, GLbitfield flags) {
+    fake::fences.push_back(reinterpret_cast<GLsync>(++fake::next));
+    return fake::fences.back();
+}
 void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {}
 void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
     if (attachment == GL_COLOR_ATTACHMENT0) fake::color_attachments[fake::framebuffer] = texture;

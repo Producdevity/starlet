@@ -113,6 +113,11 @@ public:
     // framebuffer, lower-left origin, without swapping.
     void present_into(unsigned framebuffer, int source_width, int source_height, int x, int y, int width, int height);
     void set_swap(std::function<void()>);
+    // Presentation (present, present_framebuffer, end_frame) first waits until the GPU has
+    // finished the frame presented frames presentations earlier: 1 (the default) or 2. With 2
+    // the GL thread queues a second frame before the first completes, a frame more of latency.
+    // Peeks, readbacks and materialized copies still wait for all work before them.
+    void set_frames_in_flight(unsigned frames);
     void release_snapshots() override;
     void present(int drawable_width, int drawable_height);
     void copy_display(const DisplayCopy&, std::uint8_t*, std::size_t) override;

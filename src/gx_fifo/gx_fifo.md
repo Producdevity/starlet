@@ -121,6 +121,15 @@ port that writes EFB pixels from the CPU calls `note_efb_poke()` after each
 write. The stats line counts peek groups and draw-sync callbacks answered one
 frame late as `late`.
 
+## Frame ahead
+
+`GpuSetup::frame_ahead`, or `STARLET_GX_FRAME_AHEAD=1`, lets the renderer queue
+a second frame for the GPU before the first completes
+(`Renderer::set_frame_ahead`; the GLES backend keeps two frames in flight). The
+GL thread waits less on the GPU, and the picture lags the game's input by one
+frame more, so it is off by default. Draw done, tokens, peeks that read the EFB
+and DMA over resident copies still wait for every command before them.
+
 ## Host transfers
 
 `start_gpu` observes `starlet::os::before_dma_read` and `before_dma_write`. A
@@ -145,6 +154,7 @@ draws are logged once per message.
 token and draw-done order, peeks, a display copy presented by VI.
 `read_groups_tests.cpp` covers peek groups, late answers and their exceptions,
 and exact reads under `STARLET_GX_SYNC_READS=1`; `draw_sync_snapshot_tests.cpp`
-runs the exact draw-sync snapshots. With GLES
+runs the exact draw-sync snapshots; `frame_ahead_tests.cpp` checks that the
+setting reaches the renderer and that sync points still wait. With GLES
 headers, `dma_tests.cpp` runs ARAM and disc DMA over resident texture copies of
 the GLES renderer on a recording GL fake.

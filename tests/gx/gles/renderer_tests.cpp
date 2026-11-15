@@ -53,6 +53,7 @@ extern std::vector<GLenum> invalidated;
 extern GLenum depth_func;
 extern GLboolean depth_mask, depth_test;
 extern unsigned texture_copies;
+extern std::vector<GLsync> fences, waited_fences;
 extern GLuint copy_source, copy_texture, array_framebuffer, draw_texture;
 extern std::array<GLint, 4> copy_rect;
 } // namespace fake
@@ -1681,6 +1682,48 @@ void direct_submission_thread() {
     check(s.draws == 4 && s.submissions >= 2 && fake::draws > before, "recorded draws are submitted in order");
     check(s.resident_copies == 1, "resident copies are created on the submission thread");
 }
+// Presentation waits for the frame frames_in_flight presentations back; sync points still read
+// after every queued operation.
+void frames_in_flight() {
+    GlesLimits limits; limits.direct.shading = DirectShading::fast;
+    GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
+    rejects([&] { renderer.set_frames_in_flight(0); }, "no frames in flight is refused");
+    rejects([&] { renderer.set_frames_in_flight(3); }, "three frames in flight are refused");
+    const auto frame = [&] {
+        renderer.draw_direct(f.decoder.state(), command, f.memory);
+        renderer.end_frame();
+        return fake::fences.back();
+    };
+    const auto first = frame();
+    fake::waited_fences.clear();
+    const auto second = frame();
+    check(fake::waited_fences == std::vector<GLsync>{first}, "by default a frame waits for the previous one");
+    renderer.set_frames_in_flight(2);
+    fake::waited_fences.clear();
+    const auto third = frame();
+    check(fake::waited_fences.empty(), "with two frames in flight the next frame does not wait");
+    frame();
+    check(fake::waited_fences == std::vector<GLsync>{second}, "it waits for the frame two presentations back");
+    fake::waited_fences.clear();
+    frame();
+    check(fake::waited_fences == std::vector<GLsync>{third}, "and so on");
+    renderer.start_submission([] {}, [] {}, [] {});
+    for (unsigned i = 0; i < 2; ++i) {
+        renderer.draw_direct(f.decoder.state(), command, f.memory);
+        renderer.end_frame();
+    }
+    renderer.draw_direct(f.decoder.state(), command, f.memory);
+    renderer.peek_color(10, 10);
+    check(fake::draws_at_read == fake::draws, "a live peek reads after every queued draw");
+    renderer.draw_direct(f.decoder.state(), command, f.memory);
+    renderer.peek_depth(10, 10);
+    check(fake::draws_at_read == fake::draws, "so does a depth peek");
+    renderer.stop_submission();
+    renderer.set_frames_in_flight(1);
+    fake::waited_fences.clear();
+    frame();
+    check(fake::waited_fences.size() == 2, "one frame in flight again waits for both queued frames");
+}
 void direct_texture_copy_readback() {
     GlesLimits limits; limits.direct.shading = DirectShading::fast;
     GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
@@ -2248,6 +2291,7 @@ int main() {
         snapshot_layout();
         full_resolution_snapshots();
         exact_snapshots();
+        frames_in_flight();
         region_snapshots(); panfrost_readback();
         texture_generations();
         present_mapping(); no_blits_on_the_frame_path();

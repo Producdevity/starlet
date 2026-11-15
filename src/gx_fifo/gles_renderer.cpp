@@ -44,6 +44,8 @@ bool GlesBackend::depth_readback_value(int handle, int x, int y, std::uint32_t& 
 void GlesBackend::wait_depth_readback(int handle) { renderer_.wait_depth_readback(handle); }
 void GlesBackend::release_depth_readback(int handle) { renderer_.release_depth_readback(handle); }
 
+void GlesBackend::set_frame_ahead(bool ahead) { renderer_.set_frames_in_flight(ahead ? 2 : 1); }
+
 bool GlesBackend::present(const gx::FramebufferView& frame, int drawable_width, int drawable_height, bool black) {
     return renderer_.present_framebuffer(frame, drawable_width, drawable_height, black);
 }

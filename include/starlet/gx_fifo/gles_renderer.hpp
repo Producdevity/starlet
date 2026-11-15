@@ -35,6 +35,7 @@ public:
     bool depth_readback_value(int handle, int x, int y, std::uint32_t& value) const override;
     void wait_depth_readback(int handle) override;
     void release_depth_readback(int handle) override;
+    void set_frame_ahead(bool ahead) override;
     bool present(const gx::FramebufferView& frame, int drawable_width, int drawable_height, bool black) override;
     std::vector<std::uint8_t> readback() override;
     void print_stats(const GpuCounters& gpu) override;

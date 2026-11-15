@@ -52,7 +52,9 @@ Visible zero-Q crossings and overflow fail with an error. Neither cache
 assumes that an address is an immutable resource generation. These limits
 exclude driver/compiler internals, in-flight allocations and CPU packet storage.
 A previous-frame fence is retired at presentation; the frontend must present
-regularly and bound submitted work per frame. On the direct path a retrace whose
+regularly and bound submitted work per frame. `set_frames_in_flight(2)` retires
+the fence of the frame two presentations back instead, so the GL thread queues
+a second frame before the GPU finishes the first. On the direct path a retrace whose
 XFB, extent and black state match the previous presentation, with no display
 copy into that XFB since, presents nothing and the caller does not swap: the
 earlier image stays on screen, so logic-only frames cost no presentation pass.

@@ -319,7 +319,10 @@ struct GlesRenderer::Impl {
     };
     std::vector<Texture> textures;
     std::vector<Program> programs;
-    std::vector<GLsync> frames;
+    // Fences of presented frames still on the GPU, oldest first; presentation keeps at most
+    // frames_in_flight (GL thread).
+    std::deque<GLsync> frames;
+    unsigned frames_in_flight = 1;
     std::array<GLint, 2> max_viewport{};
     std::uint64_t sequence = 0;
     TransformUniforms uploaded_transform{};
@@ -700,7 +703,7 @@ struct GlesRenderer::Impl {
         glVertexAttribIPointer(14, 3, GL_UNSIGNED_INT, sizeof(GpuVertex), reinterpret_cast<const void*>(offsetof(GpuVertex, matrices)));
         glGenBuffers(1, &ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
         glGenBuffers(1, &ubo);
-        programs.reserve(limits.programs); frames.reserve(2);
+        programs.reserve(limits.programs);
         gl_check("renderer initialization");
     }
     Program& program(const GlesDrawPipeline& pipeline, const DrawPacket& packet) {
@@ -1282,11 +1285,11 @@ void main(){
         gl_check("resident texture-copy materialization");
     }
     void bound_frames() {
-        if (!frames.empty()) {
+        while (frames.size() >= frames_in_flight) {
             const auto wait = glClientWaitSync(frames.front(), GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000);
             if (wait != GL_ALREADY_SIGNALED && wait != GL_CONDITION_SATISFIED)
                 throw std::runtime_error("GLES previous frame did not retire within one second");
-            glDeleteSync(frames.front()); frames.clear();
+            glDeleteSync(frames.front()); frames.pop_front();
         }
         const auto fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         if (!fence) throw std::runtime_error("GLES frame fence allocation failed");
@@ -2232,6 +2235,11 @@ void GlesRenderer::stop_submission() {
     q.running = false; q.id = {};
 }
 void GlesRenderer::set_swap(std::function<void()> swap) { impl_->swap = std::move(swap); }
+void GlesRenderer::set_frames_in_flight(unsigned frames) {
+    auto& g = *impl_; g.require_ready();
+    if (frames < 1 || frames > 2) throw std::invalid_argument("frames in flight must be 1 or 2");
+    g.execute([&g, frames] { g.frames_in_flight = frames; }, false);
+}
 void GlesRenderer::release_snapshots() {
     auto& g = *impl_; g.check_owner();
     std::fill(g.snapshot_busy.begin(), g.snapshot_busy.end(), false);

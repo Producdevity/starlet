@@ -58,6 +58,11 @@ struct GpuSetup {
     // peek reads the EFB as of its point in the command stream, waiting for the GPU (exact reads).
     // STARLET_GX_SYNC_READS=1 in the environment turns it on as well.
     bool sync_reads = false;
+    // The renderer may queue a second frame for the GPU before the first completes
+    // (Renderer::set_frame_ahead): the GL thread waits less on the GPU, and what the game shows
+    // lags its input by one frame more. Sync points still wait for all work before them. Off by
+    // default; STARLET_GX_FRAME_AHEAD=1 in the environment turns it on as well.
+    bool frame_ahead = false;
     Diagnostics diagnostics;
 };
 

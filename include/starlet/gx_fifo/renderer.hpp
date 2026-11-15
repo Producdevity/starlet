@@ -65,6 +65,9 @@ public:
     virtual bool depth_readback_value(int, int, int, std::uint32_t&) const { return false; }
     virtual void wait_depth_readback(int) {}
     virtual void release_depth_readback(int) {}
+    // GpuSetup::frame_ahead, on the GPU thread before decoding starts: the renderer may queue
+    // a second frame for the GPU before the first completes.
+    virtual void set_frame_ahead(bool) {}
     // Shows frame (or black) on a drawable of that size; false when nothing new was shown.
     virtual bool present(const gx::FramebufferView& frame, int drawable_width, int drawable_height, bool black) = 0;
     // Development: the EFB as RGBA8 rows from the lower left; empty when the renderer cannot read it.

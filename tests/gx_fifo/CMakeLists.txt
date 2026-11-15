@@ -19,6 +19,13 @@ add_test(NAME starlet_gx_fifo_read_groups COMMAND starlet_gx_fifo_read_groups_te
 add_test(NAME starlet_gx_fifo_read_groups_exact COMMAND starlet_gx_fifo_read_groups_tests exact)
 set_tests_properties(starlet_gx_fifo_read_groups PROPERTIES TIMEOUT 30)
 set_tests_properties(starlet_gx_fifo_read_groups_exact PROPERTIES TIMEOUT 30 ENVIRONMENT STARLET_GX_SYNC_READS=1)
+add_executable(starlet_gx_fifo_frame_ahead_tests frame_ahead_tests.cpp)
+target_link_libraries(starlet_gx_fifo_frame_ahead_tests PRIVATE starlet_gx_fifo)
+foreach(mode setup env off)
+    add_test(NAME starlet_gx_fifo_frame_ahead_${mode} COMMAND starlet_gx_fifo_frame_ahead_tests ${mode})
+    set_tests_properties(starlet_gx_fifo_frame_ahead_${mode} PROPERTIES TIMEOUT 30)
+endforeach()
+set_tests_properties(starlet_gx_fifo_frame_ahead_env PROPERTIES ENVIRONMENT STARLET_GX_FRAME_AHEAD=1)
 # ARAM and disc DMA over resident texture copies, against the GLES renderer on a recording GL fake.
 if(TARGET starlet_gx_gles_objects AND TARGET starlet_ar AND TARGET starlet_dvd)
     add_executable(starlet_gx_fifo_dma_tests dma_tests.cpp "${PROJECT_SOURCE_DIR}/tests/gx/gles/fake_gles.cpp")

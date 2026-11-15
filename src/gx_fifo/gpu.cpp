@@ -580,6 +580,7 @@ private:
         os::name_thread("gx-gpu");
         os::set_guest_allocation(false);
         if (setup_.start) setup_.start();
+        if (setup_.frame_ahead) renderer_.set_frame_ahead(true);
         new_decoder();
         while (!stopping_) {
             Job job;
@@ -767,6 +768,8 @@ void start_gpu(GpuSetup setup) {
     if (gpu) throw std::logic_error("the GPU thread is already running");
     const char* exact = std::getenv("STARLET_GX_SYNC_READS");
     sync_reads = setup.sync_reads || (exact && std::strcmp(exact, "1") == 0);
+    const char* ahead = std::getenv("STARLET_GX_FRAME_AHEAD");
+    setup.frame_ahead = setup.frame_ahead || (ahead && std::strcmp(ahead, "1") == 0);
     host_allocation_scope host;
     dirty_state = setup.flush_dirty_state;
     gpu = std::make_unique<Gpu>(std::move(setup));
