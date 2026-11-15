@@ -2,6 +2,7 @@
 // retrace callbacks.
 #include "gpu_internal.hpp"
 
+#include "starlet/gx/sync_stats.hpp"
 #include "starlet/gx_fifo/frame_trace.hpp"
 #include "starlet/gx_fifo/video.hpp"
 #include "starlet/os/guest_cpu.hpp"
@@ -41,6 +42,7 @@ std::atomic<bool> started{false};
 
 void retrace() {
     ++retrace_count;
+    starlet::gx::sync_stats::tick("retraces");
     frame_event('R', retrace_count);
     if (pre_callback) pre_callback(retrace_count);
     if (flush_pending) {
@@ -116,6 +118,7 @@ void VISetBlack(BOOL isBlack) {
 void VIWaitForRetrace() {
     const BOOL enabled = OSDisableInterrupts();
     const u32 count = retrace_count;
+    starlet::gx::sync_stats::Wait blocked("VIWaitForRetrace (game)");
     do OSSleepThread(&retrace_waiters);
     while (count == retrace_count);
     OSRestoreInterrupts(enabled);

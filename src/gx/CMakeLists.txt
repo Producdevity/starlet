@@ -19,6 +19,7 @@ add_library(starlet_gx STATIC
     draw.cpp
     direct.cpp
     fast_shader.cpp
+    sync_stats.cpp
 )
 add_library(starlet::gx ALIAS starlet_gx)
 target_include_directories(starlet_gx PUBLIC "${PROJECT_SOURCE_DIR}/include")

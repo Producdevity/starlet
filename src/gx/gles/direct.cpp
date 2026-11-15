@@ -1,3 +1,4 @@
+#include "starlet/gx/sync_stats.hpp"
 #include "starlet/gx/gles/direct.hpp"
 #include "starlet/gx/gles/program_builder.hpp"
 #include "starlet/gx/gles/program_cache.hpp"
@@ -1436,6 +1437,7 @@ struct GlesDirect::Impl {
         bool older = false;
         for (auto it = shadowed.begin(); it != shadowed.end();) {
             if (!owns_any(*it, d.address, bytes)) { ++it; continue; }
+            sync_stats::Context ctx("materialize: texture overlaps shadowed copy");
             materialize(*it); it = shadowed.erase(it); older = true;
         }
         if (found.empty()) { if (older) { textures_changed(); publish(); } return 0; }
@@ -1453,6 +1455,7 @@ struct GlesDirect::Impl {
                 return crop(found[0]->first, c, d.width, d.height);
             }
         }
+        sync_stats::Context ctx("materialize: texture not a plain copy match");
         for (auto it : found) materialize(it);
         textures_changed();
         publish();
@@ -1518,10 +1521,12 @@ struct GlesDirect::Impl {
         std::size_t from = 0, to = 0;
         for (auto it = shadowed.begin(); it != shadowed.end();) {
             if (!reached(*it, begin, size, from, to) || it->covers(from, to)) { ++it; continue; }
+            sync_stats::Context ctx("materialize: dma read");
             materialize(*it); it = shadowed.erase(it); changed = true;
         }
         for (auto it = copies.begin(); it != copies.end();) {
             if (!reached(it->second, begin, size, from, to)) { ++it; continue; }
+            sync_stats::Context ctx("materialize: dma read");
             materialize(it++); changed = true;
         }
         if (changed) { textures_changed(); publish(); }
@@ -1546,7 +1551,7 @@ struct GlesDirect::Impl {
             shadowed.push_back(std::move(it->second));
             it = copies.erase(it);
         }
-        while (shadowed.size() > 8) { materialize(shadowed.front()); shadowed.erase(shadowed.begin()); }
+        while (shadowed.size() > 8) { sync_stats::Context ctx("materialize: shadow limit"); materialize(shadowed.front()); shadowed.erase(shadowed.begin()); }
         if (changed) { textures_changed(); publish(); }
     }
     void invalidate_pointer(const std::uint8_t* begin, std::size_t size) {
@@ -1613,7 +1618,7 @@ struct GlesDirect::Impl {
             retire_shadowed(*it); it = shadowed.erase(it);
         }
         // Bounds the GPU memory older copies hold.
-        while (shadowed.size() > 8) { materialize(shadowed.front()); shadowed.erase(shadowed.begin()); }
+        while (shadowed.size() > 8) { sync_stats::Context ctx("materialize: shadow limit"); materialize(shadowed.front()); shadowed.erase(shadowed.begin()); }
         const auto t = target_of(p.destination_width(), p.destination_height());
         auto& entry = copies[token];
         entry = {token, bytes, t.texture, t.framebuffer, p, destination, capacity};

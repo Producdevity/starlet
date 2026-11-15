@@ -7,6 +7,7 @@
 #include "starlet/gx/texture_copy.hpp"
 #include "starlet/gx_fifo/frame_trace.hpp"
 #include "starlet/gx_fifo/gpu.hpp"
+#include "starlet/gx/sync_stats.hpp"
 #include "starlet/gx_fifo/renderer.hpp"
 #include "starlet/os/game_memory.hpp"
 #include "starlet/os/host_allocation.hpp"
@@ -319,6 +320,7 @@ public:
     void drain() {
         std::unique_lock<std::mutex> lock(mutex_);
         const std::uint64_t target = posted_;
+        gx::sync_stats::Wait blocked(gx::sync_stats::context("drain-other"));
         done_.wait(lock, [&] { return completed_ >= target; });
     }
     bool idle() {
@@ -358,7 +360,7 @@ public:
     bool bp_write(const State& state, std::uint8_t address, std::uint32_t value) override {
         switch (address) {
         case 0x45:  // Draw done.
-            renderer_.wait_until_idle();
+            { gx::sync_stats::Context ctx("draw-done-idle"); gx::sync_stats::Wait blocked("draw-done-idle (gpu)"); renderer_.wait_until_idle(); }
             frame_event('D');
             deliver({true, 0, -1});
             break;
@@ -367,7 +369,7 @@ public:
             break;
         case 0x48:
             token_.store(std::uint16_t(value), std::memory_order_release);
-            renderer_.wait_until_idle();
+            { gx::sync_stats::Context ctx("draw-sync-idle"); gx::sync_stats::Wait blocked("draw-sync-idle (gpu)"); renderer_.wait_until_idle(); }
             deliver(token_interrupt(std::uint16_t(value)));
             break;
         case 0x52:
@@ -580,6 +582,7 @@ private:
         os::name_thread("gx-gpu");
         os::set_guest_allocation(false);
         if (setup_.start) setup_.start();
+        gx::sync_stats::state(std::string("frame_ahead_requested=") + (setup_.frame_ahead ? "1" : "0"));
         if (setup_.frame_ahead) renderer_.set_frame_ahead(true);
         new_decoder();
         while (!stopping_) {
@@ -591,11 +594,18 @@ private:
                 while (!pending_.empty() && jobs_.empty()) {
                     if (wake_.wait_for(lock, std::chrono::milliseconds(1), [&] { return !jobs_.empty(); })) break;
                     lock.unlock();
-                    if (!renderer_.snapshot_ready(pending_.front().snapshot)) renderer_.wait_snapshot(pending_.front().snapshot);
+                    if (!renderer_.snapshot_ready(pending_.front().snapshot)) {
+                        gx::sync_stats::Context ctx("token-snapshot-wait");
+                        gx::sync_stats::Wait blocked("token-snapshot-wait (gpu)");
+                        renderer_.wait_snapshot(pending_.front().snapshot);
+                    }
                     pump();
                     lock.lock();
                 }
-                wake_.wait(lock, [&] { return !jobs_.empty(); });
+                {
+                    gx::sync_stats::Wait idle("gpu-idle-no-jobs");
+                    wake_.wait(lock, [&] { return !jobs_.empty(); });
+                }
                 job = std::move(jobs_.front());
                 jobs_.pop_front();
             }
@@ -755,6 +765,7 @@ void note_dma(const void* data, std::size_t bytes, bool write) {
     Gpu* g = gpu.get();
     if (!g || !bytes || !g->resident_in(data, bytes)) return;
     if (g->on_thread()) return g->before_dma(data, bytes, write);
+    gx::sync_stats::Context ctx(write ? "dma-write-wait" : "dma-read-wait");
     gpu_call([g, data, bytes, write] { g->before_dma(data, bytes, write); });
 }
 

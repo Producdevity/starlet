@@ -1,5 +1,6 @@
 #include "starlet/gx/gles/renderer.hpp"
 #include "starlet/gx/efb_format.hpp"
+#include "starlet/gx/sync_stats.hpp"
 
 #include <GLES3/gl31.h>
 #include <algorithm>
@@ -486,7 +487,10 @@ struct GlesRenderer::Impl {
         std::unique_lock<std::mutex> lock(q.mutex);
         if (q.failure) std::rethrow_exception(q.failure);
         // Bounded lag: the recording thread runs at most a few segments ahead.
-        q.done.wait(lock, [&] { return (q.post ? q.submitted - q.completed : q.queue.size()) < 32 || q.failure; });
+        {
+            sync_stats::Wait blocked("gl-queue-full");
+            q.done.wait(lock, [&] { return (q.post ? q.submitted - q.completed : q.queue.size()) < 32 || q.failure; });
+        }
         if (q.failure) std::rethrow_exception(q.failure);
         const auto target = ++q.submitted;
         if (q.post) {
@@ -499,6 +503,7 @@ struct GlesRenderer::Impl {
             q.ready.notify_one();
             if (!wait) return;
         }
+        sync_stats::Wait blocked(sync_stats::context("gl-sync-other"));
         q.done.wait(lock, [&] { return q.completed >= target || q.failure; });
         if (q.failure) std::rethrow_exception(q.failure);
     }
@@ -550,6 +555,7 @@ struct GlesRenderer::Impl {
                         continue;
                     }
                 } else {
+                    sync_stats::Wait idle("gl-idle-no-work");
                     q.ready.wait(lock, [&] { return q.stopping || !q.queue.empty(); });
                 }
                 if (q.queue.empty()) break;
@@ -622,7 +628,7 @@ struct GlesRenderer::Impl {
         direct = std::make_unique<GlesDirect>(limits.direct, fetch, GlesDirect::Target{framebuffer, color_framebuffer, [&g](bool rgba6) {
             if (rgba6 == g.rgba6) return false;
             g.reinterpret_format(rgba6); return true;
-        }, [&g](const GlesResidentCopy& copy) { g.flush_copies(); g.execute([&g, &copy] { g.materialize(copy); }, true); },
+        }, [&g](const GlesResidentCopy& copy) { sync_stats::Context ctx(sync_stats::context("materialize")); g.flush_copies(); g.execute([&g, &copy] { g.materialize(copy); }, true); },
         [&g](std::function<void()> op, bool wait) { g.execute(std::move(op), wait); }, strip_framebuffer});
         shared_direct.store(direct.get(), std::memory_order_release);
     }
@@ -1376,6 +1382,7 @@ void main(){
         store_texels(c.texture, materialize_buffer, 0, 0, width, height, 0, width);
         const auto done = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         if (!done) throw std::runtime_error("resident texture-copy fence allocation failed");
+        sync_stats::Wait blocked("materialize-fence");
         const auto wait = glClientWaitSync(done, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000);
         glDeleteSync(done);
         if (wait != GL_ALREADY_SIGNALED && wait != GL_CONDITION_SATISFIED)
@@ -1391,6 +1398,7 @@ void main(){
     }
     void bound_frames() {
         while (frames.size() >= frames_in_flight) {
+            sync_stats::Wait blocked("frame-fence (previous frame)");
             const auto wait = glClientWaitSync(frames.front(), GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000);
             if (wait != GL_ALREADY_SIGNALED && wait != GL_CONDITION_SATISFIED)
                 throw std::runtime_error("GLES previous frame did not retire within one second");
@@ -1836,7 +1844,7 @@ void GlesRenderer::present(int width, int height) {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, g.framebuffer); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
             glBlitFramebuffer(0, 0, g.efb_width, g.efb_height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
             g.bound_frames(); gl_check("EFB presentation");
-            if (g.swap) g.swap();
+            if (g.swap) { sync_stats::Wait blocked("swap (vsync)"); g.swap(); }
         } catch (...) { g.failed = true; throw; }
     }, false);
     if (g.direct) g.direct->next_frame();
@@ -1966,6 +1974,7 @@ void GlesRenderer::copy_texture(const TextureCopy& p, std::uint8_t* destination,
             }
         };
         // Direct draws are recorded and submitted on the GL thread; read back after them, there.
+        sync_stats::Context ctx_2029("copy-texture-readback");
         if (g.direct) { g.direct->flush(); g.execute(read, true); }
         else read();
         encode_texture_copy(p,{pixels.data(),pixels.size()},destination,capacity);
@@ -2049,6 +2058,7 @@ void GlesRenderer::Impl::present_gl(const FramebufferView& f, int width, int hei
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
+        sync_stats::tick("presents");
         if (!black) {
             g.copy_surface();
             g.display_programs(false);
@@ -2081,7 +2091,7 @@ void GlesRenderer::Impl::present_gl(const FramebufferView& f, int width, int hei
         g.bound_frames();
         gl_check("native VI YUYV presentation");
         ++g.stats.presentations;
-        if (g.swap) g.swap();
+        if (g.swap) { sync_stats::Wait blocked("swap (vsync)"); g.swap(); }
     } catch (...) {
         g.failed = true;
         throw;
@@ -2092,6 +2102,7 @@ void GlesRenderer::wait_until_idle() {
     // Direct draws consume their inputs when recorded and keep copies GPU-resident,
     // so completion needs only GL command order; presentation bounds the queue.
     if (g.direct) return;
+    sync_stats::Context ctx_2156("wait-until-idle");
     g.execute([&g] {
         GLsync fence = nullptr;
         try {
@@ -2231,6 +2242,7 @@ void GlesRenderer::wait_snapshot(int index) {
         throw std::out_of_range("unknown EFB snapshot");
     if (g.snapshot_ready(index)) return;
     ++g.stats.peek_waits;
+    sync_stats::Context ctx_2295("snapshot-wait");
     g.execute([&] { try { g.collect_snapshots(index); } catch (...) { g.failed = true; throw; } }, true);
 }
 namespace {
@@ -2343,7 +2355,7 @@ void GlesRenderer::set_swap(std::function<void()> swap) { impl_->swap = std::mov
 void GlesRenderer::set_frames_in_flight(unsigned frames) {
     auto& g = *impl_; g.require_ready();
     if (frames < 1 || frames > 2) throw std::invalid_argument("frames in flight must be 1 or 2");
-    g.execute([&g, frames] { g.frames_in_flight = frames; }, false);
+    g.execute([&g, frames] { g.frames_in_flight = frames; sync_stats::state("frames_in_flight=" + std::to_string(frames)); }, false);
 }
 void GlesRenderer::release_snapshots() {
     auto& g = *impl_; g.check_owner();
@@ -2357,10 +2369,12 @@ const std::uint8_t* GlesRenderer::Impl::peek_snapshot(int x, int y, bool color) 
     ++stats.peeks;
     if (snapshot < 0) return nullptr;
     if (!snapshot_ready(snapshot) && ++stats.peek_waits)
+        sync_stats::Context ctx_2423("peek-snapshot-wait");
         execute([&] { try { collect_snapshots(snapshot); } catch (...) { failed = true; throw; } }, true);
     if (!snapshot_region[std::size_t(snapshot)].contains(x, y)) {
         // Outside the read-back region: the retained snapshot itself, after queued GL work.
         ++stats.region_misses;
+        sync_stats::Context ctx_2427("peek-region-miss");
         execute([&] {
             try {
                 const int scale = snapshots[std::size_t(snapshot)].scale;
@@ -2388,6 +2402,7 @@ std::uint32_t GlesRenderer::peek_depth(int x, int y) {
     // each) wait for queued GL work once: the first reads the whole EFB's depth as of that point.
     if (g.live_depth_writes != g.efb_writes) {
         g.live_depth.resize(std::size_t(g.efb_width) * g.efb_height * 4);
+        sync_stats::Context ctx_2454("live-depth-peek");
         g.execute([&] {
             try { g.read_depth(0,0,g.efb_width,g.efb_height,g.live_depth.data(),-1); } catch (...) {g.failed=true;throw;}
         }, true);
@@ -2450,6 +2465,7 @@ void GlesRenderer::wait_depth_readback(int handle) {
     auto& d = g.depth_readbacks[std::size_t(handle)];
     if (d.ready()) return;
     ++g.stats.peek_waits;
+    sync_stats::Context ctx_2516("depth-readback-wait");
     g.execute([&g, &d] {
         try {
             if (d.ready() || !d.fence) return;
@@ -2474,6 +2490,7 @@ std::uint32_t GlesRenderer::peek_color(int x, int y) {
     if (const auto* pixel = g.peek_snapshot(x, y, true)) return argb(pixel);
     ++g.stats.live_peeks;
     std::array<std::uint8_t, 4> pixel{};
+    sync_stats::Context ctx_2540("live-color-peek");
     g.execute([&] {
         try {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, g.framebuffer);

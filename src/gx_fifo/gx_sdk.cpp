@@ -3,6 +3,7 @@
 // starlet/compat/gx_fifo.h.
 #include "gpu_internal.hpp"
 
+#include "starlet/gx/sync_stats.hpp"
 #include "starlet/compat/gx_fifo.h"
 #include "starlet/gx_fifo/frame_trace.hpp"
 #include "starlet/gx_fifo/gpu.hpp"
@@ -194,6 +195,7 @@ bool late_peek(bool depth, int x, int y, std::uintptr_t site, std::uint32_t& val
     // Not read back yet, outside its region, or not yet taken: the GPU thread reads that
     // snapshot, waiting for it. A snapshot the renderer refused leaves the live read.
     bool answered = false;
+    starlet::gx::sync_stats::Context ctx("late-peek-wait");
     gpu_call([slot, taken, depth, x, y, &value, &answered] {
         const int s = gpu_group_snapshot(slot, taken);
         if (s < 0) return;
@@ -259,12 +261,14 @@ std::uint32_t peek(bool depth, int x, int y, std::uintptr_t site) {
         gpu_note_token_peek(c.token, c.x0, c.y0, c.x1, c.y1);
         if (const int s = c.snapshot; s >= 0) {
             if (gpu_peek_snapshot(s, depth, x, y, value)) return value;
+            starlet::gx::sync_stats::Context ctx("token-peek-snapshot-wait");
             gpu_call([s, depth, x, y, &value] { value = gpu_peek_snapshot_wait(s, depth, x, y); });
             return value;
         }
     }
     flush_stage();
     if (!sync_callback.active && late_peek(depth, x, y, site, value)) return value;
+    starlet::gx::sync_stats::Context ctx("live-peek");
     gpu_call([depth, x, y, &value] { value = depth ? gpu_peek_depth(x, y) : gpu_peek_color(x, y); });
     return value;
 }
@@ -275,6 +279,7 @@ std::uint32_t peek_color(int x, int y) { return peek(false, x, y, 0); }
 int request_depth_readback() {
     flush_stage();
     int handle = -1;
+    starlet::gx::sync_stats::Context ctx("depth-readback-request");
     gpu_call([&handle] { handle = gpu_request_depth_readback(); });
     return handle;
 }
@@ -282,6 +287,7 @@ int request_depth_readback() {
 std::uint32_t readback_depth(int handle, int x, int y) {
     std::uint32_t value = 0;
     if (gpu_depth_readback_value(handle, x, y, value)) return value;
+    starlet::gx::sync_stats::Context ctx("depth-readback-wait");
     gpu_call([handle] { gpu_wait_depth_readback(handle); });
     if (!gpu_depth_readback_value(handle, x, y, value)) throw std::out_of_range("depth readback outside the EFB");
     return value;
@@ -519,6 +525,7 @@ void GXAbortFrame() { flush_stage(); }
 
 void __GXAbort() {
     flush_stage();
+    starlet::gx::sync_stats::Context ctx("gx-abort-drain");
     gpu_drain();
 }
 
@@ -536,6 +543,7 @@ void GXSetDrawDone() {
 
 void GXWaitDrawDone() {
     const BOOL enabled = OSDisableInterrupts();
+    starlet::gx::sync_stats::Wait blocked("GXWaitDrawDone (game)");
     while (!draw_done) OSSleepThread(&finish_queue);
     OSRestoreInterrupts(enabled);
     frame_event('e');
