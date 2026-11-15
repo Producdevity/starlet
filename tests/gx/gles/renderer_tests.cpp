@@ -54,6 +54,9 @@ extern GLenum depth_func;
 extern GLboolean depth_mask, depth_test;
 extern unsigned texture_copies;
 extern std::vector<GLsync> fences, waited_fences;
+extern std::vector<GLuint> blit_targets, array_targets;
+extern unsigned draws_at_blit;
+extern std::map<GLuint, std::array<GLint, 4>> swizzles;
 extern GLuint copy_source, copy_texture, array_framebuffer, draw_texture;
 extern std::array<GLint, 4> copy_rect;
 } // namespace fake
@@ -975,6 +978,92 @@ void format_after_depth_copy() {
 // A copy whose clear rewrites the whole EFB depth leaves the depth the copy does not read
 // dead before the pass ends: it is invalidated. Partial clears, clears that keep depth and
 // depth copies (which read it) keep it.
+// Resident copies with nothing between them render in one pass when only their targets differ:
+// one blit into every target's draw buffer, or one copy program writing each target.
+void merged_copies() {
+    alignas(32) std::array<std::uint8_t, 4096> bytes{};
+    const auto copy = [](int format, int x) {
+        TextureCopy p; p.x = x; p.width = 16; p.height = 8; p.format = format; p.stride = 256; return p;
+    };
+    {
+        GlesLimits limits; limits.direct.shading = DirectShading::fast;
+        GlesRenderer renderer(limits); Fixture f;
+        renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+        auto blits = fake::blits;
+        renderer.copy_texture_resident(copy(6, 0), bytes.data(), 512, 0x8000);
+        renderer.copy_texture_resident(copy(4, 0), bytes.data() + 512, 512, 0x8200);
+        check(fake::blits == blits, "queued copies wait for the next renderer call");
+        renderer.wait_until_idle();
+        auto s = renderer.stats();
+        check(fake::blits == blits + 1 && fake::blit_targets.size() == 2 && fake::blit_targets[0] != fake::blit_targets[1] &&
+              s.texture_copies == 2 && s.merged_copies == 1, "two blit copies of one rectangle are one blit into both targets");
+        blits = fake::blits;
+        renderer.copy_texture_resident(copy(7, 0), bytes.data(), 512, 0x8000);
+        renderer.copy_texture_resident(copy(8, 0), bytes.data() + 512, 512, 0x8200);
+        renderer.wait_until_idle();
+        const auto a8 = fake::swizzles[fake::blit_targets.at(0)], r8 = fake::swizzles[fake::blit_targets.at(1)];
+        check(fake::blits == blits + 1 && a8 == std::array<GLint, 4>{GL_ONE, GL_ONE, GL_ONE, GL_ONE} &&
+              r8 == std::array<GLint, 4>{GL_RED, GL_RED, GL_RED, GL_RED}, "each merged target samples its own copy's channels");
+        renderer.copy_texture_resident(copy(6, 0), bytes.data(), 512, 0x8000);
+        renderer.copy_texture_resident(copy(4, 0), bytes.data() + 512, 512, 0x8200);
+        const auto before = fake::draws;
+        renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+        check(fake::blits == blits + 2 && fake::draws_at_blit == before && fake::draws > before,
+              "a draw after queued copies renders them first");
+        blits = fake::blits;
+        renderer.copy_texture_resident(copy(6, 0), bytes.data(), 512, 0x8000);
+        renderer.wait_until_idle();
+        renderer.copy_texture_resident(copy(4, 0), bytes.data() + 512, 512, 0x8200);
+        renderer.wait_until_idle();
+        check(fake::blits == blits + 2 && fake::blit_targets.size() == 1 && renderer.stats().merged_copies == 3,
+              "a renderer call between copies keeps them apart");
+        blits = fake::blits;
+        renderer.copy_texture_resident(copy(6, 0), bytes.data(), 512, 0x8000);
+        renderer.copy_texture_resident(copy(6, 16), bytes.data() + 512, 512, 0x8200);
+        renderer.copy_texture_resident(copy(6, 16), bytes.data() + 1024, 512, 0x8400);
+        renderer.copy_texture_resident(copy(6, 16), bytes.data() + 1024, 512, 0x8400);
+        renderer.wait_until_idle();
+        check(fake::blits == blits + 3 && renderer.stats().merged_copies == 4,
+              "copies of another rectangle, or over a queued copy's memory, start a new pass");
+        blits = fake::blits;
+        const auto clears = fake::clears;
+        TextureCopy cleared = copy(6, 0);
+        EfbClear clear; clear.rectangle = {0, 456 - 8, 16, 8}; clear.color_write = true; cleared.clear = clear;
+        renderer.copy_texture_resident(copy(6, 0), bytes.data(), 512, 0x8000);
+        renderer.copy_texture_resident(cleared, bytes.data() + 512, 512, 0x8200);
+        check(fake::blits == blits + 1 && fake::blit_targets.size() == 2, "a copy that clears renders at once, with the copies before it");
+        renderer.copy_texture_resident(copy(6, 0), bytes.data() + 1024, 512, 0x8400);
+        renderer.wait_until_idle();
+        check(fake::blits == blits + 2 && fake::blit_targets.size() == 1 && fake::clears > clears,
+              "and the copy after its clear reads the cleared EFB in a pass of its own");
+        renderer.copy_texture_resident(copy(6, 0), bytes.data(), 512, 0x8000);
+        renderer.copy_texture_resident(copy(6, 0), bytes.data() + 512, 512, 0x8200);
+        renderer.copy_texture_resident(copy(6, 0), bytes.data() + 1024, 512, 0x8400);
+        renderer.copy_texture_resident(copy(6, 0), bytes.data() + 1536, 512, 0x8600);
+        renderer.copy_texture_resident(copy(6, 0), bytes.data() + 2048, 512, 0x8800);
+        renderer.wait_until_idle();
+        check(fake::blit_targets.size() == 1 && renderer.stats().merged_copies == 5 + 3, "at most four targets share a pass");
+    }
+    {
+        GlesRenderer renderer; Fixture f;
+        renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+        const auto sources = fake::shader_sources.size();
+        renderer.copy_texture_resident(copy(6, 0), bytes.data(), 512, 0x8000);
+        renderer.copy_texture_resident(copy(6, 0), bytes.data() + 512, 512, 0x8200);
+        const auto draws = fake::draws;
+        renderer.wait_until_idle();
+        check(fake::draws == draws + 1 && fake::array_targets.size() == 2 && fake::array_targets[0] != fake::array_targets[1] &&
+              renderer.stats().merged_copies == 1, "two identical program copies are one draw into both targets");
+        bool outputs = false;
+        for (auto i = sources; i < fake::shader_sources.size(); ++i)
+            outputs = outputs || fake::shader_sources[i].find("layout(location=1) out vec4 color1;") != std::string::npos;
+        check(outputs, "the merged copy program writes a second output");
+        renderer.copy_texture_resident(copy(6, 0), bytes.data(), 512, 0x8000);
+        renderer.copy_texture_resident(copy(4, 0), bytes.data() + 512, 512, 0x8200);
+        renderer.wait_until_idle();
+        check(fake::draws == draws + 3 && fake::array_targets.size() == 1, "program copies of other formats render apart");
+    }
+}
 void copy_clear_invalidation() {
     GlesRenderer renderer; Fixture f;
     renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
@@ -2266,6 +2355,7 @@ int main() {
         direct_source_geometry();
     format_after_depth_copy();
     copy_clear_invalidation();
+    merged_copies();
         direct_batched_draws();
         direct_batched_normals();
         direct_batch_merging();

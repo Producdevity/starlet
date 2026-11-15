@@ -590,6 +590,7 @@ struct GlesRenderer::Impl {
         if (copy_rgb_taps_program) glDeleteProgram(copy_rgb_taps_program);
         if (present_rgb_program) glDeleteProgram(present_rgb_program);
         if (copy_framebuffer) glDeleteFramebuffers(1,&copy_framebuffer);
+        if (merge_framebuffer) glDeleteFramebuffers(1, &merge_framebuffer);
         if (copy_texture) glDeleteTextures(1,&copy_texture);
         for (auto frame : frames) glDeleteSync(frame);
         for (const auto& p : programs) glDeleteProgram(p.name);
@@ -621,7 +622,7 @@ struct GlesRenderer::Impl {
         direct = std::make_unique<GlesDirect>(limits.direct, fetch, GlesDirect::Target{framebuffer, color_framebuffer, [&g](bool rgba6) {
             if (rgba6 == g.rgba6) return false;
             g.reinterpret_format(rgba6); return true;
-        }, [&g](const GlesResidentCopy& copy) { g.execute([&g, &copy] { g.materialize(copy); }, true); },
+        }, [&g](const GlesResidentCopy& copy) { g.flush_copies(); g.execute([&g, &copy] { g.materialize(copy); }, true); },
         [&g](std::function<void()> op, bool wait) { g.execute(std::move(op), wait); }, strip_framebuffer});
         shared_direct.store(direct.get(), std::memory_order_release);
     }
@@ -635,6 +636,7 @@ struct GlesRenderer::Impl {
     void require_ready() {
         check_owner();
         if (failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
+        flush_copies();
         flush_direct();
     }
     void submit(const DrawPacket&,const GlesDrawPipeline&,const std::vector<GpuVertex>&,
@@ -1119,35 +1121,86 @@ void main(){
         glInvalidateFramebuffer(GL_FRAMEBUFFER, count, attachments);
         ++stats.invalidations;
     }
-    void resident_pass(const TextureCopy& p, GlesDirect::ResidentTarget target) {
+    // Fast copies other than luminance are blits: the EFB colour already holds the texel the
+    // copy decodes to, and the target's swizzle selects the copied channel (one where the copy
+    // format or EFB has none).
+    bool blit_copy(const TextureCopy& p) const { return fast_copy(p) && !(p.format == 1 && p.luminance); }
+    // What a resident copy program computes, but for its outputs.
+    std::uint32_t copy_mode(const TextureCopy& p) const {
+        return std::uint32_t(p.format) | (std::uint32_t(p.half_scale) << 8) | (std::uint32_t(p.rgba6) << 9) |
+               (std::uint32_t(p.luminance) << 10) | (std::uint32_t(p.depth) << 11) | (std::uint32_t(fast_copy(p)) << 12) |
+               (std::uint32_t(p.filtered()) << 13);
+    }
+    // Resident copies queued while nothing else has reached the renderer: the EFB they read is
+    // the same. Copies whose pass differs only in its target render in one pass (flush_copies).
+    struct PendingCopy {
+        TextureCopy plan;
+        GlesDirect::ResidentTarget target;
+        std::uint64_t token, bytes;
+    };
+    std::vector<PendingCopy> pending_copies;
+    static constexpr std::size_t merged_targets = 4;  // GLES 3 guarantees four colour attachments
+    GLuint merge_framebuffer = 0;
+    // Whether copy p, about to be queued, renders in the same pass as the queued copies: the same
+    // EFB rectangle, scale and format state, and the same blit, or the same program and uniforms.
+    bool merges(const TextureCopy& p, std::uint64_t token, std::uint64_t bytes) const {
+        if (pending_copies.empty() || pending_copies.size() == merged_targets) return false;
+        const auto& q = pending_copies.front().plan;
+        if (q.x != p.x || q.y != p.y || q.width != p.width || q.height != p.height || q.half_scale != p.half_scale ||
+            q.strip != p.strip || q.rgba6 != p.rgba6 || q.efb != p.efb || blit_copy(q) != blit_copy(p))
+            return false;
+        if (!blit_copy(p) && (copy_mode(q) != copy_mode(p) || (p.filtered() && (q.filter != p.filter || q.clamp_top != p.clamp_top ||
+                                                                                  q.clamp_bottom != p.clamp_bottom))))
+            return false;
+        // A copy over a queued one's memory replaces or shadows it: the queued one renders first.
+        for (const auto& c : pending_copies)
+            if (token < c.token + c.bytes && c.token < token + bytes) return false;
+        return true;
+    }
+    // Attaches the targets to the merge framebuffer, which is left bound.
+    void attach_merged(const GlesDirect::ResidentTarget* targets, unsigned count) {
+        if (!merge_framebuffer) glGenFramebuffers(1, &merge_framebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, merge_framebuffer);
+        GLenum buffers[merged_targets];
+        for (unsigned i = 0; i < count; ++i) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, targets[i].texture, 0);
+            buffers[i] = GL_COLOR_ATTACHMENT0 + i;
+        }
+        glDrawBuffers(GLsizei(count), buffers);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            throw std::runtime_error("merged texture-copy framebuffer is incomplete");
+    }
+    // Detaches them, so retired targets are not kept alive.
+    void detach_merged(unsigned count) {
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, merge_framebuffer);
+        for (unsigned i = 0; i < count; ++i) glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, 0, 0);
+    }
+    // Renders copy plans[0] into the targets of count copies in one pass: a blit writes every
+    // draw buffer (each target's swizzle follows its own copy's format), and a copy program
+    // writes the same value to each of its outputs.
+    void resident_pass(const TextureCopy* plans, const GlesDirect::ResidentTarget* targets, unsigned count) {
+        const TextureCopy& p = plans[0];
         const bool fast = fast_copy(p);
-        // Fast copies other than luminance are blits: the EFB colour already holds the
-        // texel the copy decodes to, and the target's swizzle selects the copied channel
-        // (one where the copy format or EFB has none).
-        if (p.strip && !(fast && !(p.format == 1 && p.luminance)))
+        if (p.strip && !blit_copy(p))
             throw std::runtime_error("EFB copies below the displayed frame need the fast blit");
-        if (fast && !(p.format == 1 && p.luminance)) {
+        if (count > 1) attach_merged(targets, count);
+        const GLuint destination = count > 1 ? merge_framebuffer : targets[0].framebuffer;
+        if (blit_copy(p)) {
             fullscreen_state();
             const int top = p.strip ? EfbLayout::rows : efb_height;
             glBindFramebuffer(GL_READ_FRAMEBUFFER, p.strip ? strip_framebuffer : color_framebuffer ? color_framebuffer : framebuffer);
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target.framebuffer);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, destination);
             glBlitFramebuffer(p.x, top - p.y - p.height, p.x + p.width, top - p.y,
                               0, p.destination_height(), p.destination_width(), 0, GL_COLOR_BUFFER_BIT,
                               p.half_scale ? GL_LINEAR : GL_NEAREST);
-            const GLint alpha = p.rgba6 ? GL_ALPHA : GL_ONE;
-            GLint swizzle[4] = {GL_RED, GL_GREEN, GL_BLUE, p.format == 4 ? GL_ONE : alpha};
-            if (p.format == 7) std::fill(swizzle, swizzle + 4, alpha);
-            else if (p.format == 1 || p.format >= 8) std::fill(swizzle, swizzle + 4, p.format == 9 ? GL_GREEN : p.format == 10 ? GL_BLUE : GL_RED);
-            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, target.texture);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, swizzle[0]); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, swizzle[1]);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, swizzle[2]); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, swizzle[3]);
+            if (count > 1) detach_merged(count);
+            glActiveTexture(GL_TEXTURE0);
+            for (unsigned i = 0; i < count; ++i) set_copy_swizzle(plans[i], targets[i].texture);
             glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
             gl_check("resident EFB texture blit");
             return;
         }
-        const std::uint32_t mode = std::uint32_t(p.format) | (std::uint32_t(p.half_scale) << 8) | (std::uint32_t(p.rgba6) << 9) |
-                                   (std::uint32_t(p.luminance) << 10) | (std::uint32_t(p.depth) << 11) | (std::uint32_t(fast) << 12) |
-                                   (std::uint32_t(p.filtered()) << 13);
+        const std::uint32_t mode = copy_mode(p) | (std::uint32_t(count - 1) << 14);
         auto found = std::find_if(resident_programs.begin(), resident_programs.end(), [&](const auto& r) { return r.mode == mode; });
         if (found == resident_programs.end()) {
             GlesDrawPipeline pipeline;
@@ -1200,6 +1253,7 @@ void main(){
  else d=ivec4(c.rgb,alpha);
  color=vec4(d)/255.0;
 })GLSL";
+            if (count > 1) pipeline.fragment = with_outputs(pipeline.fragment, count);
             ResidentProgram created;
             created.mode = mode;
             created.name = link_efb_program(pipeline);
@@ -1213,14 +1267,16 @@ void main(){
             found = std::prev(resident_programs.end());
         }
         fullscreen_state();
-        glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, destination);
         glViewport(0, 0, p.destination_width(), p.destination_height());
         glBindVertexArray(vao);
         glUseProgram(found->name);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, target.texture); // Targets are reused across formats.
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_BLUE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
+        for (unsigned i = 0; i < count; ++i) { // Targets are reused across formats.
+            glBindTexture(GL_TEXTURE_2D, targets[i].texture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_BLUE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
+        }
         glBindTexture(GL_TEXTURE_2D, p.depth ? depth : color);
         if (fast) {
             glBindSampler(0, copy_sampler(p.half_scale));
@@ -1236,7 +1292,56 @@ void main(){
         }
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glBindSampler(0, 0);
+        if (count > 1) detach_merged(count);
         gl_check("resident EFB texture copy");
+    }
+    // A blit copy's target swizzle (bound to unit 0).
+    void set_copy_swizzle(const TextureCopy& p, GLuint texture) {
+        const GLint alpha = p.rgba6 ? GL_ALPHA : GL_ONE;
+        GLint swizzle[4] = {GL_RED, GL_GREEN, GL_BLUE, p.format == 4 ? GL_ONE : alpha};
+        if (p.format == 7) std::fill(swizzle, swizzle + 4, alpha);
+        else if (p.format == 1 || p.format >= 8) std::fill(swizzle, swizzle + 4, p.format == 9 ? GL_GREEN : p.format == 10 ? GL_BLUE : GL_RED);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, swizzle[0]); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, swizzle[1]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, swizzle[2]); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, swizzle[3]);
+    }
+    // A copy program that also writes its value to outputs 1 to count - 1.
+    static std::string with_outputs(std::string fragment, unsigned count) {
+        const std::string output = "layout(location=0) out vec4 color;\n";
+        const auto declared = fragment.find(output);
+        const auto end = fragment.rfind('}');
+        if (declared == std::string::npos || end == std::string::npos || end < declared)
+            throw std::logic_error("texture-copy program without its output");
+        std::string declarations, copies;
+        for (unsigned i = 1; i < count; ++i) {
+            declarations += "layout(location=" + std::to_string(i) + ") out vec4 color" + std::to_string(i) + ";\n";
+            copies += " color" + std::to_string(i) + "=color;\n";
+        }
+        fragment.insert(end, copies);
+        fragment.insert(declared + output.size(), declarations);
+        return fragment;
+    }
+    // GL thread: renders the queued copies, one pass for all, then the last one's clear.
+    void render_copies(const std::vector<PendingCopy>& copies) {
+        const auto& p = copies.front().plan, &last = copies.back().plan;
+        if (!p.depth) reinterpret_format(p.rgba6);
+        if (last.clear) invalidate_cleared(last);
+        TextureCopy plans[merged_targets];
+        GlesDirect::ResidentTarget targets[merged_targets];
+        for (std::size_t i = 0; i < copies.size(); ++i) plans[i] = copies[i].plan, targets[i] = copies[i].target;
+        resident_pass(plans, targets, unsigned(copies.size()));
+        if (last.clear) clear_efb_gl(*last.clear);
+        stats.texture_copies += copies.size();
+        stats.merged_copies += copies.size() - 1;
+    }
+    // Owner thread: hands the queued copies to the GL thread.
+    void flush_copies() {
+        if (pending_copies.empty()) return;
+        auto& g = *this;
+        g.execute([&g, copies = std::move(pending_copies)] {
+            try { g.render_copies(copies); } catch (...) { g.failed = true; throw; }
+        }, false);
+        pending_copies.clear();
     }
     // Newer copies own the covered ranges: their bytes stay.
     static void store_uncovered(const GlesResidentCopy& c, const std::vector<std::uint8_t>& pixels) {
@@ -1577,6 +1682,7 @@ void GlesRenderer::draw_direct(const State& state, const Draw& command, MemoryRe
     auto& g = *impl_; g.check_owner();
     ++g.efb_writes;
     if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
+    g.flush_copies();
     if (state.efb() != g.limits.efb) throw std::invalid_argument("GX state uses another EFB layout");
     g.ensure_direct();
     g.direct->draw(state, command, memory, cmpr);
@@ -1870,7 +1976,8 @@ void GlesRenderer::copy_texture(const TextureCopy& p, std::uint8_t* destination,
 }
 void GlesRenderer::copy_texture_resident(const TextureCopy& p, std::uint8_t* destination, std::size_t capacity, std::uint32_t token) {
     ++impl_->efb_writes;
-    auto& g = *impl_; g.require_ready();
+    auto& g = *impl_; g.check_owner();
+    if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
     if (!g.direct) { copy_texture(p, destination, capacity); return; }
     if (p.efb != g.limits.efb) throw std::invalid_argument("texture copy planned for another EFB layout");
     const auto required = texture_copy_bytes(p);
@@ -1882,34 +1989,31 @@ void GlesRenderer::copy_texture_resident(const TextureCopy& p, std::uint8_t* des
         p.clear->rectangle.width != p.width || p.clear->rectangle.height != p.height))
         throw std::invalid_argument("invalid texture-copy clear operation");
     try {
+        if (!g.merges(p, token, required)) g.flush_copies();
+        g.flush_direct();
         const auto target = g.direct->resident_copy(p, token, destination, capacity);
         g.direct->flush();
-        g.execute([&g, p, target] {
-            try {
-                if (!p.depth) g.reinterpret_format(p.rgba6);
-                if (p.clear) g.invalidate_cleared(p);
-                g.resident_pass(p, target);
-                if (p.clear) g.clear_efb_gl(*p.clear);
-                ++g.stats.texture_copies;
-            } catch (...) { g.failed = true; throw; }
-        }, false);
+        g.pending_copies.push_back({p, target, token, required});
+        // The clear changes what a later copy would read.
+        if (p.clear) g.flush_copies();
     } catch (...) { g.failed = true; throw; }
 }
 void GlesRenderer::release_resident(std::uint32_t token, std::size_t bytes) {
     auto& g = *impl_; g.check_owner();
+    g.flush_copies();
     if (g.direct) g.direct->release(token, bytes);
 }
 void GlesRenderer::before_dma_read(const void* data, std::size_t bytes) {
     auto& g = *impl_; g.check_owner();
     if (!g.direct) return;
     if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
-    try { g.direct->before_read(data, bytes); } catch (...) { g.failed = true; throw; }
+    try { g.flush_copies(); g.direct->before_read(data, bytes); } catch (...) { g.failed = true; throw; }
 }
 void GlesRenderer::before_dma_write(const void* data, std::size_t bytes) {
     auto& g = *impl_; g.check_owner();
     if (!g.direct) return;
     if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
-    try { g.direct->before_write(data, bytes); } catch (...) { g.failed = true; throw; }
+    try { g.flush_copies(); g.direct->before_write(data, bytes); } catch (...) { g.failed = true; throw; }
 }
 bool GlesRenderer::resident_in(const void* data, std::size_t bytes) const {
     const auto* direct = impl_->shared_direct.load(std::memory_order_acquire);
@@ -2222,6 +2326,7 @@ void GlesRenderer::stop_submission() {
     auto& g = *impl_;
     auto& q = g.submission;
     if (!q.running) return;
+    g.flush_copies();
     if (g.direct) g.direct->flush();
     if (q.post) {
         std::unique_lock<std::mutex> lock(q.mutex);

@@ -54,14 +54,14 @@ std::vector<std::uint8_t> GlesBackend::readback() { return renderer_.readback();
 
 void GlesBackend::print_stats(const GpuCounters& gpu) {
     const auto s = renderer_.stats();
-    std::printf("gpu: %u retraces, presented=%d xfb=%p known=%d, draws %llu, display copies %llu, texture copies %llu, "
+    std::printf("gpu: %u retraces, presented=%d xfb=%p known=%d, draws %llu, display copies %llu, texture copies %llu (merged %llu), "
                 "presentations %llu, programs %llu, decoded %llu bytes; direct draws %llu zero-area %llu culled %llu unready %llu "
                 "submissions %llu batched %llu instanced %llu skipped %u; program waits %llu/%llu/%llu/%llu/%llu "
                 "(33/67/133/267 ms/longer) max %llu ms, GL-thread links %llu max %llu ms; resident copies %llu hits %llu "
                 "crops %llu materialized %llu overwritten by DMA %llu settled DMA %llu; batched with zero alpha %llu, vertex fog %llu; uniform blocks %llu shared %llu bytes %llu; "
                 "peeks %llu live %llu waited %llu snapshots refused %llu region misses %llu late %llu; stream reused %llu updated %llu verified %llu; state hits %llu misses %llu; state reused %llu raster hits %llu texture plan hits %llu; state snapshots %llu/%llu bytes %llu; program hits %llu misses %llu; vertex bytes %llu\n",
                 gpu.retraces, gpu.presented, gpu.frame_buffer, gpu.known_frame_buffer, (unsigned long long)s.draws,
-                (unsigned long long)s.display_copies, (unsigned long long)s.texture_copies,
+                (unsigned long long)s.display_copies, (unsigned long long)s.texture_copies, (unsigned long long)s.merged_copies,
                 (unsigned long long)s.presentations, (unsigned long long)s.shader_compiles,
                 (unsigned long long)gpu.decoded_bytes, (unsigned long long)s.direct.draws,
                 (unsigned long long)s.direct.zero_area, (unsigned long long)s.direct.culled_draws,

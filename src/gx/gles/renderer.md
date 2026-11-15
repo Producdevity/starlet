@@ -140,6 +140,16 @@ Draw-sync snapshots (`snapshot_efb`) keep `GlesDirectLimits::snapshot_scale`;
 `peek_depth` and `peek_color` at that point. A slot reused at the other
 resolution is made anew.
 
+Resident texture copies wait for the next renderer call. Copies with no other
+call between them read the same EFB, and those whose pass differs only in its
+target (the same rectangle, scale and EFB format, and the same blit, or the
+same copy program and uniforms) render in one pass: one blit into up to four
+targets' draw buffers, or one draw of a program that writes its value to up to
+four outputs. Each pass costs on Mali-G31 r20 whether it is large or small. A
+copy that clears renders at once, after the copies queued before it, so the
+copy after it reads the cleared EFB. `GlesStats::merged_copies` counts copies
+that shared a pass.
+
 A resident texture copy whose clear covers the whole EFB and rewrites an attachment the
 copy does not read (depth for colour copies; colour, alpha included, for depth copies)
 invalidates that attachment first, so the pass the copy ends does not write it back.

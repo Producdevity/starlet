@@ -34,6 +34,8 @@ struct GlesStats {
     std::uint64_t peeks = 0, live_peeks = 0, peek_waits = 0, refused_snapshots = 0, region_misses = 0;
     // EFB attachments invalidated before a copy whose clear rewrites them (see renderer.md).
     std::uint64_t invalidations = 0;
+    // Resident texture copies rendered in the pass of the copy before them (see renderer.md).
+    std::uint64_t merged_copies = 0;
     TextureCacheStats capture_cache;
     VertexCacheStats geometry_cache;
     GlesDirectStats direct;
@@ -125,7 +127,8 @@ public:
     // With the direct path active, copies stay GPU-resident (gles_direct.hpp),
     // display copies are presented from the GPU without writing XFB memory, and
     // wait_until_idle only submits pending draws: no CPU-visible GX result is
-    // pending, and presentation waits for the previous frame.
+    // pending, and presentation waits for the previous frame. Consecutive resident copies that
+    // differ only in their target render in one pass (renderer.md).
     void copy_texture_resident(const TextureCopy&, std::uint8_t*, std::size_t, std::uint32_t token) override;
     void release_resident(std::uint32_t token, std::size_t bytes) override;
     // Direct path, for host transfers on the game's behalf (DMA engines, card and disc

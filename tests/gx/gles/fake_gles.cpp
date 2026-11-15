@@ -83,6 +83,22 @@ const char* renderer_name = "private dispatch fixture";
 // Shader sources in compile order; depth state as last set.
 std::vector<std::string> shader_sources;
 std::vector<GLenum> invalidated;
+// Colour attachments by framebuffer and attachment, each framebuffer's draw buffers, the textures
+// the last blit and the last glDrawArrays wrote (their draw framebuffer's draw buffers), and the
+// draw count at the last blit.
+std::map<std::pair<GLuint, GLenum>, GLuint> attached;
+std::map<GLuint, std::vector<GLenum>> draw_buffers;
+std::vector<GLuint> blit_targets, array_targets;
+// Each texture's swizzle as last set.
+std::map<GLuint, std::array<GLint, 4>> swizzles;
+unsigned draws_at_blit = 0;
+std::vector<GLuint> written_targets() {
+    const auto found = draw_buffers.find(framebuffer);
+    const std::vector<GLenum> buffers = found == draw_buffers.end() ? std::vector<GLenum>{GL_COLOR_ATTACHMENT0} : found->second;
+    std::vector<GLuint> textures;
+    for (auto b : buffers) textures.push_back(attached[{framebuffer, b}]);
+    return textures;
+}
 // Fences in creation order, and the fences glClientWaitSync waited for.
 std::vector<GLsync> fences, waited_fences;
 GLenum depth_func = GL_LESS;
@@ -180,7 +196,12 @@ void glCullFace(GLenum) {}
 void glBlendFuncSeparate(GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha) {}
 void glBlendFunc(GLenum sfactor, GLenum dfactor) {}
 void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1,
-                       GLint dstY1, GLbitfield mask, GLenum filter) { ++fake::blits; }
+                       GLint dstY1, GLbitfield mask, GLenum filter) {
+    ++fake::blits;
+    fake::blit_targets = fake::written_targets();
+    fake::draws_at_blit = fake::draws;
+}
+void glDrawBuffers(GLsizei n, const GLenum* buffers) { fake::draw_buffers[fake::framebuffer].assign(buffers, buffers + n); }
 void glBufferSubData(GLenum, GLintptr, GLsizeiptr, const void*) {}
 void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
     if (target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER) {
@@ -260,7 +281,11 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices
     fake::draw_texture = fake::bound[3];
     fake::sampler_seen = fake::samplers[3];
 }
-void glDrawArrays(GLenum, GLint, GLsizei) { ++fake::draws; fake::array_framebuffer = fake::framebuffer; }
+void glDrawArrays(GLenum, GLint, GLsizei) {
+    ++fake::draws;
+    fake::array_framebuffer = fake::framebuffer;
+    fake::array_targets = fake::written_targets();
+}
 void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices) { glDrawElements(mode, count, type, indices); }
 void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices, GLint) { glDrawElements(mode, count, type, indices); }
 void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instances, GLint) {
@@ -274,6 +299,7 @@ GLsync glFenceSync(GLenum condition, GLbitfield flags) {
 }
 void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {}
 void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
+    fake::attached[{fake::framebuffer, attachment}] = texture;
     if (attachment == GL_COLOR_ATTACHMENT0) fake::color_attachments[fake::framebuffer] = texture;
     if (attachment == GL_DEPTH_ATTACHMENT) fake::depth_attachments[fake::framebuffer] = texture;
 }
@@ -424,7 +450,9 @@ void glTexSubImage2D(GLenum target, GLint, GLint, GLint, GLsizei width, GLsizei 
     if(!fake::unpack_seen&&!fake::unpack_buffer)fake::first[fake::bound[fake::active]]=static_cast<const unsigned char*>(pixels)[0];
 }
 void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {}
-void glTexParameteri(GLenum target, GLenum pname, GLint param) {}
+void glTexParameteri(GLenum target, GLenum pname, GLint param) {
+    if (pname >= GL_TEXTURE_SWIZZLE_R && pname <= GL_TEXTURE_SWIZZLE_A) fake::swizzles[fake::bound[fake::active]][pname - GL_TEXTURE_SWIZZLE_R] = param;
+}
 void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height) {}
 void glUniform1i(GLint location, GLint v0) { fake::last_int = v0; }
 void glUniform2f(GLint location, GLfloat v0, GLfloat v1) { uniform(location,{v0,v1,0,0}); }
