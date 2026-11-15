@@ -43,6 +43,18 @@ std::vector<std::uint8_t> filter_texture_copy(const TextureCopy&, ByteView rows,
 // GX texture format code the copy is sampled as: I8 (1) for one-byte outputs,
 // otherwise RGB565 (4), RGB5A3 (5) or RGBA8 (6).
 unsigned texture_copy_sample_format(const TextureCopy&);
+struct TextureDescriptor;
+// Whether a lookup of d at the copy's own address can be built without reading the copy back: an
+// I8 texture of the copy's width and tile stride that is taller than the copy, whose top rows are
+// the copy and whose remaining rows are whatever memory holds after the copy's bytes. The sample
+// format must be I8 and every channel of the copy's texels must carry the one intensity (copy
+// formats I8, R8, G8, B8), so decoded memory rows can be uploaded beside it.
+bool texture_copy_extends(const TextureCopy&, const TextureDescriptor& d, unsigned levels);
+// The RGBA8 texels (top row first, d.width wide) of the lookup's rows below the copy, decoded from
+// the memory after the copy's texture_copy_bytes: tail holds those rows' tiled I8 bytes.
+std::vector<std::uint8_t> decode_texture_copy_tail(const TextureCopy&, const TextureDescriptor& d, ByteView tail);
+// Bytes of tail that decode_texture_copy_tail reads.
+std::size_t texture_copy_tail_bytes(const TextureCopy&, const TextureDescriptor& d);
 // RGBA8 texels the sampled format decodes from encode_texture_copy's bytes, top row
 // first, at destination dimensions. Same input as encode_texture_copy.
 std::vector<std::uint8_t> decode_texture_copy(const TextureCopy&, ByteView rgba);

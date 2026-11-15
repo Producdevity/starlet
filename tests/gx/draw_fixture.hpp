@@ -19,8 +19,8 @@ struct Memory : MemoryReader {
     bool fail = false;
     bool copy(std::uint32_t address, std::uint8_t* output, std::size_t size) override {
         ++reads;
-        if (fail || address != 0x8000 || size > bytes.size()) return false;
-        std::copy_n(bytes.data(), size, output); return true;
+        if (fail || address < 0x8000 || address - 0x8000 > bytes.size() || size > bytes.size() - (address - 0x8000)) return false;
+        std::copy_n(bytes.data() + (address - 0x8000), size, output); return true;
     }
 };
 struct Sink : CommandSink {

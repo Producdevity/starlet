@@ -1,4 +1,5 @@
 #include "starlet/gx/texture_copy.hpp"
+#include "starlet/gx/texture.hpp"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -143,6 +144,27 @@ void encode_texture_copy(const TextureCopy& p, ByteView rgba, std::uint8_t* dest
 }
 unsigned texture_copy_sample_format(const TextureCopy& p) {
     return p.format == 4 || p.format == 5 || p.format == 6 ? p.format : two_channel(p.format) ? 3 : 1;
+}
+bool texture_copy_extends(const TextureCopy& p, const TextureDescriptor& d, unsigned levels) {
+    const unsigned format = p.format;
+    if (levels != 1 || d.format != TextureFormat::i8 || !(format == 1 || (format >= 8 && format <= 10)) || p.depth) return false;
+    const int width = p.destination_width(), height = p.destination_height();
+    return d.width == width && (width & 7) == 0 && d.height > height && (d.height & 3) == 0 && (height & 3) == 0 &&
+           p.stride == std::size_t(width / 8) * 32;
+}
+std::size_t texture_copy_tail_bytes(const TextureCopy& p, const TextureDescriptor& d) {
+    return std::size_t(d.height - p.destination_height()) / 4 * p.stride;
+}
+std::vector<std::uint8_t> decode_texture_copy_tail(const TextureCopy& p, const TextureDescriptor& d, ByteView tail) {
+    if (!texture_copy_extends(p, d, 1) || !tail.data || tail.size != texture_copy_tail_bytes(p, d))
+        throw std::invalid_argument("invalid texture-copy tail");
+    const unsigned rows = d.height - p.destination_height();
+    std::vector<std::uint8_t> out(std::size_t(d.width) * rows * 4);
+    for (unsigned y = 0; y < rows; ++y) for (unsigned x = 0; x < d.width; ++x) {
+        const auto intensity = tail.data[std::size_t(y / 4) * p.stride + std::size_t(x / 8) * 32 + (y & 3) * 8 + (x & 7)];
+        std::fill_n(&out[(std::size_t(y) * d.width + x) * 4], 4, intensity);
+    }
+    return out;
 }
 namespace {
 unsigned expand(unsigned value, unsigned bits) { return bits == 4 ? value * 17 : bits == 5 ? (value << 3) | (value >> 2) : (value << 2) | (value >> 4); }

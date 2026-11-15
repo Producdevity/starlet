@@ -303,3 +303,14 @@ path halved Sunshine's frame rate, so it stays on `glReadPixels`.
 
 These are recording-thread budgets (textures, programs, geometry) of GL objects,
 excluding driver allocations.
+
+## Lookups of resident texture copies
+
+A texture lookup that overlaps a resident copy normally materializes it: a GPU readback with a
+fence wait, so the GPU thread waits for all queued GL work. Two lookups skip that and read the
+copy on the GPU: the top-left part of the copy (same address, format and tile stride), and an
+I8 lookup of the copy's width that is taller than the copy (Super Mario Sunshine's 512 x 512
+lookup of a 512 x 448 copy). The taller one is the copy's texels over the rows memory holds after
+the copy's bytes, decoded on the CPU as the materialize path would decode them
+(`decode_texture_copy_tail`). The tail is hashed on every lookup; a change rebuilds the texture.
+`STARLET_GX_SYNC_STATS=1` logs each other lookup that still materializes, once per case, with the reason.

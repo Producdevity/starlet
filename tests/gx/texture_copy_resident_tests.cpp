@@ -41,6 +41,59 @@ std::vector<std::uint8_t> sample(const TextureCopy& p, const std::vector<std::ui
     require(bool(captured), captured.message);
     return captured.snapshot->levels()[0].rgba;
 }
+// An I8 lookup taller than the copy it starts at: the copy's texels over the rows memory holds
+// after the copy, as the CPU path decodes them once the copy is written to memory.
+void copy_tail() {
+    std::mt19937 random(11);
+    unsigned cases = 0;
+    for (unsigned format : {1u, 8u, 9u, 10u}) for (bool rgba6 : {false, true}) for (unsigned extra : {4u, 8u, 24u}) {
+        TextureCopy p;
+        p.format = format; p.rgba6 = rgba6; p.luminance = format == 1;
+        p.width = 16; p.height = 8; p.stride = 64;
+        std::vector<std::uint8_t> rgba(std::size_t(p.width) * p.height * 4);
+        for (auto& v : rgba) v = static_cast<std::uint8_t>(random());
+        if (rgba6) for (auto& v : rgba) v = static_cast<std::uint8_t>((v & 0xfc) | (v >> 6));
+        const auto size = texture_copy_bytes(p);
+        TextureDescriptor d;
+        d.format = TextureFormat::i8; d.width = 16; d.height = std::uint16_t(8 + extra); d.address = 0x10000;
+        require(texture_copy_extends(p, d, 1) && !texture_copy_extends(p, d, 2), "the lookup extends the copy");
+        const auto tail_bytes = texture_copy_tail_bytes(p, d);
+        require(tail_bytes == extra / 4 * 64, "tail size");
+        std::vector<std::uint8_t> storage(size + tail_bytes + 63), memory_bytes(size + tail_bytes);
+        auto* encoded = aligned(storage);
+        encode_texture_copy(p, {rgba.data(), rgba.size()}, encoded, size);
+        std::copy(encoded, encoded + size, memory_bytes.begin());
+        for (std::size_t i = size; i < memory_bytes.size(); ++i) memory_bytes[i] = static_cast<std::uint8_t>(random());
+        // CPU path: the whole texture decoded from memory.
+        Memory memory; memory.bytes = memory_bytes; Sink sink; Decoder decoder(memory, sink);
+        auto bp = [&](unsigned reg, std::uint32_t value) { require(decoder.write_u8(0x61) && decoder.write_u32((reg << 24) | value), "bp"); };
+        bp(0x80, 0); bp(0x84, 0);
+        bp(0x88, unsigned(d.width - 1) | (unsigned(d.height - 1) << 10) | (1u << 20));
+        bp(0x94, 0x10000 >> 5);
+        const auto captured = capture_texture(decoder.state(), 0, memory);
+        require(bool(captured), captured.message);
+        // GPU plan: the copy's texels, then the decoded tail.
+        auto plan = decode_texture_copy(p, {rgba.data(), rgba.size()});
+        const auto tail = decode_texture_copy_tail(p, d, {memory_bytes.data() + size, tail_bytes});
+        plan.insert(plan.end(), tail.begin(), tail.end());
+        require(plan == captured.snapshot->levels()[0].rgba, "the GPU plan matches the CPU path, format " + std::to_string(format));
+        ++cases;
+    }
+    require(cases == 24, "tail case count");
+    TextureCopy p; p.format = 8; p.width = 16; p.height = 8; p.stride = 64;
+    TextureDescriptor d; d.format = TextureFormat::i8; d.width = 16; d.height = 16;
+    require(texture_copy_extends(p, d, 1), "baseline");
+    auto refused = [&](TextureCopy q, TextureDescriptor e, unsigned levels) { return !texture_copy_extends(q, e, levels); };
+    auto wide = d; wide.width = 24;
+    auto short_ = d; short_.height = 8;
+    auto other = d; other.format = TextureFormat::ia8;
+    auto uneven = d; uneven.height = 18;
+    auto stride = p; stride.stride = 96;
+    auto alpha = p; alpha.format = 7;
+    auto rgb = p; rgb.format = 4;
+    require(refused(p, wide, 1) && refused(p, short_, 1) && refused(p, other, 1) && refused(p, uneven, 1) && refused(stride, d, 1) &&
+            refused(alpha, d, 1) && refused(rgb, d, 1), "lookups that are not a plain extension are refused");
+}
 void formats() {
     std::mt19937 random(7);
     unsigned cases = 0;
@@ -131,7 +184,7 @@ void z16_layout() {
 }
 
 int main() {
-    try { formats(); z16_plan(); clipped_plan(); z16_layout(); }
+    try { formats(); copy_tail(); z16_plan(); clipped_plan(); z16_layout(); }
     catch (const std::exception& error) { std::cerr << "texture_copy_resident_tests: " << error.what() << '\n'; return 1; }
     std::cout << "resident texture-copy model matches encoder and sampler\n";
 }

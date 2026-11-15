@@ -738,6 +738,32 @@ void resident_copy_crops() {
     s=renderer.stats().direct;
     check(s.materialized==1 && s.resident_crops==2 && fake::read_pixels==reads+1,"a lookup with another stride still materializes");
 }
+// A lookup taller than the copy at its address (Sirena's 512x512 I8 over a 512x448 copy): the copy's
+// rows come from the GPU copy, the rows below from memory, and nothing is read back.
+void resident_copy_extension() {
+    GlesRenderer renderer; Fixture f; f.memory.bytes.resize(1024,0xa5);
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    TextureCopy p; p.width=16; p.height=8; p.format=8; p.stride=64;
+    alignas(32) std::array<std::uint8_t,128> bytes{};
+    const auto reads=fake::read_pixels, copies=fake::texture_copies, uploads=fake::uploads;
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    renderer.wait_until_idle();
+    const auto copy_framebuffer=fake::array_framebuffer;
+    f.bp(0x8b,15u|(15u<<10)|(1u<<20)); // I8 16x16
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    auto s=renderer.stats().direct;
+    check(s.resident_hits==1 && s.resident_crops==1 && s.materialized==0 && fake::read_pixels==reads &&
+          bytes==std::array<std::uint8_t,128>{},"a taller lookup of a resident copy neither materializes nor reads back");
+    check(fake::texture_copies==copies+1 && fake::copy_source==copy_framebuffer && fake::copy_rect==std::array<GLint,4>{0,0,16,8} &&
+          fake::uploads==uploads+1 && fake::draw_texture==fake::copy_texture,"the lookup samples the copy's rows on the GPU and uploads the memory rows below");
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    s=renderer.stats().direct;
+    check(s.resident_hits==2 && s.resident_crops==1 && fake::texture_copies==copies+1 && fake::uploads==uploads+1,"the texture is reused while the rows below stay as they were");
+    f.memory.bytes[128]^=0xff;
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    s=renderer.stats().direct;
+    check(s.resident_crops==2 && s.materialized==0 && fake::uploads==uploads+2,"a change to the rows below rebuilds the texture");
+}
 // A downsample chain into memory holding an earlier copy: each copy replaces the start
 // of the previous one, whose remaining bytes stay on the GPU until a lookup needs them.
 void resident_copy_chain() {
@@ -2348,7 +2374,7 @@ int main() {
         rejected_program_skips_draws();
         unready_program_policy();
         program_reuse_across_tev_colours();
-        resident_copies(); resident_copy_crops(); resident_copy_chain(); dma_over_resident_copies(); stamped_resident_copies();
+        resident_copies(); resident_copy_crops(); resident_copy_extension(); resident_copy_chain(); dma_over_resident_copies(); stamped_resident_copies();
         z_texture_clear();
         direct_geometry_cache();
         direct_instancing();

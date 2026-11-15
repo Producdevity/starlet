@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <set>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -553,7 +554,7 @@ struct GlesDirect::Impl {
     struct SpareTarget { int width, height; GLuint texture, framebuffer; std::uint64_t frame; };
     std::vector<SpareTarget> spare_targets;
     // GPU copies of a resident copy's top-left part, for lookups smaller than the copy.
-    struct Crop { std::uint32_t token; unsigned width, height; GLuint texture, framebuffer; };
+    struct Crop { std::uint32_t token; unsigned width, height; GLuint texture, framebuffer; std::uint64_t tail_hash = 0; };
     std::vector<Crop> crops;
     std::vector<std::uint8_t> vertices, scratch;
     UniformBytes uniforms;
@@ -1347,7 +1348,7 @@ struct GlesDirect::Impl {
             key.palette_hash = hash_bytes(scratch.data(), scratch.size());
         }
         if (d.format == TextureFormat::cmpr) key.model = cmpr;
-        if (!copies.empty() || !shadowed.empty()) if (const auto name = resident(d, key.levels)) return name;
+        if (!copies.empty() || !shadowed.empty()) if (const auto name = resident(d, key.levels, memory)) return name;
         const std::uint64_t fields[] = {key.address, key.image, key.levels, key.palette, key.palette_hash,
                                         static_cast<std::uint64_t>(key.model)};
         const auto key_hash = hash_bytes(reinterpret_cast<const std::uint8_t*>(fields), sizeof fields);
@@ -1431,7 +1432,33 @@ struct GlesDirect::Impl {
         materialize(it->second);
         copies.erase(it);
     }
-    GLuint resident(const TextureDescriptor& d, unsigned levels) {
+    // Diagnostic: once per distinct case, why a sampled texture could not use a resident copy.
+    void log_materialize_case(const TextureDescriptor& d, unsigned levels, const std::vector<std::map<std::uint32_t, GlesResidentCopy>::iterator>& found) {
+        static std::set<std::string> seen;
+        for (auto it : found) {
+            const auto& c = it->second;
+            const auto& p = c.plan;
+            const unsigned tile_width = d.format == TextureFormat::i8 ? 8 : 4, tile_bytes = d.format == TextureFormat::rgba8 ? 64 : 32;
+            std::string why;
+            if (found.size() != 1) why += "several-copies ";
+            if (it->first != d.address) why += "address ";
+            if (levels != 1) why += "mips ";
+            if (static_cast<unsigned>(d.format) != texture_copy_sample_format(p)) why += "format ";
+            if (d.width > p.destination_width() || d.height > p.destination_height()) why += "larger-than-copy ";
+            if (p.stride != std::size_t{(d.width + tile_width - 1u) / tile_width} * tile_bytes) why += "stride ";
+            if (!c.intact()) why += "not-intact ";
+            char text[512];
+            std::snprintf(text, sizeof text,
+                "materialize case: sample addr=0x%08x fmt=%u %ux%u levels=%u palfmt=%u tlut=0x%08x lod=[%u,%u] | copy token=0x%08x bytes=%zu "
+                "fmt=%u rect=(%d,%d %dx%d) half=%d out=%dx%d stride=%zu rgba6=%d depth=%d lum=%d filter=%d,%d,%d | why: %s",
+                unsigned(d.address), unsigned(d.format), unsigned(d.width), unsigned(d.height), levels, unsigned(d.palette_format),
+                unsigned(d.bp_words[6]), unsigned(d.sampler.min_lod_sixteenths), unsigned(d.sampler.max_lod_sixteenths), unsigned(it->first), c.bytes, p.format, p.x, p.y,
+                p.width, p.height, int(p.half_scale), p.destination_width(), p.destination_height(), p.stride, int(p.rgba6), int(p.depth),
+                int(p.luminance), p.filter[0], p.filter[1], p.filter[2], why.c_str());
+            if (seen.insert(text).second) std::fprintf(stderr, "%s\n", text);
+        }
+    }
+    GLuint resident(const TextureDescriptor& d, unsigned levels, MemoryReader& memory) {
         const auto bytes = texture_source_bytes(d, levels);
         auto found = overlapping(d.address, bytes);
         bool older = false;
@@ -1454,8 +1481,14 @@ struct GlesDirect::Impl {
                 if (d.width == width && d.height == height) return c.texture;
                 return crop(found[0]->first, c, d.width, d.height);
             }
+            if (found[0]->first == d.address && static_cast<unsigned>(d.format) == texture_copy_sample_format(p) &&
+                texture_copy_extends(p, d, levels) && c.intact()) {
+                ++stats.resident_hits;
+                return extend(found[0]->first, c, d, memory);
+            }
         }
         sync_stats::Context ctx("materialize: texture not a plain copy match");
+        if (sync_stats::enabled()) log_materialize_case(d, levels, found);
         for (auto it : found) materialize(it);
         textures_changed();
         publish();
@@ -1577,6 +1610,50 @@ struct GlesDirect::Impl {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
             glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, GLsizei(width), GLsizei(height));
             glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(read));
+        });
+        ++stats.resident_crops;
+        return t.texture;
+    }
+    // A lookup taller than the copy: the copy's rows on the GPU, then the rows memory holds after
+    // the copy's bytes, decoded here as the CPU path would after materializing (texture_copy.hpp).
+    // The tail is hashed on every lookup; a changed tail rebuilds the texture.
+    GLuint extend(std::uint32_t token, const GlesResidentCopy& c, const TextureDescriptor& d, MemoryReader& memory) {
+        const auto tail_offset = texture_copy_bytes(c.plan), tail_bytes = texture_copy_tail_bytes(c.plan, d);
+        ByteView view = memory.view(d.address + std::uint32_t(tail_offset), tail_bytes);
+        if (!view.data || view.size != tail_bytes) {
+            scratch.resize(tail_bytes);
+            if (!memory.copy(d.address + std::uint32_t(tail_offset), scratch.data(), tail_bytes)) throw std::runtime_error("GX texture source read failed");
+            view = {scratch.data(), scratch.size()};
+        }
+        const auto hash = hash_bytes(view.data, view.size);
+        for (auto it = crops.begin(); it != crops.end(); ++it) {
+            if (it->token != token || it->width != d.width || it->height != d.height) continue;
+            if (it->tail_hash == hash) return it->texture;
+            retire_target(int(it->width), int(it->height), it->texture, it->framebuffer);
+            crops.erase(it);
+            break;
+        }
+        const auto t = target_of(int(d.width), int(d.height));
+        crops.push_back({token, d.width, d.height, t.texture, t.framebuffer, hash});
+        auto rows = std::make_shared<std::vector<std::uint8_t>>(decode_texture_copy_tail(c.plan, d, view));
+        const unsigned first = unsigned(c.plan.destination_height()), width = d.width;
+        pending.push_back([source = GLuint(c.framebuffer), from = GLuint(c.texture), texture = t.texture, width, first, rows] {
+            static constexpr GLenum channels[] = {GL_TEXTURE_SWIZZLE_R, GL_TEXTURE_SWIZZLE_G, GL_TEXTURE_SWIZZLE_B, GL_TEXTURE_SWIZZLE_A};
+            GLint read = 0, swizzle[4];
+            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, from);
+            for (unsigned i = 0; i < 4; ++i) glGetTexParameteriv(GL_TEXTURE_2D, channels[i], &swizzle[i]);
+            glBindTexture(GL_TEXTURE_2D, texture);
+            for (unsigned i = 0; i < 4; ++i) glTexParameteri(GL_TEXTURE_2D, channels[i], swizzle[i]);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, GLsizei(width), GLsizei(first));
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(read));
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1); glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            glPixelStorei(GL_UNPACK_SKIP_ROWS, 0); glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, GLint(first), GLsizei(width), GLsizei(rows->size() / (std::size_t(width) * 4)), GL_RGBA,
+                            GL_UNSIGNED_BYTE, rows->data());
         });
         ++stats.resident_crops;
         return t.texture;
