@@ -5,6 +5,7 @@
 #include "starlet/ax/ax.hpp"
 
 #include "ax_internal.hpp"
+#include "diagnostics.hpp"
 #include "platform.hpp"
 #include "starlet/ai/ai.hpp"
 #include "starlet/sdk/ai.h"
@@ -20,6 +21,7 @@ using namespace starlet::ax::detail;
 namespace {
 
 namespace platform = starlet::ax::platform;
+namespace diag = starlet::ax::diag;
 
 class Interrupts {
 public:
@@ -233,7 +235,7 @@ void set_pb_default(AXVPB* p) {
 void clear_dsp_updates(AXPB& pb) { std::memset(pb.update.updNum, 0, sizeof pb.update.updNum); }
 
 // Copies what the game changed into the DSP's block and what the DSP changed back, by sync flag.
-void service_vpb(AXVPB* p) {
+void copy_vpb(AXVPB* p) {
     ++voice_count;
     AXPB& to = dsp.pb[p->index];
     AXPB& user = p->pb;
@@ -318,6 +320,17 @@ void service_vpb(AXVPB* p) {
         return;
     }
     if (sync & AX_SYNC_FLAG_COPYLPF) to.lpf = user.lpf;
+}
+
+// The sync, then the diagnostics' look at the voice as the DSP now holds it.
+void service_vpb(AXVPB* p) {
+    const bool was_running = dsp.pb[p->index].state == AX_PB_STATE_RUN;
+    copy_vpb(p);
+    const AXPB& to = dsp.pb[p->index];
+    if (to.state == AX_PB_STATE_RUN)
+        diag::running_voice(int(p->index), to, !was_running, platform::aram_bytes());
+    else
+        diag::stopped_voice(int(p->index));
 }
 
 // Over the DSP budget: the voice stops now and its callback runs from the frame interrupt.
@@ -465,12 +478,16 @@ void new_frame() {
     frame_command = next_command;
     depop_fade(frame_command);
     const Memory memory{platform::aram(), platform::aram_bytes()};
-    run_frame(dsp, frame_command, aux, memory, __AXCompressorTable, output_buffers[frame_command.output]);
+    u32 saturated = 0;
+    run_frame(dsp, frame_command, aux, memory, __AXCompressorTable, output_buffers[frame_command.output], &saturated);
     counters.frames.fetch_add(1, std::memory_order_relaxed);
     service_callback_stack();
     __AXLocalProfile.auxProcessingStart = u64(platform::time());
     process_aux();
     __AXLocalProfile.auxProcessingEnd = u64(platform::time());
+    diag::end_frame(output_buffers[frame_command.output], aux_callback_a ? aux.a[(aux_cpu + 2) % 3] : nullptr,
+                    aux_callback_b && cl_mode != AX_MODE_DPL2 ? aux.b[(aux_cpu + 2) % 3] : nullptr, saturated,
+                    take_reads_past_end());
     __AXLocalProfile.userCallbackStart = u64(platform::time());
     if (user_callback) user_callback();
     __AXLocalProfile.userCallbackEnd = u64(platform::time());
@@ -527,6 +544,7 @@ void AXInit() { AXInitEx(0); }
 void AXInitEx(u32 outputBufferMode) {
     init_voice_stacks();
     reset(dsp);
+    diag::reset();
     vpb_init();
     std::memset(depop_sum, 0, sizeof depop_sum);
     aux_init();

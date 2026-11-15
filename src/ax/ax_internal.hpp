@@ -56,9 +56,14 @@ struct Memory {
 void reset(Dsp& dsp);
 
 // One frame: setup, voices, aux exchange, compressor, output. out takes 160 stereo frames, right
-// channel first, as the AI DMA reads them.
+// channel first, as the AI DMA reads them. saturated, when given, receives the number of output
+// samples (both channels) the final clamp cut.
 void run_frame(Dsp& dsp, const FrameCommand& command, AuxBuffers& aux, const Memory& memory,
-               const u16* compressor_table, s16* out);
+               const u16* compressor_table, s16* out, u32* saturated = nullptr);
+
+// Voice blocks read past their end address since the last call (a diagnostic; the frame interrupt's
+// thread only).
+u32 take_reads_past_end();
 
 // The accelerator and sample-rate converter for one voice: count output samples at 32 kHz.
 // Updates the block's addresses, decoder state and converter state as the DSP does.

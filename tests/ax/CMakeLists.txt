@@ -6,6 +6,7 @@ add_executable(starlet_ax_tests
     "${PROJECT_SOURCE_DIR}/src/ai/ai.cpp"
     "${PROJECT_SOURCE_DIR}/src/ax/ax_sdk.cpp"
     "${PROJECT_SOURCE_DIR}/src/ax/dsp.cpp"
+    "${PROJECT_SOURCE_DIR}/src/ax/diagnostics.cpp"
 )
 target_include_directories(starlet_ax_tests PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_compile_features(starlet_ax_tests PRIVATE cxx_std_17)
@@ -13,3 +14,14 @@ find_package(Threads REQUIRED)
 target_link_libraries(starlet_ax_tests PRIVATE Threads::Threads)
 add_test(NAME starlet_ax COMMAND starlet_ax_tests)
 set_tests_properties(starlet_ax PROPERTIES TIMEOUT 60)
+
+add_executable(starlet_ax_diagnostics_tests
+    diagnostics_tests.cpp
+    "${PROJECT_SOURCE_DIR}/src/ax/diagnostics.cpp"
+)
+target_include_directories(starlet_ax_diagnostics_tests PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_compile_features(starlet_ax_diagnostics_tests PRIVATE cxx_std_17)
+find_package(Threads REQUIRED)
+target_link_libraries(starlet_ax_diagnostics_tests PRIVATE Threads::Threads)
+add_test(NAME starlet_ax_diagnostics COMMAND starlet_ax_diagnostics_tests)
+set_tests_properties(starlet_ax_diagnostics PROPERTIES TIMEOUT 60)

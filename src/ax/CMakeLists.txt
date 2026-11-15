@@ -6,6 +6,7 @@ endif()
 add_library(starlet_ax STATIC
     ax_sdk.cpp
     dsp.cpp
+    diagnostics.cpp
     platform_starlet.cpp
 )
 add_library(starlet::ax ALIAS starlet_ax)

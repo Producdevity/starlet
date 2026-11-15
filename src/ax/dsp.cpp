@@ -21,6 +21,9 @@ void warn_once(std::atomic<bool>& said, const char* message) {
 
 std::atomic<bool> warned_format{false};
 std::atomic<bool> warned_itd{false};
+// Reads past a voice's end address since the last take, counted per 1 ms block of a voice; only the
+// frame interrupt touches it.
+u32 reads_past_end = 0;
 
 u32 hilo(u16 hi, u16 lo) { return (u32(hi) << 16) | lo; }
 
@@ -86,6 +89,8 @@ public:
     }
 
     void store() {
+        // The wrap compares for equality, so a current address beyond the end keeps reading memory.
+        if (!stopped_ && (current_ & 0x3FFFFFFF) > end_ + 3) ++reads_past_end;
         pb_.addr.currentAddressHi = u16(current_ >> 16);
         pb_.addr.currentAddressLo = u16(current_);
         pb_.adpcm.yn1 = u16(yn1_);
@@ -364,12 +369,18 @@ void read_samples(AXPB& pb, const Memory& memory, s16* out, u32 count) {
     accelerator.store();
 }
 
+u32 take_reads_past_end() {
+    const u32 count = reads_past_end;
+    reads_past_end = 0;
+    return count;
+}
+
 void reset(Dsp& dsp) {
     std::memset(&dsp, 0, sizeof dsp);
 }
 
 void run_frame(Dsp& dsp, const FrameCommand& command, AuxBuffers& aux, const Memory& memory,
-               const u16* compressor_table, s16* out) {
+               const u16* compressor_table, s16* out, u32* saturated) {
     for (int b = 0; b < bus_count; ++b) {
         const s32 value = command.studio_value[b];
         const s16 delta = command.studio_delta[b];
@@ -401,11 +412,15 @@ void run_frame(Dsp& dsp, const FrameCommand& command, AuxBuffers& aux, const Mem
 
     if (command.compressor && compressor_table) compress(dsp, compressor_table);
 
+    u32 clipped = 0;
     for (int i = 0; i < frame_samples; ++i) {
         dsp.surround[i] = dsp.bus[main_s][i];
-        out[2 * i] = clamp16(dsp.bus[main_r][i]);
-        out[2 * i + 1] = clamp16(dsp.bus[main_l][i]);
+        const int r = dsp.bus[main_r][i], l = dsp.bus[main_l][i];
+        clipped += u32(r > 0x7FFF) + u32(r < -0x8000) + u32(l > 0x7FFF) + u32(l < -0x8000);
+        out[2 * i] = clamp16(r);
+        out[2 * i + 1] = clamp16(l);
     }
+    if (saturated) *saturated = clipped;
 }
 
 }

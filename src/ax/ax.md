@@ -118,6 +118,28 @@ accelerator (`Source/Core/Core/DSP/DSPAccelerator.cpp`):
 - `COPYALL` sync copies the game's update words to the DSP. The SDK copies them
   the other way, which loses them; nothing in RE4 uses it.
 
+## Diagnostics
+
+Always on (`include/starlet/ax/diagnostics.hpp`, `src/ax/diagnostics.cpp`). Every line goes
+to stderr with the prefix `[audio] t=<seconds since start>`.
+
+- Voice checks run once per 5 ms frame on each running voice after the sync, so they cover
+  game writes and update-queue changes. A line prints when a voice starts or its findings
+  change: ratio 0 or above 2.0, polyphase or invalid SRC type, loop/end/current address
+  outside ARAM, ADPCM predictor word above 0x7f or scale above 12, a looped ADPCM voice with
+  an all-zero loop context, LPF on, ITD on. Findings in the first group print at most 8 lines
+  per second and 300 per run; polyphase, LPF and ITD notes print at most 3 per second and
+  100 per run. Dropped lines are counted in the next window's first line.
+- Once per second, when non-zero: output samples clamped in the main mix, aux A and aux B
+  return samples beyond 16 bits (after the callbacks), and 1 ms voice blocks whose current
+  address is past the end address.
+- A ring holds the last 10 s of the main mix and the aux A and B returns (the mean of L and
+  R), 2.56 MB. `save_audio_clip` writes `audio-clip-<seconds>.wav` (32 kHz, 4 channels: main
+  L, main R, aux A, aux B) and `.txt` into the folder given to `set_diagnostics_directory`:
+  the voices that started in the window with their parameter-block words and the run's
+  totals. Ten trigger clips per run; the `exit` reason always writes `audio-clip-exit.*`.
+  `request_audio_clip` does the same on a worker thread.
+
 ## Tests
 
 `tests/ax` runs AX on the real AI model with a hand-driven guest CPU and output:
@@ -126,3 +148,6 @@ loop context for voices and streams, SRC sample counts at 1.0 and 0.5,
 per-sample volume ramps across frames, aux A routing and latency, DPL2 rear
 routing, the compressor, priority drops, budget drops and the frame-callback
 cadence including a late guest.
+
+`tests/ax/diagnostics_tests.cpp` covers the voice checks, the rate limiter, the clip ring's order,
+the WAV writer's bytes and a clip saved from the always-on state.
