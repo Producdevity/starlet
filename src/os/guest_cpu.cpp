@@ -7,6 +7,7 @@
 #include "starlet/sdk/os.h"
 
 #include <pthread.h>
+#include <time.h>
 
 #include <algorithm>
 #include <array>
@@ -62,6 +63,14 @@ Guest interrupt_guest;
 OSThread* interrupted = nullptr;  // The guest thread an interrupt delivery preempted.
 OSThread* last_guest = nullptr;
 thread_local Guest* self = nullptr;
+std::atomic<SwitchTrace> switch_trace{nullptr};
+thread_local std::uint64_t run_cpu_start = 0;
+
+std::uint64_t thread_cpu_us() {
+    timespec t{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return std::uint64_t(t.tv_sec) * 1000000u + std::uint64_t(t.tv_nsec) / 1000u;
+}
 
 // Host threads that ended: the next thread creation joins them and reuses their stacks.
 struct Finished {
@@ -103,6 +112,23 @@ std::atomic<bool> in_handler{false};
 
 int slot(const Guest* g) { return g->priority() + 1; }
 
+// Diagnostics (set_switch_trace): h handed the CPU, g resumed, x released with its CPU time.
+void trace_dispatch(const Guest* g) {
+    if (const auto trace = switch_trace.load(std::memory_order_relaxed)) trace('h', std::uint32_t(slot(g)));
+}
+void trace_resume(const Guest* g) {
+    const auto trace = switch_trace.load(std::memory_order_relaxed);
+    if (!trace) return;
+    run_cpu_start = thread_cpu_us();
+    trace('g', std::uint32_t(slot(g)));
+}
+void trace_release(const Guest* g) {
+    const auto trace = switch_trace.load(std::memory_order_relaxed);
+    if (!trace) return;
+    const std::uint64_t used = run_cpu_start ? thread_cpu_us() - run_cpu_start : 0;
+    trace('x', std::uint32_t(slot(g)) | (g->queued ? 0x80u : 0u) | std::uint32_t(std::min<std::uint64_t>(used, 0xffffff) << 8));
+}
+
 void update_best() {
     int best = priority_slots;
     for (int i = 0; i < priority_slots; ++i)
@@ -137,6 +163,7 @@ void dispatch() {
         next->queued = false;
         update_best();
         running = next;
+        trace_dispatch(next);
         if (!next->interrupt_thread) {
             next->os->state = OS_THREAD_STATE_RUNNING;
             last_guest = next->os;
@@ -161,12 +188,14 @@ void wait_turn(Guest* g, std::unique_lock<std::mutex>& lock) {
         if (g->killed) end_host_thread(lock);
         g->turn.wait(lock);
     }
+    trace_resume(g);
 }
 
 // Gives up the CPU (the caller has already queued or parked itself) and waits
 // until it is dispatched again.
 void switch_away(std::unique_lock<std::mutex>& lock) {
     Guest* g = self;
+    trace_release(g);
     running = nullptr;
     dispatch();
     wait_turn(g, lock);
@@ -221,6 +250,7 @@ void interrupt_loop() {
         }
         in_handler.store(false, std::memory_order_relaxed);
         interrupted = nullptr;
+        trace_release(&interrupt_guest);
         running = nullptr;
         dispatch();
     }
@@ -337,6 +367,8 @@ OSThread main_thread;
 u8 main_thread_stack_marker[16];
 
 }
+
+void set_switch_trace(SwitchTrace trace) { switch_trace.store(trace, std::memory_order_relaxed); }
 
 void raise_interrupt(std::function<void()> handler) {
     host_allocation_scope host_;  // Scheduler containers must not take game memory.
@@ -484,6 +516,7 @@ void OSExitThread(void* val) {
     std::unique_lock<std::mutex> lock(scheduler);
     Guest* g = self;
     terminate(g, val);
+    trace_release(g);
     running = nullptr;
     dispatch();
     // A joiner may delete g once the lock is released.

@@ -8,6 +8,7 @@ declared in `include/starlet/sdk/os.h`. Moved from the Pikmin 2 port's platform 
   pending. Host service threads queue interrupt handlers with `raise_interrupt`; they run on an
   interrupt thread that outranks every OS priority while the running thread has interrupts enabled.
   `wait_for_interrupt` is for game loops that spin on a variable an interrupt handler sets.
+  `set_switch_trace` reports each hand-over of the CPU for diagnostics (the GX frame trace records them).
 - `os_core`: arena bounds, time base (40.5 MHz ticks), calendar, alarms, reports, cache maintenance
   (reported to observers such as the GX), console settings, reset. Host transfers into and out of game
   memory (ARAM, disc, card, THP, audio DMA) call `before_dma_read` or `before_dma_write` first, and

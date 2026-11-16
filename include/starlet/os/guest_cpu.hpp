@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 
 namespace starlet::sdk {
@@ -43,5 +44,12 @@ bool in_interrupt();
 
 // Number of guest threads that currently exist, for diagnostics.
 std::size_t guest_thread_count();
+
+// Diagnostics: called with the scheduler locked when the CPU is handed to a thread ('h'), when that
+// thread resumes ('g') and when it lets go ('x'). The value's low 7 bits are the thread's priority
+// plus one (0: the interrupt thread). For 'x', bit 7 is set when the thread stays ready (preempted)
+// and the bits above hold the thread CPU time of that turn in microseconds.
+using SwitchTrace = void (*)(char kind, std::uint32_t value);
+void set_switch_trace(SwitchTrace trace);
 
 }

@@ -121,6 +121,7 @@ void VIWaitForRetrace() {
     starlet::gx::sync_stats::Wait blocked("VIWaitForRetrace (game)");
     do OSSleepThread(&retrace_waiters);
     while (count == retrace_count);
+    frame_event('w', retrace_count);
     OSRestoreInterrupts(enabled);
 }
 
