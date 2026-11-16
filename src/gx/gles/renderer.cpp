@@ -3,6 +3,9 @@
 #include "starlet/gx/sync_stats.hpp"
 
 #include <GLES3/gl31.h>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -410,28 +413,108 @@ struct GlesRenderer::Impl {
     }
     struct PendingRead { std::size_t index; std::uint64_t generation; };
     std::vector<PendingRead> pending_reads;
-    // write_back ranges (owner thread) and the copies issued into them: each is read back into a
-    // pixel-pack buffer after its pass; the GL thread copies the texels out once the fence
-    // signals and publishes its sequence in read_write_backs, in order; the owner lands it.
+    // write_back ranges (owner thread) and the copies issued into them. Each is read back into a
+    // pixel-pack buffer: one-byte-per-texel copies issued together packed into one target (see
+    // land_write_backs), others right after their pass. The GL thread maps the buffer once its fence
+    // signals and publishes the last sequence in read_write_backs, in order; the copier (below)
+    // copies the texels out, and the owner lands them.
     std::vector<std::pair<std::uint32_t, std::size_t>> write_back_ranges;
     struct WriteBack {
         std::uint64_t sequence = 0;
         std::uint32_t token = 0;
+        std::size_t bytes = 0;     // the copy's span from token
         // The readback's extent in RGBA8 pixels. packed: a one-byte-per-texel copy (I8 sample
         // format, whole 8x4 tiles, natural stride), whose destination bytes a GPU pass packs four
         // to a pixel, so the readback is the copy's own bytes; otherwise the texels as
         // materialize reads them.
         int width = 0, height = 0;
         bool packed = false;
+        GLuint texture = 0, framebuffer = 0;   // the copy's resident target
+        int row = 0;                           // its first row in its readback
+        // Copied out on the copier's thread (with a GL submission thread), else on the GL thread.
+        bool copier = false;
+        std::vector<std::uint8_t> texels;      // copied out of the readback
+    };
+    // One pixel-pack buffer and fence for write-backs read back together, rows stacked: packed
+    // ones issued together, or one other copy. On the Flip's Mali each
+    // readback costs the GL thread about 1 ms whatever its size (Bianco Hills has five 256 x 256
+    // goop maps a frame).
+    struct Readback {
+        std::vector<std::shared_ptr<WriteBack>> write_backs;
+        int width = 0, height = 0;
+        bool copier = false;
         GLuint pack = 0;           // GL thread
         GLsync fence = nullptr;    // GL thread
-        // The mapped readback, published with the sequence; the owner copies it out and hands the
-        // buffer back (released_packs), and the GL thread unmaps it before reusing it.
+        // Its commands were flushed: an idle GL thread's polls need not flush again (each flush
+        // can end a render pass early on a tiler).
+        bool flushed = false;      // GL thread
+        // Mapped by the GL thread; the copier copies the texels out and hands the buffer back
+        // (released_packs), and the GL thread unmaps it before reusing it.
         const std::uint8_t* mapped = nullptr;
+        std::uint64_t last() const { return write_backs.back()->sequence; }
     };
+    // Copies mapped readbacks out, oldest first, on its own thread: on the Flip's Mali a mapping
+    // reads at about 85 MB/s (3 ms for Sirena's 256 KiB map a frame), which on the owner held up
+    // its decoding and so the game's draw-done waits. copied: the last sequence copied out.
+    struct Copier {
+        std::thread thread;
+        std::mutex mutex;
+        std::condition_variable wake, done;
+        std::deque<std::shared_ptr<Readback>> queue;
+        std::atomic<std::uint64_t> copied{0};
+        bool stopping = false;
+    } copier;
+    void copy_out(Readback& r) {
+        const auto start = std::chrono::steady_clock::now();
+        const std::size_t stride = std::size_t(r.width) * 4;
+        for (const auto& w : r.write_backs) {
+            const std::size_t row_bytes = std::size_t(w->width) * 4;
+            w->texels.resize(row_bytes * std::size_t(w->height));
+            const std::uint8_t* from = r.mapped + std::size_t(w->row) * stride;
+            if (row_bytes == stride) std::memcpy(w->texels.data(), from, w->texels.size());
+            else for (int y = 0; y < w->height; ++y) std::memcpy(w->texels.data() + std::size_t(y) * row_bytes, from + std::size_t(y) * stride, row_bytes);
+        }
+        {
+            std::lock_guard<std::mutex> lock(released_mutex);
+            released_packs.emplace_back(r.pack, GLsizeiptr(stride) * r.height);
+        }
+        r.mapped = nullptr;
+        write_back_copy_us.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    }
+    void start_copier() {
+        if (copier.thread.joinable()) return;
+        copier.thread = std::thread([this] {
+#if defined(__linux__)
+            pthread_setname_np(pthread_self(), "gx-copy-out");
+#endif
+            for (;;) {
+                std::shared_ptr<Readback> r;
+                {
+                    std::unique_lock<std::mutex> lock(copier.mutex);
+                    copier.wake.wait(lock, [this] { return copier.stopping || !copier.queue.empty(); });
+                    if (copier.stopping) return;
+                    r = copier.queue.front();
+                }
+                copy_out(*r);
+                {
+                    std::lock_guard<std::mutex> lock(copier.mutex);
+                    copier.queue.pop_front();
+                    copier.copied.store(r->last(), std::memory_order_release);
+                }
+                copier.done.notify_all();
+            }
+        });
+    }
+    void stop_copier() {
+        if (!copier.thread.joinable()) return;
+        { std::lock_guard<std::mutex> lock(copier.mutex); copier.stopping = true; }
+        copier.wake.notify_all();
+        copier.thread.join();
+    }
     std::mutex released_mutex;
-    std::vector<std::pair<GLuint, GLsizeiptr>> released_packs;   // owner -> GL thread
-    // GL thread: unmaps the buffers the owner has copied out and keeps them for reuse.
+    std::vector<std::pair<GLuint, GLsizeiptr>> released_packs;   // copier -> GL thread
+    // GL thread: unmaps the buffers the copier has copied out and keeps them for reuse.
     void reuse_released_packs() {
         std::vector<std::pair<GLuint, GLsizeiptr>> released;
         {
@@ -447,16 +530,23 @@ struct GlesRenderer::Impl {
     }
     // GL thread: the packing program and its targets, by extent.
     GLuint pack_program = 0;
+    GLint pack_origin = -1;
     struct PackTarget { int width = 0, height = 0; GLuint texture = 0, framebuffer = 0; };
     std::vector<PackTarget> pack_targets;
     static bool packs_bytes(const TextureCopy& p) {
         const int width = p.destination_width(), height = p.destination_height();
         return texture_copy_sample_format(p) == 1 && width % 8 == 0 && height % 4 == 0 && p.stride == std::size_t(width / 8) * 32;
     }
-    // GL thread: renders texture's I8 texels into target in the copy's tiled byte order: pixel
-    // (x, row) holds bytes 4x..4x+3 of tile row `row`, 8x4 tiles of 32 bytes, four texels of one
-    // texel row each. Leaves target bound.
-    void pack_tiles(GLuint texture, const PackTarget& target) {
+    // GL thread: renders w's I8 texels into the bound pack target from row w.row on, in the copy's
+    // tiled byte order: pixel (x, w.row + row) holds bytes 4x..4x+3 of tile row `row`, 8x4 tiles
+    // of 32 bytes, four texels of one texel row each.
+    void pack_tiles(const WriteBack& w) {
+        glViewport(0, w.row, w.width, w.height);
+        glUniform2i(pack_origin, 0, w.row);
+        glBindTexture(GL_TEXTURE_2D, w.texture);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    void begin_packing(const PackTarget& target) {
         if (!pack_program) {
             GlesDrawPipeline pipeline;
             pipeline.vertex = "#version 310 es\nvoid main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.0-1.0,0.0,1.0);}";
@@ -464,9 +554,10 @@ struct GlesRenderer::Impl {
 precision highp float;
 precision highp int;
 uniform highp sampler2D uCopy;
+uniform ivec2 uOrigin;
 layout(location=0) out vec4 color;
 void main(){
- ivec2 o=ivec2(gl_FragCoord.xy);int b=o.x*4;
+ ivec2 o=ivec2(gl_FragCoord.xy)-uOrigin;int b=o.x*4;
  ivec2 t=ivec2((b>>5)*8+(b&7),o.y*4+((b&31)>>3));
  color=vec4(texelFetch(uCopy,t,0).r,texelFetch(uCopy,t+ivec2(1,0),0).r,texelFetch(uCopy,t+ivec2(2,0),0).r,texelFetch(uCopy,t+ivec2(3,0),0).r);
 })GLSL";
@@ -474,16 +565,14 @@ void main(){
             ++stats.shader_compiles;
             glUseProgram(pack_program);
             glUniform1i(glGetUniformLocation(pack_program, "uCopy"), 0);
+            pack_origin = glGetUniformLocation(pack_program, "uOrigin");
         }
         fullscreen_state();
         glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
-        glViewport(0, 0, target.width, target.height);
         glBindVertexArray(vao);
         glUseProgram(pack_program);
         glActiveTexture(GL_TEXTURE0);
         glBindSampler(0, 0);
-        glBindTexture(GL_TEXTURE_2D, texture);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
     }
     const PackTarget& pack_target(int width, int height) {
         for (const auto& t : pack_targets) if (t.width == width && t.height == height) return t;
@@ -495,13 +584,20 @@ void main(){
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.texture, 0);
         if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
             throw std::runtime_error("write-back packing framebuffer is incomplete");
+        // Bounded: batches of other sizes come and go with the stage.
+        if (pack_targets.size() >= 8) {
+            glDeleteFramebuffers(1, &pack_targets.front().framebuffer); glDeleteTextures(1, &pack_targets.front().texture);
+            pack_targets.erase(pack_targets.begin());
+        }
         pack_targets.push_back(t);
         return pack_targets.back();
     }
     std::deque<std::shared_ptr<WriteBack>> issued_write_backs;   // owner thread, not yet landed
+    std::vector<std::shared_ptr<WriteBack>> unpacked;            // owner thread, packed ones not yet read back
+    std::chrono::steady_clock::time_point last_unpacked;         // owner thread, when the last one was issued
     std::uint64_t write_back_sequence = 0;                        // owner thread
     std::atomic<std::uint64_t> read_write_backs{0};
-    std::deque<std::shared_ptr<WriteBack>> fenced_write_backs;   // GL thread
+    std::deque<std::shared_ptr<Readback>> fenced_readbacks;      // GL thread
     std::atomic<std::uint64_t> write_back_issue_us{0}, write_back_copy_us{0};
     std::vector<std::pair<GLuint, GLsizeiptr>> spare_packs;      // GL thread
     bool writes_back(std::uint32_t token, std::size_t bytes) const {
@@ -509,68 +605,103 @@ void main(){
             if (token < std::uint64_t{r.first} + r.second && r.first < std::uint64_t{token} + bytes) return true;
         return false;
     }
-    // GL thread, after the copy's pass: reads its target into a pack buffer and fences it.
-    void read_write_back(const std::shared_ptr<WriteBack>& w, GLuint texture, GLuint framebuffer) {
+    // Owner thread: queues the readback of these write-backs, after the copies' passes.
+    void read_back(std::vector<std::shared_ptr<WriteBack>> write_backs) {
+        if (write_backs.empty()) return;
+        flush_copies();
+        auto r = std::make_shared<Readback>();
+        r->copier = write_backs.front()->copier;
+        for (const auto& w : write_backs) { w->row = r->height; r->height += w->height; r->width = std::max(r->width, w->width); }
+        r->write_backs = std::move(write_backs);
+        sync_stats::Context ctx("gl: write-back readback");
+        execute([this, r] { try { read_back_gl(r); } catch (...) { failed = true; throw; } }, false);
+    }
+    // Owner thread: the packed write-backs issued so far, in one readback.
+    void read_back_unpacked() {
+        std::vector<std::shared_ptr<WriteBack>> write_backs;
+        write_backs.swap(unpacked);
+        read_back(std::move(write_backs));
+    }
+    // GL thread: packs the readback's write-backs (or takes its one other copy's target), reads
+    // it into a pack buffer and fences it.
+    void read_back_gl(const std::shared_ptr<Readback>& r) {
         const auto start = std::chrono::steady_clock::now();
-        const GLsizeiptr bytes = GLsizeiptr(w->width) * w->height * 4;
+        const GLsizeiptr bytes = GLsizeiptr(r->width) * r->height * 4;
         reuse_released_packs();
         auto spare = std::find_if(spare_packs.begin(), spare_packs.end(), [&](const auto& b) { return b.second == bytes; });
-        if (spare != spare_packs.end()) { w->pack = spare->first; spare_packs.erase(spare); }
+        if (spare != spare_packs.end()) { r->pack = spare->first; spare_packs.erase(spare); }
         else {
-            glGenBuffers(1, &w->pack); glBindBuffer(GL_PIXEL_PACK_BUFFER, w->pack);
+            glGenBuffers(1, &r->pack); glBindBuffer(GL_PIXEL_PACK_BUFFER, r->pack);
             glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
         }
-        if (w->packed) {
-            const auto& target = pack_target(w->width, w->height);
-            pack_tiles(texture, target);
+        GLuint texture = r->write_backs.front()->texture, framebuffer = r->write_backs.front()->framebuffer;
+        if (r->write_backs.front()->packed) {
+            const auto& target = pack_target(r->width, r->height);
+            begin_packing(target);
+            for (const auto& w : r->write_backs) pack_tiles(*w);
             texture = target.texture;
             framebuffer = target.framebuffer;
         }
         if (compute_readback) {
             glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-            store_texels(texture, w->pack, 0, 0, w->width, w->height, 0, w->width);
+            store_texels(texture, r->pack, 0, 0, r->width, r->height, 0, r->width);
         } else {
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, w->pack);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, r->pack);
             glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
             glPixelStorei(GL_PACK_ALIGNMENT, 1); glPixelStorei(GL_PACK_ROW_LENGTH, 0);
             glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
-            glReadPixels(0, 0, w->width, w->height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glReadPixels(0, 0, r->width, r->height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
             glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
         }
         glBindFramebuffer(GL_FRAMEBUFFER, this->framebuffer);
-        w->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        if (!w->fence) throw std::runtime_error("write-back fence allocation failed");
-        fenced_write_backs.push_back(w);
+        r->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (!r->fence) throw std::runtime_error("write-back fence allocation failed");
+        fenced_readbacks.push_back(r);
         gl_check("texture-copy write-back readback");
         write_back_issue_us.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
     }
-    // GL thread: maps the readbacks whose fence has signalled and publishes them, oldest first;
-    // through forces those up to that sequence. flush submits queued commands first (an idle GL
-    // thread). The owner copies them out: on the Flip's Mali the mapping reads at about 100 MB/s,
-    // 2.4 ms for Sirena's 256 KiB, which the GL thread, the busier one, is spared.
+    // GL thread: maps the readbacks whose fence has signalled and publishes them, oldest first,
+    // to the copier (or copies them out here); through forces those up to that sequence. flush
+    // submits queued commands first (an idle GL thread).
     void collect_write_backs(std::uint64_t through = 0, bool flush = false) {
-        while (!fenced_write_backs.empty()) {
-            auto& w = *fenced_write_backs.front();
-            const bool forced = w.sequence <= through;
-            const auto status = glClientWaitSync(w.fence, forced || flush ? GL_SYNC_FLUSH_COMMANDS_BIT : 0, forced ? 1000000000 : 0);
+        while (!fenced_readbacks.empty()) {
+            auto& r = *fenced_readbacks.front();
+            const bool forced = r.write_backs.front()->sequence <= through;
+            const bool flushing = forced || (flush && !r.flushed);
+            const auto status = glClientWaitSync(r.fence, flushing ? GL_SYNC_FLUSH_COMMANDS_BIT : 0, forced ? 1000000000 : 0);
+            // One flush submits every fence made before it.
+            if (flushing) for (const auto& f : fenced_readbacks) f->flushed = true;
             if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) {
                 if (forced) throw std::runtime_error("texture-copy write-back did not retire within one second");
                 return;
             }
-            glDeleteSync(w.fence); w.fence = nullptr;
-            const GLsizeiptr bytes = GLsizeiptr(w.width) * w.height * 4;
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, w.pack);
-            w.mapped = static_cast<const std::uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT));
+            glDeleteSync(r.fence); r.fence = nullptr;
+            const GLsizeiptr bytes = GLsizeiptr(r.width) * r.height * 4;
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, r.pack);
+            r.mapped = static_cast<const std::uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT));
             glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-            if (!w.mapped) throw std::runtime_error("texture-copy write-back map failed");
-            read_write_backs.store(w.sequence, std::memory_order_release);
-            fenced_write_backs.pop_front();
+            if (!r.mapped) throw std::runtime_error("texture-copy write-back map failed");
+            if (r.copier) {
+                { std::lock_guard<std::mutex> lock(copier.mutex); copier.queue.push_back(fenced_readbacks.front()); }
+                copier.wake.notify_one();
+            } else {
+                copy_out(r);
+            }
+            read_write_backs.store(r.last(), std::memory_order_release);
+            fenced_readbacks.pop_front();
             flush = false;
         }
     }
     // Owner thread: until write-back sequence is read back (as wait_readback).
     void wait_write_back(std::uint64_t sequence);
+    // Owner thread: until the copier has copied write-back sequence out (it is read back).
+    void wait_copied(std::uint64_t sequence) {
+        std::unique_lock<std::mutex> lock(copier.mutex);
+        sync_stats::Wait blocked(sync_stats::context("write-back-copy-wait"));
+        if (!copier.done.wait_for(lock, std::chrono::seconds(2), [&] { return copier.copied.load(std::memory_order_acquire) >= sequence; }))
+            throw std::runtime_error("texture-copy write-back was not copied out within two seconds");
+    }
     // GL thread: copies signalled snapshot readbacks; wait forces the one for index. flush submits
     // queued commands first, so fences the driver still holds can signal (an idle GL thread).
     void collect_snapshots(int wait = -1, bool flush = false) {
@@ -687,7 +818,7 @@ void main(){
             op();
             if (!pending_reads.empty()) collect_snapshots();
             if (depth_readbacks_pending()) collect_depth_readbacks();
-            if (!fenced_write_backs.empty()) collect_write_backs();
+            if (!fenced_readbacks.empty()) collect_write_backs();
         }
         catch (...) {
             std::lock_guard<std::mutex> lock(q.mutex);
@@ -711,7 +842,7 @@ void main(){
         try {
             if (!pending_reads.empty()) collect_snapshots(-1, true);
             if (depth_readbacks_pending()) collect_depth_readbacks();
-            if (!fenced_write_backs.empty()) collect_write_backs(0, true);
+            if (!fenced_readbacks.empty()) collect_write_backs(0, true);
         }
         catch (...) {
             std::lock_guard<std::mutex> lock(q.mutex);
@@ -731,7 +862,7 @@ void main(){
             std::function<void()> op;
             {
                 std::unique_lock<std::mutex> lock(q.mutex);
-                if (depth_readbacks_pending() || !pending_reads.empty() || !fenced_write_backs.empty()) {
+                if (depth_readbacks_pending() || !pending_reads.empty() || !fenced_readbacks.empty()) {
                     // A readback is in flight: wake every millisecond, or when a reader waits for one,
                     // to publish it once its fence signals, without waiting for later GL work.
                     {
@@ -759,6 +890,7 @@ void main(){
     explicit Impl(GlesLimits budget) : limits(budget), capture_cache({budget.texture_bytes, std::min<std::size_t>(budget.textures, 256)}), geometry_cache(budget.geometry) {}
     ~Impl() {
         if (owner != std::this_thread::get_id()) std::terminate();
+        stop_copier();
         if (!context_valid) return;
         shared_direct.store(nullptr, std::memory_order_release);
         direct.reset();
@@ -774,9 +906,9 @@ void main(){
         for (std::size_t i = 0; i < snapshots.size(); ++i) if (snapshot_pixels[i]) {
             glBindBuffer(GL_PIXEL_PACK_BUFFER, snapshots[i].pack); glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
         }
-        for (const auto& w : fenced_write_backs) { glDeleteSync(w->fence); glDeleteBuffers(1, &w->pack); }
+        for (const auto& r : fenced_readbacks) { glDeleteSync(r->fence); glDeleteBuffers(1, &r->pack); }
+        for (const auto& r : copier.queue) glDeleteBuffers(1, &r->pack);
         for (const auto& b : released_packs) glDeleteBuffers(1, &b.first);
-        for (const auto& w : issued_write_backs) if (w->mapped) glDeleteBuffers(1, &w->pack);
         for (const auto& t : pack_targets) { glDeleteFramebuffers(1, &t.framebuffer); glDeleteTextures(1, &t.texture); }
         if (pack_program) glDeleteProgram(pack_program);
         for (const auto& b : spare_packs) glDeleteBuffers(1, &b.first);
@@ -2057,6 +2189,7 @@ void GlesRenderer::copy_display(const DisplayCopy &p, std::uint8_t *destination,
     auto &g = *impl_;
     g.require_ready();
     if (p.efb != g.limits.efb) throw std::invalid_argument("display copy planned for another EFB layout");
+    g.read_back_unpacked();
     const auto required = display_copy_bytes(p);
     const auto address = reinterpret_cast<std::uintptr_t>(destination);
     if (!destination || (address & 31) || capacity < required || capacity > UINTPTR_MAX - address)
@@ -2206,9 +2339,19 @@ void GlesRenderer::copy_texture_resident(const TextureCopy& p, std::uint8_t* des
         g.flush_direct();
         std::shared_ptr<Impl::WriteBack> write_back;
         if (g.writes_back(token, required)) {
+            // Copies reach memory in issue order, as on the console: an earlier one into this
+            // memory lands first. Made about a frame earlier, it is usually read back by now.
+            std::uint64_t earlier = 0;
+            for (const auto& w : g.issued_write_backs)
+                if (w->token < std::uint64_t{token} + required && token < std::uint64_t{w->token} + w->bytes) earlier = w->sequence;
+            if (earlier) land_write_backs(earlier, true);
             write_back = std::make_shared<Impl::WriteBack>();
             write_back->sequence = ++g.write_back_sequence;
             write_back->token = token;
+            write_back->bytes = required;
+            // With a GL submission thread, readbacks are copied out on the copier's.
+            write_back->copier = g.submission.running;
+            if (write_back->copier) g.start_copier();
             write_back->packed = Impl::packs_bytes(p);
             write_back->width = p.destination_width();
             write_back->height = write_back->packed ? p.destination_height() / 4 : p.destination_height();
@@ -2217,13 +2360,19 @@ void GlesRenderer::copy_texture_resident(const TextureCopy& p, std::uint8_t* des
         g.direct->flush();
         g.pending_copies.push_back({p, target, token, required});
         if (write_back) {
-            // Read back after the copy's pass; the GL thread publishes it once its fence signals.
-            g.flush_copies();
+            write_back->texture = target.texture;
+            write_back->framebuffer = target.framebuffer;
             g.issued_write_backs.push_back(write_back);
-            sync_stats::Context ctx("gl: write-back readback");
-            g.execute([&g, write_back, target] {
-                try { g.read_write_back(write_back, target.texture, target.framebuffer); } catch (...) { g.failed = true; throw; }
-            }, false);
+            if (!write_back->packed) {
+                // Readbacks publish in issue order.
+                g.read_back_unpacked();
+                g.read_back({write_back});
+            } else {
+                // Read back with the packed ones issued around it (see land_write_backs).
+                g.unpacked.push_back(write_back);
+                g.last_unpacked = std::chrono::steady_clock::now();
+                if (g.unpacked.size() == 8) g.read_back_unpacked();
+            }
         }
         // The clear changes what a later copy would read.
         if (p.clear) g.flush_copies();
@@ -2240,6 +2389,12 @@ std::uint64_t GlesRenderer::write_backs_issued() const { return impl_->write_bac
 bool GlesRenderer::land_write_backs(std::uint64_t through, bool wait) {
     auto& g = *impl_; g.check_owner();
     auto& issued = g.issued_write_backs;
+    // Packed copies are read back together once 2 ms pass without another (Bianco Hills copies
+    // its five goop maps back to back), well before the next frame's copies into the same memory
+    // need them; the next display copy reads back any left.
+    if (!g.unpacked.empty() && std::chrono::steady_clock::now() - g.last_unpacked >= std::chrono::milliseconds(2)) {
+        try { g.read_back_unpacked(); } catch (...) { g.failed = true; throw; }
+    }
     if (issued.empty() || issued.front()->sequence > through) return true;
     if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
     try {
@@ -2248,23 +2403,17 @@ bool GlesRenderer::land_write_backs(std::uint64_t through, bool wait) {
         if (!q.running) g.collect_write_backs();
         while (!issued.empty() && issued.front()->sequence <= through) {
             const auto& w = issued.front();
-            if (g.read_write_backs.load(std::memory_order_acquire) < w->sequence) {
+            const bool ready = w->copier ? g.copier.copied.load(std::memory_order_acquire) >= w->sequence
+                                         : g.read_write_backs.load(std::memory_order_acquire) >= w->sequence;
+            if (!ready) {
                 if (!wait) return false;
                 ++g.stats.write_back_waits;
                 sync_stats::Context ctx("write-back-wait");
-                g.wait_write_back(w->sequence);
+                if (!g.unpacked.empty() && g.unpacked.front()->sequence <= w->sequence) g.read_back_unpacked();
+                if (g.read_write_backs.load(std::memory_order_acquire) < w->sequence) g.wait_write_back(w->sequence);
+                if (w->copier) g.wait_copied(w->sequence);
             }
-            // One bulk copy out of the mapping (uncached or write-combined), then the buffer goes back.
-            const auto start = std::chrono::steady_clock::now();
-            const std::size_t bytes = std::size_t(w->width) * std::size_t(w->height) * 4;
-            std::vector<std::uint8_t> texels(w->mapped, w->mapped + bytes);
-            {
-                std::lock_guard<std::mutex> lock(g.released_mutex);
-                g.released_packs.emplace_back(w->pack, GLsizeiptr(bytes));
-            }
-            g.write_back_copy_us.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
-            if (g.direct && g.direct->land_write_back(w->token, w->sequence, std::move(texels), w->packed)) ++g.stats.write_backs;
+            if (g.direct && g.direct->land_write_back(w->token, w->sequence, std::move(w->texels), w->packed)) ++g.stats.write_backs;
             else ++g.stats.write_backs_dropped;
             issued.pop_front();
         }
@@ -2652,6 +2801,7 @@ void GlesRenderer::stop_submission() {
     auto& g = *impl_;
     auto& q = g.submission;
     if (!q.running) return;
+    g.read_back_unpacked();
     g.flush_copies();
     if (g.direct) g.direct->flush();
     if (q.post) {

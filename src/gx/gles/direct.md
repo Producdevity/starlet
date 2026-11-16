@@ -233,17 +233,25 @@ write (Galaxy unregisters its writable ranges this way).
 `GlesRenderer::write_back` names ranges whose copies the game's CPU also reads, as
 on the console, where a copy writes main memory (Super Mario Sunshine's goop maps:
 Mario slips, sinks and burns by them). Such a copy stays resident and is not
-stamped; after its pass the GL thread reads its target into a pixel-pack buffer
-behind a fence, and copies the texels out once the fence signals (after each task,
-and every millisecond while idle). `land_write_backs`, on the owner thread, then
-stores them as materializing would, outside newer copies' ranges, in issue order.
+stamped. The GL thread reads its target into a pixel-pack buffer behind a fence,
+and maps the buffer once the fence signals (after each task, and every millisecond
+while idle); a copier thread copies the texels out, since the Flip's Mali maps such
+a buffer at about 85 MB/s. `land_write_backs`, on the owner thread, then stores them
+as materializing would, outside newer copies' ranges, in issue order. A copy into
+memory whose earlier copy has not landed lands that one first, waiting for its
+readback if needed: made a frame earlier, it is usually read back by then.
 A copy of one byte per texel (I8 sample format, whole 8x4 tiles, natural stride) is
-first packed on the GPU into its own tiled bytes, four to an RGBA8 pixel, so a
-quarter of the bytes are read back and landing is a copy: Sirena's 512 x 512 map is
-256 KiB a frame instead of 1 MiB and an encode.
+packed on the GPU into its own tiled bytes, four to an RGBA8 pixel, so a quarter of
+the bytes are read back and landing is a copy: Sirena's 512 x 512 map is 256 KiB a
+frame instead of 1 MiB and an encode. Such copies issued together are packed and read
+back together, their rows stacked in one target, once 2 ms pass on the owner thread
+without another (at the latest at the next display copy, or when a landing needs
+one): each readback costs the Mali GL thread about 1 ms whatever its size, and Bianco
+Hills copies five goop maps a frame, back to back. Other copies are read back right
+after their pass.
 Until then, and after, the copy is intact while memory holds the bytes it held when
 the copy was made, or the landed bytes: a game that rewrote the memory first keeps
-its bytes, and the copy is dropped at its next lookup. A copy replaced, released or
+its bytes, and the copy is dropped at its next lookup. A copy released or
 materialized before its readback arrived lands nothing. A landed copy materializes
 without a readback and is still sampled from the GPU.
 

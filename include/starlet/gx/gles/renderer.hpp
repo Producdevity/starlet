@@ -36,8 +36,8 @@ struct GlesStats {
     std::uint64_t invalidations = 0;
     // Resident texture copies rendered in the pass of the copy before them (see renderer.md).
     std::uint64_t merged_copies = 0;
-    // Resident copies into write_back ranges: written to memory, dropped (replaced, released or
-    // overwritten by the game first), and landings that waited for their readback.
+    // Resident copies into write_back ranges: written to memory, dropped (released, materialized
+    // or overwritten by the game first), and landings that waited for their readback.
     std::uint64_t write_backs = 0, write_backs_dropped = 0, write_back_waits = 0;
     // Time for them: issuing the packing pass and readback on the GL thread, and copying the
     // mapped readback out on the owner thread (microseconds).
@@ -148,10 +148,12 @@ public:
     void before_dma_write(const void* data, std::size_t bytes);
     // Direct path, owner thread: resident copies into [token, token + bytes) also reach memory,
     // for a game whose CPU reads them (a console copy writes main memory). Each one is read back
-    // after its pass without waiting; land_write_backs writes its bytes as materializing would.
-    // on = false drops the range. write_backs_issued counts the copies issued into such ranges;
+    // without waiting (one-byte-per-texel copies issued together in one readback; see direct.md);
+    // land_write_backs writes its bytes as materializing would. A copy into memory whose earlier
+    // copy has not landed lands that one first, waiting for its readback if needed. on = false
+    // drops the range. write_backs_issued counts the copies issued into such ranges;
     // land_write_backs writes those read back, in order, up to through, and is true once all of
-    // them are written or dropped (wait: blocks until then).
+    // them are written or dropped (wait: reads back and blocks until then).
     void write_back(std::uint32_t token, std::size_t bytes, bool on);
     std::uint64_t write_backs_issued() const;
     bool land_write_backs(std::uint64_t through, bool wait);

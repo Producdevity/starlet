@@ -134,12 +134,12 @@ and DMA over resident copies still wait for every command before them.
 
 A port names memory whose texture copies the game reads on the CPU with
 `Renderer::write_back` (the GLES backend reads such copies back without waiting;
-direct.md). Each draw-done and token interrupt waits for the copies issued before
-it: it is raised only once their bytes are in memory, as on the console, where the
-interrupt follows the copy's memory writes. The GPU thread keeps decoding meanwhile
-and writes each readback as it arrives; with nothing else queued it polls for the
-one the next interrupt needs every millisecond, which the idle GL thread publishes
-on that schedule, so new commands are never held up.
+direct.md). The GPU thread writes each copy's bytes into memory after the command
+during which its readback arrived, in issue order, and before the next copy into
+the same memory, so the CPU sees a copy up to about a frame late. Draw-done and
+token interrupts do not wait for them. On the console an interrupt follows the
+copy's memory writes, but holding it until the GPU had finished the copy made the
+game wait for the GPU in every frame.
 
 ## Host transfers
 
@@ -171,5 +171,6 @@ and exact reads under `STARLET_GX_SYNC_READS=1`; `draw_sync_snapshot_tests.cpp`
 runs the exact draw-sync snapshots; `frame_ahead_tests.cpp` checks that the
 setting reaches the renderer and that sync points still wait. With GLES
 headers, `dma_tests.cpp` runs ARAM and disc DMA over resident texture copies of
-the GLES renderer on a recording GL fake, and `write_back_tests.cpp` checks that a
-token behind a written-back copy waits for its bytes.
+the GLES renderer on a recording GL fake, and `write_back_tests.cpp` checks that
+interrupts do not wait for a written-back copy, that its bytes land once read back,
+and that a later copy into the same memory lands the earlier one first.

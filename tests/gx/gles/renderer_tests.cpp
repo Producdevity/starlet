@@ -950,8 +950,9 @@ void stamped_resident_copies() {
     check(renderer.stats().direct.materialized==2 && std::all_of(bytes.begin(),bytes.end(),[](std::uint8_t b){return b==0x22;}),
           "a fully overwritten copy materializes nothing");
 }
-// Written-back copies (GlesRenderer::write_back): read back into a buffer after their pass without
-// a wait, their bytes stored once landed as materializing would, and still sampled on the GPU.
+// Written-back copies (GlesRenderer::write_back): read back into a buffer without a wait (packed
+// ones together, before the next display copy or a landing that needs them), their bytes stored
+// once landed as materializing would, and still sampled on the GPU.
 void written_back_copies() {
     GlesRenderer renderer; Fixture f; f.memory.bytes.resize(64,0xa5); f.bp(0x8b,0x100c0f);
     renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
@@ -966,11 +967,11 @@ void written_back_copies() {
     renderer.write_back(0x8000,64,true);
     const auto reads=fake::read_pixels, draws=fake::draws;
     renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
-    check(renderer.write_backs_issued()==1 && fake::read_pixels==reads+1 && fake::pack_pbo_seen!=0 && fake::pack_required==64 &&
-          fake::draws>draws && all(0x11),
-          "a written-back R8 copy is packed and read back into a buffer; memory keeps its bytes until it lands");
-    check(renderer.land_write_backs(1,false) && bytes==expected && renderer.stats().write_backs==1,
-          "landing stores the copy's bytes");
+    check(renderer.write_backs_issued()==1 && fake::read_pixels==reads && all(0x11),
+          "a written-back R8 copy waits to be read back with others; memory keeps its bytes until it lands");
+    check(renderer.land_write_backs(1,true) && fake::read_pixels==reads+1 && fake::pack_pbo_seen!=0 && fake::pack_required==64 &&
+          fake::draws>draws && bytes==expected && renderer.stats().write_backs==1,
+          "a landing that needs it packs it, reads it back into a buffer and stores the copy's bytes");
     check(renderer.land_write_backs(1,false) && renderer.stats().write_backs==1,"a copy lands once");
     renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
     auto s=renderer.stats().direct;
@@ -983,13 +984,16 @@ void written_back_copies() {
     renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
     bytes[5]^=0xff;
     const auto written=bytes;
-    check(renderer.land_write_backs(2,false) && bytes==written && renderer.stats().write_backs_dropped==1,
+    check(renderer.land_write_backs(2,true) && bytes==written && renderer.stats().write_backs_dropped==1,
           "a copy whose memory the game changed before it landed writes nothing");
     bytes.fill(0x11);
     renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    check(all(0x11),"memory keeps its bytes until the copy lands");
     renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
-    check(all(0x11) && renderer.land_write_backs(4,false) && bytes==expected && renderer.stats().write_backs==2 &&
-          renderer.stats().write_backs_dropped==2,"a copy replaced before it landed is dropped; the newer one lands");
+    check(bytes==expected && renderer.stats().write_backs==2 && renderer.stats().write_backs_dropped==1,
+          "a copy into memory an earlier copy has not reached yet lands that one first");
+    check(renderer.land_write_backs(4,true) && bytes==expected && renderer.stats().write_backs==3 &&
+          renderer.stats().write_backs_dropped==1,"the newer one lands after it");
     renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
     s=renderer.stats().direct;
     check(s.resident_hits==2,"the newer landed copy is sampled on the GPU");
@@ -997,6 +1001,20 @@ void written_back_copies() {
     const auto before=fake::read_pixels;
     renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
     check(renderer.write_backs_issued()==4 && fake::read_pixels==before,"copies outside write-back ranges stay on the GPU only");
+    // Two packed copies into separate ranges are read back in one buffer, stacked.
+    alignas(32) std::array<std::uint8_t,64> other{}; other.fill(0x33); bytes.fill(0x22);
+    alignas(32) std::array<std::uint8_t,64> second{};
+    for (std::size_t i=0;i<second.size();++i) second[i]=std::uint8_t((64+i)%251);
+    renderer.write_back(0x8000,64,true); renderer.write_back(0x9000,64,true);
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    renderer.copy_texture_resident(p,other.data(),other.size(),0x9000);
+    check(renderer.land_write_backs(6,true) && fake::read_pixels==before+1 && fake::pack_required==128 && bytes==expected &&
+          other==second && renderer.stats().write_backs==5,"packed copies are read back together and land each its own rows");
+    // Without a landing that needs it, a packed copy is read back once 2 ms pass without another.
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    check(renderer.land_write_backs(7,false) && fake::read_pixels==before+2 && renderer.stats().write_backs==6,
+          "a packed copy is read back after a quiet 2 ms");
     fake::map_pattern=false;
 }
 // JFWDisplay::clearEfb on every draw path: the Z texel becomes the fragment depth, the depth

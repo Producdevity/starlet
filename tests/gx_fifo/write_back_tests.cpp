@@ -1,6 +1,6 @@
-// A texture copy into a written-back range (Renderer::write_back), on the GLES renderer over a
-// recording GL fake: the copy's readback does not hold up the GPU thread, the token after the copy
-// is raised only once the copy's bytes are in memory, and the draw done stays behind it.
+// Texture copies into a written-back range (Renderer::write_back), on the GLES renderer over a
+// recording GL fake: no interrupt waits for a copy's readback, the bytes reach memory after it
+// arrives, and a later copy into the same memory lands the earlier one first.
 #include "starlet/compat/gx_fifo.h"
 #include "starlet/gx/texture_copy.hpp"
 #include "starlet/gx_fifo/gles_renderer.hpp"
@@ -78,6 +78,25 @@ std::array<std::uint8_t, copy_bytes> stored() {
 
 std::array<std::uint8_t, copy_bytes> expected;
 
+bool held() {
+    const auto start = std::chrono::steady_clock::now();
+    while (!fake::readback_held && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) std::this_thread::yield();
+    return fake::readback_held;
+}
+
+// Until `count` copies have landed. Two draw dones a round: the GPU thread finishes the first
+// one's command, landing what was read back by then, before it starts the second.
+bool lands(std::uint64_t count) {
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+        GXDrawDone();
+        GXDrawDone();
+        if (renderer->stats().write_backs == count) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
 int guest_main() {
     GXFifoObj fifo{};
     __GXFifoInit();
@@ -92,31 +111,38 @@ int guest_main() {
     });
     GXSetDrawDoneCallback([] { interrupts.push_back("done"); });
 
-    // The readback held on the GL thread: the token behind the copy is not raised meanwhile.
+    // The readback held on the GL thread: the token and the draw done behind the copy are raised
+    // meanwhile, with memory as it was.
     std::memset(destination, 0x11, copy_bytes);
     fake::hold_readbacks = true;
     copy();
     token(0x20);
     GXFlush();
-    const auto start = std::chrono::steady_clock::now();
-    while (!fake::readback_held && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) std::this_thread::yield();
-    require(fake::readback_held, "the copy is read back on the GL thread");
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    require(interrupts.empty() && destination[0] == 0x11, "the token waits for the copy's bytes");
-    fake::hold_readbacks = false;
+    require(held(), "the copy is read back on the GL thread");
     GXDrawDone();
-    require(interrupts == std::vector<std::string>{"token 32 copied", "done"},
-            "the token is raised with the copy in memory, the draw done after it");
-    require(renderer->stats().write_backs == 1, "the copy landed once");
+    require(interrupts == std::vector<std::string>{"token 32 stale", "done"} && destination[0] == 0x11,
+            "the token and the draw done do not wait for the copy's readback");
+    fake::hold_readbacks = false;
+    require(lands(1), "the copy's bytes reach memory once read back");
+    require(std::equal(expected.begin(), expected.end(), destination), "memory holds the copy");
     interrupts.clear();
 
-    // A ready readback: the copy is in memory by its token, and the draw done is not held.
+    // A second copy into the same memory while the first one's readback is held: the first lands
+    // before the second is made, and nothing is dropped.
     std::memset(destination, 0x22, copy_bytes);
+    fake::hold_readbacks = true;
+    copy();
+    GXFlush();
+    require(held(), "the first copy is read back on the GL thread");
     copy();
     token(0x21);
-    GXDrawDone();
-    require(interrupts == std::vector<std::string>{"token 33 copied", "done"}, "a copy read back at once lands by its token");
-    require(std::equal(expected.begin(), expected.end(), destination), "memory holds the copy afterwards");
+    GXFlush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    require(interrupts.empty() && destination[0] == 0x22, "the second copy waits for the first one's bytes");
+    fake::hold_readbacks = false;
+    require(lands(3), "both copies land");
+    require(interrupts.front() == "token 33 copied", "the token behind the second copy sees the first one's bytes");
+    require(renderer->stats().write_backs_dropped == 0, "no copy is dropped");
     require(gx_fifo::gpu_failure()[0] == 0, "no command stream failure");
     return 0;
 }
