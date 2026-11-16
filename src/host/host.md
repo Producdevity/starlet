@@ -87,6 +87,16 @@ unit circle, and the console's value at 1. `read_stick` returns the response as
 floats for a port that maps sticks itself; `stick_value` scales and rounds half
 away from zero.
 
+The `gamecube` shape models a real controller feeding the SDK's stick clamp. The
+SDL vector is limited to the unit circle and scaled to `gate_radius` (the raw
+value at full deflection, about 87 for the control stick and 74 for the C-stick),
+each axis loses `gate_dead_zone` (15), and the result is limited to an octagon:
+cardinal maximum `range`, diagonal corner (`gate_corner`, `gate_corner`), with a
+point beyond an edge scaled toward the centre onto it. The
+output is whole console units divided by `range`; `dead_zone`, `rescale`, `full`
+and `circle` do not apply. Control stick: `gate_radius` 87, `range` 72,
+`gate_corner` 40. C-stick: 74, 59, 31. Existing shapes are unchanged.
+
 The ports' layouts, reproduced in `tests/host/pad_tests.cpp` against
 transcriptions of their code:
 

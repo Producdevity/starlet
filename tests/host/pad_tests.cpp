@@ -283,6 +283,61 @@ void dead_zones() {
     require(stick_value(1, 200) == 127 && stick_value(-1, 200) == -128, "values stay within a signed byte");
 }
 
+void gamecube_sticks() {
+    const StickResponse main{Shape::gamecube, 0, false, 32767, false, 72, 87, 15, 40};
+    const StickResponse c{Shape::gamecube, 0, false, 32767, false, 59, 74, 15, 31};
+    const auto units = [](std::int16_t x, std::int16_t y, const StickResponse& r, int& ux, int& uy) {
+        const Stick s = read_stick(x, y, r);
+        ux = stick_value(s.x, r.range);
+        uy = stick_value(s.y, r.range);
+    };
+    int x = 0, y = 0;
+    units(0, 0, main, x, y);
+    require(x == 0 && y == 0, "gamecube centre reads 0");
+    // 15/87 of full deflection is the console's dead zone.
+    units(5500, -5500, main, x, y);
+    require(x == 0 && y == 0, "gamecube small deflection reads 0");
+    units(5500, 0, main, x, y);
+    require(x == 0, "gamecube stays 0 below the dead zone");
+    units(5650, 0, main, x, y);
+    require(x == 0 && y == 0, "gamecube stays 0 at the dead zone's edge");
+    units(32767, 0, main, x, y);
+    require(x == 72 && y == 0, "gamecube main stick cardinal reads 72");
+    units(0, -32768, main, x, y);
+    require(x == 0 && y == 72, "gamecube up is positive");
+    units(32767, 0, c, x, y);
+    require(x == 59 && y == 0, "gamecube C-stick cardinal reads 59");
+    units(23170, -23170, main, x, y);
+    require(x == 40 && y == 40, "gamecube main stick diagonal reads (40, 40)");
+    units(23170, -23170, c, x, y);
+    require(x == 31 && y == 31, "gamecube C-stick diagonal reads (31, 31)");
+    units(-32768, 32767, main, x, y);
+    require(x == -40 && y == -40, "gamecube diagonal is symmetric");
+    // 20 degrees: the octagon edge between (72, 0) and (40, 40), not the |x| + |y| diamond.
+    units(30791, -11207, main, x, y);
+    require(x == 61 && y == 14, "gamecube main stick at 20 degrees reads (61, 14)");
+    for (const StickResponse* r : {&main, &c}) {
+        for (int angle = 0; angle < 360; angle += 15) {
+            const float cs = std::cos(float(angle) * 3.14159265f / 180.f), sn = std::sin(float(angle) * 3.14159265f / 180.f);
+            int last = -1;
+            for (int len = 0; len <= 32767; len += 97) {
+                const auto px = std::int16_t(std::lround(cs * float(len))), py = std::int16_t(std::lround(sn * float(len)));
+                int ux, uy, mx, my;
+                units(px, py, *r, ux, uy);
+                units(std::int16_t(-px), std::int16_t(-py), *r, mx, my);
+                require(ux == -mx && uy == -my, "gamecube point symmetry");
+                const int high = std::max(std::abs(ux), std::abs(uy)), low = std::min(std::abs(ux), std::abs(uy));
+                require(r->gate_corner * high + (r->range - r->gate_corner) * low <= r->gate_corner * r->range + r->range,
+                        "gamecube stays within the octagon");
+                // The octagon's own norm: constant along an edge, so only rounding (one unit) may lower it.
+                const int mag = r->gate_corner * high + (r->range - r->gate_corner) * low;
+                require(mag + r->gate_corner >= last, "gamecube magnitude never falls as the stick moves out");
+                last = mag;
+            }
+        }
+    }
+}
+
 void layouts() {
     Gamepad pad;
     pad.connected = true;
@@ -427,6 +482,7 @@ int main(int argc, char** argv) {
     gc_recomp_reproduced();
     galaxy_reproduced();
     dead_zones();
+    gamecube_sticks();
     layouts();
     std::puts("pad: Pikmin 2, gc-recomp and Galaxy input reproduced; dead zones and layouts");
     return 0;

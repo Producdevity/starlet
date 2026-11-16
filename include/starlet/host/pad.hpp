@@ -44,6 +44,11 @@ struct StickResponse {
     enum class Shape : std::uint8_t {
         radial,  // the dead zone and scaling apply to the stick's length
         axial,   // they apply to each axis alone
+        // A GameCube controller's gate followed by the console's clamp: the vector is limited to the unit
+        // circle and scaled to gate_radius, each axis loses gate_dead_zone, and the result is limited to the
+        // octagon with cardinal maximum range and diagonal corner gate_corner. Ignores dead_zone, rescale,
+        // full and circle; the result is whole console units divided by range.
+        gamecube,
     };
     Shape shape = Shape::radial;
     int dead_zone = 0;     // raw deflection at or below this reads 0
@@ -51,6 +56,9 @@ struct StickResponse {
     float full = 32767;    // raw deflection that reads as 1
     bool circle = false;   // limit the length to 1
     int range = 0;         // the console's value for a deflection of 1
+    int gate_radius = 0;     // gamecube: the controller's raw value at full deflection
+    int gate_dead_zone = 15; // gamecube: raw value each axis loses
+    int gate_corner = 0;     // gamecube: the console's value on each axis at a full diagonal
 };
 // Up is positive, so y is SDL's negated. Each component lies within -1..1.
 struct Stick {

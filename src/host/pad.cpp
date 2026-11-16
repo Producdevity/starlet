@@ -14,6 +14,20 @@ float axis(int value, const StickResponse& response) {
     return std::clamp(float(live) / (response.full - float(response.dead_zone)), -1.f, 1.f);
 }
 
+Stick gamecube_stick(int raw_x, int raw_y, const StickResponse& response) {
+    float x = float(raw_x) / 32767.f, y = float(raw_y) / 32767.f;
+    const float length = std::hypot(x, y);
+    if (length > 1) x /= length, y /= length;
+    const float gate = float(response.gate_radius), dead = float(response.gate_dead_zone);
+    x = std::copysign(std::max(std::fabs(x) * gate - dead, 0.f), x);
+    y = std::copysign(std::max(std::fabs(y) * gate - dead, 0.f), y);
+    // The octagon's edges run from (range, 0) to (corner, corner); a point beyond one is scaled onto it.
+    const float range = float(response.range), corner = float(response.gate_corner);
+    const float high = std::max(std::fabs(x), std::fabs(y)), low = std::min(std::fabs(x), std::fabs(y));
+    const float over = std::max((corner * high + (range - corner) * low) / (corner * range), 1.f);
+    return {std::round(x / over) / range, std::round(y / over) / range};
+}
+
 std::uint8_t analog_trigger(std::int16_t value) { return std::uint8_t(std::clamp(value / 128, 0, 255)); }
 
 }
@@ -27,6 +41,7 @@ bool pressed(const Gamepad& pad, Input input, std::int16_t trigger_threshold) {
 Stick read_stick(std::int16_t x, std::int16_t y, const StickResponse& response) {
     // Negated as an int, so SDL's -32768 reads as full up.
     const int raw_x = x, raw_y = -int(y);
+    if (response.shape == StickResponse::Shape::gamecube) return gamecube_stick(raw_x, raw_y, response);
     Stick stick;
     if (response.shape == StickResponse::Shape::axial) {
         stick = {axis(raw_x, response), axis(raw_y, response)};
