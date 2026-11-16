@@ -30,6 +30,20 @@ struct Wait {
     long long start;
 };
 
+// Measures the scope's wall time and, separately, the part the calling thread did not spend on
+// the CPU ("<tag> blocked"): GL work that waits inside the driver.
+struct Task {
+    explicit Task(const char* tag);
+    ~Task();
+    Task(const Task&) = delete;
+    Task& operator=(const Task&) = delete;
+    const char* tag;
+    long long start, cpu;
+};
+
+// GL thread, after each swap: the interval since the previous one, counted by retraces (16.7 ms).
+void presented();
+
 void note(const char* cause, double ms);
 // A counted event (retrace, presentation) the report divides by; prints the report every 10 s.
 void tick(const char* counter);

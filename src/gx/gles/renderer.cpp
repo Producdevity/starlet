@@ -498,6 +498,11 @@ struct GlesRenderer::Impl {
             q.done.wait(lock, [&] { return (q.post ? q.submitted - q.completed : q.queue.size()) < 32 || q.failure; });
         }
         if (q.failure) std::rethrow_exception(q.failure);
+        if (sync_stats::enabled()) {
+            // Diagnostics: each task's wall and CPU time on the GL thread, by the caller's context.
+            const char* tag = sync_stats::context("gl: other");
+            op = [tag, inner = std::move(op)] { sync_stats::Task timed(tag); inner(); };
+        }
         const auto target = ++q.submitted;
         if (q.post) {
             lock.unlock();
@@ -1356,6 +1361,7 @@ void main(){
     void flush_copies() {
         if (pending_copies.empty()) return;
         auto& g = *this;
+        sync_stats::Context ctx("gl: resident copies");
         g.execute([&g, copies = std::move(pending_copies)] {
             try { g.render_copies(copies); } catch (...) { g.failed = true; throw; }
         }, false);
@@ -1490,6 +1496,7 @@ void GlesRenderer::clear_efb(const EfbClear& operation) {
         r.width>g.efb_width-r.x || r.height>g.efb_height-r.y || operation.depth>0xffffff)
         throw std::invalid_argument("invalid native GLES EFB clear rectangle");
     if (!r.width || !r.height) return;
+    sync_stats::Context ctx("gl: clear");
     g.execute([&g, operation] { g.clear_efb_gl(operation); }, false);
 }
 void GlesRenderer::begin_offscreen() {
@@ -1880,6 +1887,7 @@ void GlesRenderer::copy_display(const DisplayCopy &p, std::uint8_t *destination,
     if (old != g.copy_serials.end()) g.copy_serials.erase(old);
     else if (g.copy_serials.size() == 8) g.copy_serials.pop_front();
     g.copy_serials.emplace_back(destination, serial);
+    sync_stats::Context ctx("gl: display copy");
     g.execute([&g, p, destination] { g.copy_display_gl(p, destination); }, false);
 }
 void GlesRenderer::Impl::copy_display_gl(const DisplayCopy& p, std::uint8_t* destination) {
@@ -2056,6 +2064,7 @@ bool GlesRenderer::present_framebuffer(const FramebufferView &f, int width, int 
         if (g.presented == next) return false;
         g.presented = next;
     }
+    sync_stats::Context ctx("gl: present");
     g.execute([&g, f, width, height, black] { g.present_gl(f, width, height, black); }, false);
     if (g.direct) g.direct->next_frame();
     return true;
@@ -2104,6 +2113,7 @@ void GlesRenderer::Impl::present_gl(const FramebufferView& f, int width, int hei
         gl_check("native VI YUYV presentation");
         ++g.stats.presentations;
         if (g.swap) { sync_stats::Wait blocked("swap (vsync)"); g.swap(); }
+        sync_stats::presented();
     } catch (...) {
         g.failed = true;
         throw;
@@ -2181,6 +2191,7 @@ int GlesRenderer::Impl::snapshot(const EfbRegion& requested, int scale) {
     g.snapshot_mapped_from[index] = std::size_t(row0) * 2 * std::size_t(columns) * 4;
     g.snapshot_mapped_bytes[index] = std::size_t(row_count) * 2 * std::size_t(columns) * 4;
     const auto generation = g.snapshot_generation[index].fetch_add(1, std::memory_order_relaxed) + 1;
+    sync_stats::Context ctx("gl: snapshot pack");
     g.execute([&g, index, generation, scale, row0, row_count, column0, column_count] {
         try {
             if (index == g.snapshots.size()) g.snapshots.emplace_back();

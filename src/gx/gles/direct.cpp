@@ -8,6 +8,7 @@
 
 #include <GLES3/gl32.h>
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -336,6 +337,7 @@ struct GlesDirect::Impl {
         if (open_stream_page < 0) return;
         auto& page = stream_pages[open_stream_page];
         pending.push_back([buffer = page.buffer, data = std::move(page.data)] {
+            sync_stats::Task timed("seg: stream page data");
             glBindVertexArray(0);
             glBindBuffer(GL_ARRAY_BUFFER, buffer);
             glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(data->size()), data->data(), GL_STATIC_DRAW);
@@ -933,6 +935,7 @@ struct GlesDirect::Impl {
     }
     // Runs GL work after all previously submitted work, on the thread owning the context.
     void run_gl(std::function<void()> op, bool wait) {
+        sync_stats::Context ctx(sync_stats::context("gl: segment"));
         if (target.execute) target.execute(std::move(op), wait);
         else op();
     }
@@ -1310,6 +1313,7 @@ struct GlesDirect::Impl {
         for (const auto& level : levels) entry.bytes += level.rgba.size();
         entry.name = take(Kind::texture);
         pending.push_back([name = entry.name, image] {
+            sync_stats::Task timed("seg: texture upload");
             const auto& levels = image->levels();
             glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, name);
             glTexStorage2D(GL_TEXTURE_2D, static_cast<GLsizei>(levels.size()), GL_RGBA8, levels[0].width, levels[0].height);
@@ -1628,6 +1632,7 @@ struct GlesDirect::Impl {
         crops.push_back({token, width, height, t.texture, t.framebuffer});
         pending.push_back([source = GLuint(c.framebuffer), from = GLuint(c.texture), texture = t.texture,
                            framebuffer = t.framebuffer, width, height] {
+            sync_stats::Task timed("seg: crop copy");
             copy_swizzle(from, texture);
             blit_rows(source, framebuffer, width, 0, height);
         });
@@ -1659,6 +1664,7 @@ struct GlesDirect::Impl {
         const unsigned first = unsigned(c.plan.destination_height()), width = d.width;
         pending.push_back([source = GLuint(c.framebuffer), from = GLuint(c.texture), texture = t.texture,
                            framebuffer = t.framebuffer, width, first, rows] {
+            sync_stats::Task timed("seg: extend copy");
             copy_swizzle(from, texture);
             // The tail from memory first: an upload into a texture the GPU has yet to write would wait for it.
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
@@ -1729,6 +1735,7 @@ struct GlesDirect::Impl {
         if (!texture) {
             texture = take(Kind::texture); framebuffer = take(Kind::framebuffer);
             pending.push_back([texture, framebuffer, width, height] {
+                sync_stats::Task timed("seg: copy target");
                 glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, texture);
                 glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width, height);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
@@ -2033,6 +2040,7 @@ struct GlesDirect::Impl {
             std::memcpy(packed->data() + places[i].indices, g->data.data() + g->index_offset, g->data.size() - g->index_offset);
         }
         pending.push_back([buffer = a.buffer, packed] {
+            sync_stats::Task timed("seg: geometry arena data");
             glBindVertexArray(0);
             glBindBuffer(GL_ARRAY_BUFFER, buffer);
             glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(packed->size()), packed->data(), GL_STATIC_DRAW);
@@ -2162,6 +2170,7 @@ struct GlesDirect::Impl {
         g.bytes += g.data.size(); // CPU copy until packed.
         g.buffer = take(Kind::buffer);
         pending.push_back([buffer = g.buffer, data = g.data] {
+            sync_stats::Task timed("seg: geometry data");
             glBindVertexArray(0);
             glBindBuffer(GL_ARRAY_BUFFER, buffer);
             glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(data.size()), data.data(), GL_STATIC_DRAW);
@@ -2914,12 +2923,12 @@ struct GlesDirect::Impl {
     // GL thread: creations, then the segment's draws, then deletions.
     void execute(const std::shared_ptr<Segment>& segment_data) {
         auto& seg = *segment_data;
-        for (auto& op : seg.before) op();
+        { sync_stats::Task timed("seg: creations"); for (auto& op : seg.before) op(); }
         if (!seg.records.empty()) draw_segment(seg);
         // After the visible draws, so their programs reach the builder first.
         for (Program* p : seg.warm)
             if (!p->name && !p->rejected && builder && builder->running()) ready(*p);
-        for (auto& op : seg.after) op();
+        { sync_stats::Task timed("seg: deletions"); for (auto& op : seg.after) op(); }
         seg.before.clear(); seg.after.clear(); seg.warm.clear(); seg.records.clear(); seg.states.clear(); seg.runs.clear();
         seg.dynamic_vertices.clear();
         seg.vertices.clear(); seg.uniforms.clear(); seg.indices.clear();
@@ -2930,6 +2939,7 @@ struct GlesDirect::Impl {
     void draw_segment(const Segment& seg) {
         ++gl_segments;
         const auto& records = seg.records; const auto& states = seg.states; const auto& runs = seg.runs;
+        std::optional<sync_stats::Task> phase(std::in_place, "seg: buffer data");
         if (!seg.dynamic_vertices.empty()) {
             glBindBuffer(GL_ARRAY_BUFFER, dynamic_vbo);
             glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(seg.dynamic_vertices.size()), seg.dynamic_vertices.data(), GL_STREAM_DRAW);
@@ -2941,6 +2951,8 @@ struct GlesDirect::Impl {
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(seg.indices.size() * 4), seg.indices.data(), GL_STREAM_DRAW);
         glBindBuffer(GL_UNIFORM_BUFFER, ubo);
         glBufferData(GL_UNIFORM_BUFFER, static_cast<GLsizeiptr>(seg.uniforms.size()), seg.uniforms.data(), GL_STREAM_DRAW);
+        phase.reset();
+        phase.emplace("seg: draws");
         const bool depth = std::any_of(records.begin(), records.end(), [&](const Record& r) {
             const auto& raster = seg.raster_states[states[r.state].raster].raster;
             return raster.depth_test && (raster.depth_compare != 7 || raster.depth_write);

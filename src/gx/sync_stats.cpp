@@ -1,6 +1,7 @@
 #include "starlet/gx/sync_stats.hpp"
 
 #include <pthread.h>
+#include <time.h>
 
 #include <chrono>
 #include <cstdio>
@@ -49,6 +50,45 @@ const char* context(const char* fallback) { return current_context ? current_con
 
 Wait::Wait(const char* c) : cause(c), start(st().on ? now_ns() : 0) {}
 Wait::~Wait() { if (start) note(cause, double(now_ns() - start) / 1e6); }
+
+namespace {
+long long cpu_ns() {
+    timespec t{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return (long long)t.tv_sec * 1000000000ll + t.tv_nsec;
+}
+}
+Task::Task(const char* t) : tag(t), start(st().on ? now_ns() : 0), cpu(st().on ? cpu_ns() : 0) {}
+Task::~Task() {
+    if (!start) return;
+    const double wall = double(now_ns() - start) / 1e6, used = double(cpu_ns() - cpu) / 1e6;
+    note(tag, wall);
+    std::string blocked = std::string(tag) + " blocked";
+    auto& s = st();
+    char name[32] = "?";
+    pthread_getname_np(pthread_self(), name, sizeof name);
+    std::lock_guard<std::mutex> lock(s.mutex);
+    auto& e = s.entries[{blocked, name}];
+    const double ms = wall > used ? wall - used : 0;
+    ++e.count;
+    e.ms += ms;
+    if (ms > e.max_ms) e.max_ms = ms;
+}
+
+void presented() {
+    auto& s = st();
+    if (!s.on) return;
+    static long long last = 0;
+    const long long now = now_ns();
+    if (last) {
+        const double ms = double(now - last) / 1e6;
+        const char* bucket = ms < 25 ? "present interval <=1 retrace" : ms < 41.7 ? "present interval 2 retraces"
+                             : ms < 58.4 ? "present interval 3 retraces" : ms < 75 ? "present interval 4 retraces"
+                             : "present interval 5+ retraces";
+        note(bucket, ms);
+    }
+    last = now;
+}
 
 void note(const char* cause, double ms) {
     auto& s = st();
