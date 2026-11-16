@@ -2,7 +2,8 @@
 // keeps on the GPU: the transfers see memory as the console has it once the copy has run. A read
 // gets the copy's bytes, a write replaces them, and a later read of a partly written copy gets the
 // copy's remaining bytes beside the written ones. Transfers reaching no byte a copy still owns
-// return without the GPU thread, and none takes memory from the game's heap.
+// return without the GPU thread, none takes memory from the game's heap, and a guest thread waiting
+// for the GPU thread takes interrupts.
 #include "starlet/ar/ar.hpp"
 #include "starlet/compat/gx_fifo.h"
 #include "starlet/dvd/dvd.hpp"
@@ -216,6 +217,23 @@ int guest_main() {
     require(!timed_out, "transfers reaching no resident byte do not wait for the GPU thread");
     require(stats().materialized == 3 && stats().dma_settled == settled + 1 && !renderer->resident_in(z, copy_bytes),
             "only the read reaching the copy was settled by the renderer");
+
+    // A guest thread waiting for the GPU thread takes interrupts, as the console's CPU did while it
+    // waited: an interrupt raised during the wait runs before the wait ends.
+    copy_to(z);
+    fake::hold_readbacks = true;
+    std::atomic<bool> handled{false}, handled_while_waiting{false};
+    std::thread raiser([&handled, &handled_while_waiting] {
+        while (!fake::readback_held) std::this_thread::yield();
+        os::raise_interrupt([&handled] { handled = true; });
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!handled && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        handled_while_waiting = handled.load();
+        fake::hold_readbacks = false;
+    });
+    os::before_dma_read(z, copy_bytes);
+    raiser.join();
+    require(handled_while_waiting, "an interrupt raised while a guest thread waits for the GPU thread runs during the wait");
 
     // A guest thread whose game heap is gone reaches the GPU thread without allocating from it.
     os::set_game_heap(gone_heap());

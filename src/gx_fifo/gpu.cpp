@@ -10,6 +10,7 @@
 #include "starlet/gx/sync_stats.hpp"
 #include "starlet/gx_fifo/renderer.hpp"
 #include "starlet/os/game_memory.hpp"
+#include "starlet/os/guest_cpu.hpp"
 #include "starlet/os/host_allocation.hpp"
 #include "starlet/os/os_core.hpp"
 #include "starlet/os/thread_name.hpp"
@@ -350,11 +351,19 @@ public:
         ++posted_;
         wake_.notify_one();
     }
+    // The console's CPU took interrupts while it waited for the GPU, so a guest thread that waits
+    // here takes pending ones; the audio DMA interrupt would otherwise wait for the whole drain.
     void drain() {
         std::unique_lock<std::mutex> lock(mutex_);
         const std::uint64_t target = posted_;
         gx::sync_stats::Wait blocked(gx::sync_stats::context("drain-other"));
-        done_.wait(lock, [&] { return completed_ >= target; });
+        const bool take_interrupts = os::on_guest_thread() && !os::in_interrupt();
+        while (!done_.wait_for(lock, std::chrono::milliseconds(1), [&] { return completed_ >= target; })) {
+            if (!take_interrupts || !os::interrupt_pending()) continue;
+            lock.unlock();
+            os::checkpoint();
+            lock.lock();
+        }
     }
     bool idle() {
         std::lock_guard<std::mutex> lock(mutex_);

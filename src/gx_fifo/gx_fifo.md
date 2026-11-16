@@ -138,7 +138,10 @@ transfer whose range may hold results the renderer keeps off memory
 before it and then the renderer's `before_dma_read` or `before_dma_write`; other
 transfers do not wait. The GPU and GL threads never wait for a guest or DMA
 thread. Calls handed to the GPU thread are allocated from the host, since a
-guest thread's game heap may be gone at a transfer.
+guest thread's game heap may be gone at a transfer. A guest thread waiting for
+the GPU thread (these transfers, `GXDrawDone`, peeks) takes pending interrupts
+during the wait, as the console's CPU did, so the audio DMA's interrupt is not
+held for the whole wait.
 
 ## Diagnostics
 
