@@ -1,5 +1,6 @@
 // The guest CPU runs one thread at a time by Dolphin OS priority, switches only
-// inside OS calls, and delivers interrupts on its interrupt thread.
+// inside OS calls, and takes interrupts on the running thread, or on its interrupt thread while
+// no thread runs.
 #include "starlet/os/game_memory.hpp"
 #include "starlet/os/guest_cpu.hpp"
 #include "starlet/os/os_core.hpp"
@@ -188,6 +189,110 @@ void stacks_return() {
     expect(ran == 300, "300 short-lived threads ran in a pool of 63 stacks");
 }
 
+// The switch trace (set_switch_trace) names each hand-over: a message to a higher-priority
+// thread preempts the sender, which stays ready and gets the CPU back when the receiver sleeps.
+std::vector<std::pair<char, std::uint32_t>> switches;
+void record_switch(char kind, std::uint32_t value) { switches.push_back({kind, value}); }
+
+void* answer(void*) {
+    for (;;) {
+        OSMessage message;
+        OSReceiveMessage(&queue, &message, OS_MESSAGE_BLOCK);
+        if (!message) return nullptr;
+        ++shared;
+    }
+}
+
+void preempting_messages() {
+    OSInitMessageQueue(&queue, messages, 4);
+    shared = 0;
+    OSCreateThread(&thread_a, answer, nullptr, stack_a + sizeof stack_a, sizeof stack_a, 15, 0);
+    OSResumeThread(&thread_a);  // Runs at once and sleeps on the empty queue.
+    starlet::os::set_switch_trace(record_switch);
+    OSSendMessage(&queue, reinterpret_cast<OSMessage>(std::uintptr_t{1}), OS_MESSAGE_BLOCK);
+    starlet::os::set_switch_trace(nullptr);
+    expect(shared == 1, "the receiver answered before the sender went on");
+    std::string kinds;
+    for (const auto& s : switches) kinds += s.first;
+    expect(kinds == "xhgxhg", "sender let go, receiver ran, sender resumed");
+    if (kinds == "xhgxhg") {
+        expect((switches[0].second & 0xff) == (17 | 0x80), "the sender stayed ready");
+        expect((switches[1].second & 0x7f) == 16 && (switches[2].second & 0x7f) == 16, "the receiver got the CPU");
+        expect((switches[3].second & 0xff) == 16, "the receiver slept");
+        expect((switches[4].second & 0x7f) == 17 && (switches[5].second & 0x7f) == 17, "the sender got it back");
+    }
+    // Many such round trips, as a game's draw-sync manager makes them, keep one thread on the CPU.
+    static std::atomic<int> inside{0};
+    static std::atomic<bool> overlap{false};
+    std::atomic<bool> stop{false};
+    std::thread interrupter([&] {
+        while (!stop.load()) {
+            starlet::os::raise_interrupt([] {
+                if (inside.fetch_add(1) != 0) overlap = true;
+                inside.fetch_sub(1);
+            });
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    });
+    for (int i = 0; i < 2000; ++i) {
+        if (inside.fetch_add(1) != 0) overlap = true;
+        inside.fetch_sub(1);
+        OSSendMessage(&queue, reinterpret_cast<OSMessage>(std::uintptr_t{1}), OS_MESSAGE_BLOCK);
+    }
+    stop = true;
+    interrupter.join();
+    OSSendMessage(&queue, nullptr, OS_MESSAGE_BLOCK);
+    OSJoinThread(&thread_a, nullptr);
+    expect(shared == 2001, "every message answered in turn");
+    expect(!overlap, "guest code never ran on two threads at once");
+}
+
+// An interrupt that arrives while a thread runs is taken on that thread, as on the console: no
+// hand-over to the interrupt thread and back. A thread the handler wakes with a better priority
+// runs before the interrupted one goes on.
+void* note_woken(void*) {
+    trace += 'w';
+    return nullptr;
+}
+
+void interrupts_in_place() {
+    trace.clear();
+    switches.clear();
+    OSInitThreadQueue(&alarm_waiters);
+    OSCreateThread(&thread_b, [](void*) -> void* {
+        OSSleepThread(&alarm_waiters);
+        return note_woken(nullptr);
+    }, nullptr, stack_b + sizeof stack_b, sizeof stack_b, 10, 0);
+    OSResumeThread(&thread_b);  // Runs at once and sleeps.
+    static std::thread::id handler_thread;
+    static OSThread* handler_current = nullptr;
+    static bool handler_in_interrupt = false;
+    const BOOL enabled = OSDisableInterrupts();
+    std::thread([] {
+        starlet::os::raise_interrupt([] {
+            handler_thread = std::this_thread::get_id();
+            handler_current = OSGetCurrentThread();
+            handler_in_interrupt = starlet::os::in_interrupt();
+            trace += 'h';
+            OSWakeupThread(&alarm_waiters);
+            trace += 'H';
+        });
+    }).join();
+    starlet::os::set_switch_trace(record_switch);
+    OSRestoreInterrupts(enabled);
+    trace += 'm';
+    starlet::os::set_switch_trace(nullptr);
+    OSJoinThread(&thread_b, nullptr);
+    expect(handler_thread == std::this_thread::get_id(), "the handler ran on the interrupted thread");
+    expect(handler_current == OSGetCurrentThread(), "OSGetCurrentThread in the handler names the interrupted thread");
+    expect(handler_in_interrupt, "in_interrupt during the handler");
+    expect(!starlet::os::in_interrupt(), "not in an interrupt after it");
+    expect(trace == "hHwm", "the woken thread runs after the handler, before the interrupted thread goes on");
+    std::string kinds;
+    for (const auto& s : switches) kinds += s.first;
+    expect(kinds == "ijxhgxhg", "no hand-over for the interrupt; one each way for the woken thread");
+}
+
 int run_tests() {
     priorities();
     messages_block();
@@ -197,6 +302,8 @@ int run_tests() {
     disabled_interrupts();
     wait_for_interrupt();
     stacks_return();
+    preempting_messages();
+    interrupts_in_place();
     return failures;
 }
 

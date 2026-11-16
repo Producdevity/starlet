@@ -60,7 +60,6 @@ std::atomic<bool> pending_flag{false};
 std::unordered_map<OSThread*, Guest*> guests;
 int scheduler_disabled = 0;
 Guest interrupt_guest;
-OSThread* interrupted = nullptr;  // The guest thread an interrupt delivery preempted.
 OSThread* last_guest = nullptr;
 thread_local Guest* self = nullptr;
 std::atomic<SwitchTrace> switch_trace{nullptr};
@@ -201,18 +200,58 @@ void switch_away(std::unique_lock<std::mutex>& lock) {
     wait_turn(g, lock);
 }
 
-// Lets a better thread run. A yield also gives way to equal priority. The
-// interrupt thread is eligible only while this thread has interrupts enabled.
+thread_local bool handling_in_place = false;
+
+// Runs the pending interrupt handlers on the running thread, as the console's CPU takes an
+// interrupt on the thread it interrupts, instead of handing the CPU to the interrupt thread and back.
+void handle_in_place(Guest* g, std::unique_lock<std::mutex>& lock) {
+    handling_in_place = true;
+    in_handler.store(true, std::memory_order_relaxed);
+    const bool enabled = g->interrupts;
+    while (!pending.empty()) {
+        auto handler = std::move(pending.front());
+        pending.pop_front();
+        pending_flag.store(!pending.empty(), std::memory_order_release);
+        g->interrupts = false;
+        lock.unlock();
+        {
+            host_allocation_scope host_;
+            handler();
+        }
+        lock.lock();
+    }
+    dequeue(&interrupt_guest);
+    g->interrupts = enabled;
+    in_handler.store(false, std::memory_order_relaxed);
+    handling_in_place = false;
+}
+
+// Takes pending interrupts while this thread has interrupts enabled, then lets a
+// better thread run. A yield also gives way to equal priority.
 void reschedule(std::unique_lock<std::mutex>& lock, bool yield) {
     Guest* g = self;
-    if (!g || running != g || g->interrupt_thread) return;
+    if (!g || running != g || g->interrupt_thread || handling_in_place) return;
     if (scheduler_disabled && !yield) return;
     const int mine = slot(g);
-    int best = priority_slots;
-    for (int i = g->interrupts ? 0 : 1; i < priority_slots; ++i)
-        if (!ready[i].empty()) { best = i; break; }
+    const auto best_slot = [g] {
+        for (int i = g->interrupts ? 0 : 1; i < priority_slots; ++i)
+            if (!ready[i].empty()) return i;
+        return priority_slots;
+    };
+    int best = best_slot();
+    if (best == 0) {
+        if (const auto trace = switch_trace.load(std::memory_order_relaxed)) trace('i', std::uint32_t(mine));
+        handle_in_place(g, lock);
+        if (const auto trace = switch_trace.load(std::memory_order_relaxed)) trace('j', std::uint32_t(mine));
+        if (g->os->suspend > 0) {
+            // A handler suspended the thread it interrupted.
+            g->os->state = OS_THREAD_STATE_READY;
+            switch_away(lock);
+            return;
+        }
+        best = best_slot();
+    }
     if (best < mine || (yield && best <= mine)) {
-        if (best == 0) interrupted = g->os;
         enqueue(g);
         switch_away(lock);
     }
@@ -249,7 +288,6 @@ void interrupt_loop() {
             lock.lock();
         }
         in_handler.store(false, std::memory_order_relaxed);
-        interrupted = nullptr;
         trace_release(&interrupt_guest);
         running = nullptr;
         dispatch();
@@ -335,7 +373,7 @@ void require_guest(const char* call) {
 // OSSleepThread with the scheduler locked.
 void sleep_on(OSThreadQueue* queue, std::unique_lock<std::mutex>& lock) {
     Guest* g = self;
-    if (g->interrupt_thread) throw std::logic_error("an interrupt handler tried to sleep");
+    if (g->interrupt_thread || handling_in_place) throw std::logic_error("an interrupt handler tried to sleep");
     g->os->state = OS_THREAD_STATE_WAITING;
     g->os->queue = queue;
     add_by_priority(queue, g->os);
@@ -384,7 +422,7 @@ bool interrupt_pending() { return pending_flag.load(std::memory_order_acquire); 
 
 bool on_guest_thread() { return self != nullptr; }
 
-bool in_interrupt() { return self == &interrupt_guest; }
+bool in_interrupt() { return self == &interrupt_guest || handling_in_place; }
 
 std::size_t guest_thread_count() {
     host_allocation_scope host_;  // Scheduler containers must not take game memory.
@@ -445,7 +483,7 @@ void OSInitThreadQueue(OSThreadQueue* queue) { init_queue(queue); }
 
 OSThread* OSGetCurrentThread() {
     if (!self) return nullptr;
-    if (self->interrupt_thread) return interrupted ? interrupted : last_guest;
+    if (self->interrupt_thread) return last_guest;
     return self->os;
 }
 
@@ -570,7 +608,7 @@ s32 OSSuspendThread(OSThread* thread) {
     const s32 previous = thread->suspend++;
     if (previous == 0) {
         Guest* g = guest_of(thread);
-        if (g && g == self && running == g) {
+        if (g && g == self && running == g && !handling_in_place) {
             thread->state = OS_THREAD_STATE_READY;
             switch_away(lock);
         } else if (g) {

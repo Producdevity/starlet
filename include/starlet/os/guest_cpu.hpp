@@ -14,9 +14,10 @@ namespace starlet::os {
 // threads, one at a time, chosen by OS priority as the Dolphin OS scheduler
 // chooses them. Switches happen inside OS calls: a blocking call, a wakeup
 // that readies a higher-priority thread, a yield, or a checkpoint that finds an
-// interrupt pending. Interrupt handlers run on a dedicated guest thread that
-// outranks every OS priority and is eligible whenever the running thread has
-// interrupts enabled, so game code never runs concurrently with game code.
+// interrupt pending. Interrupt handlers run on the running thread when it has
+// interrupts enabled, as the console's CPU takes them, and on a dedicated
+// interrupt thread when no thread runs, so game code never runs concurrently
+// with game code.
 
 // Host service threads (timers, disc, audio) queue interrupt handlers here.
 // Handlers run in order with the CPU held and interrupts disabled.
@@ -39,16 +40,17 @@ void wait_for_interrupt();
 // True on a guest thread (including the interrupt thread).
 bool on_guest_thread();
 
-// The interrupt thread is running handlers.
+// Interrupt handlers are running on this thread.
 bool in_interrupt();
 
 // Number of guest threads that currently exist, for diagnostics.
 std::size_t guest_thread_count();
 
 // Diagnostics: called with the scheduler locked when the CPU is handed to a thread ('h'), when that
-// thread resumes ('g') and when it lets go ('x'). The value's low 7 bits are the thread's priority
-// plus one (0: the interrupt thread). For 'x', bit 7 is set when the thread stays ready (preempted)
-// and the bits above hold the thread CPU time of that turn in microseconds.
+// thread resumes ('g') and when it lets go ('x'), and around interrupt handlers the running thread
+// takes ('i', 'j'). The value's low 7 bits are the thread's priority plus one (0: the interrupt
+// thread). For 'x', bit 7 is set when the thread stays ready (preempted) and the bits above hold the
+// thread CPU time of that turn in microseconds.
 using SwitchTrace = void (*)(char kind, std::uint32_t value);
 void set_switch_trace(SwitchTrace trace);
 

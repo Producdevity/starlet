@@ -11,7 +11,8 @@ namespace starlet::gx_fifo {
 //   e GXWaitDrawDone returned  S VISetNextFrameBuffer
 //   F VIFlush                  P present on the GPU thread
 //   w VIWaitForRetrace returned
-//   h, g, x guest CPU handed to a thread, resumed, let go (starlet/os/guest_cpu.hpp set_switch_trace)
+//   h, g, x guest CPU handed to a thread, resumed, let go; i, j interrupt handlers on the running
+//   thread (starlet/os/guest_cpu.hpp set_switch_trace)
 // Ports add their own (for example W for the swap on their GL thread).
 
 // Starts recording; the last 262144 events are kept. Call before the game starts.
