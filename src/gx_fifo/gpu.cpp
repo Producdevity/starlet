@@ -636,7 +636,9 @@ private:
                 while (!pending_.empty() && jobs_.empty()) {
                     if (wake_.wait_for(lock, std::chrono::milliseconds(1), [&] { return !jobs_.empty(); })) break;
                     lock.unlock();
-                    if (!settle(pending_.front())) {
+                    // The GL thread publishes a write-back's readback within a millisecond of its
+                    // fence, so the GPU thread polls for it and stays free for new commands.
+                    if (renderer_.land_write_backs(pending_.front().write_backs, false) && !settle(pending_.front())) {
                         gx::sync_stats::Context ctx("token-snapshot-wait");
                         gx::sync_stats::Wait blocked("token-snapshot-wait (gpu)");
                         renderer_.wait_snapshot(awaited_snapshot());
@@ -704,6 +706,9 @@ private:
         std::uint16_t token;
         int snapshot;
         std::array<int, max_peek_lag> fallbacks{{-1, -1, -1}};
+        // Copies to written-back memory issued before the interrupt (Renderer::write_back):
+        // it is raised only once their bytes are in memory.
+        std::uint64_t write_backs = 0;
     };
     std::deque<Interrupt> pending_;
     // Draw-sync callbacks that read the EFB, by token value and its ordinal among that value's
@@ -804,8 +809,9 @@ private:
             renderer_.release_snapshot(i.snapshot);
         }
     }
-    void deliver(const Interrupt& i) {
-        if (pending_.empty() && i.snapshot < 0) return raise(i);
+    void deliver(Interrupt i) {
+        i.write_backs = renderer_.write_backs_issued();
+        if (pending_.empty() && i.snapshot < 0 && renderer_.land_write_backs(i.write_backs, false)) return raise(i);
         pending_.push_back(i);
         pump();
     }
@@ -815,6 +821,7 @@ private:
         static const char* const answered[max_peek_lag + 1] = {
             "token: answered from last frame's snapshot", "token: answered from the snapshot two frames back",
             "token: answered from the snapshot three frames back", "token: answered from the snapshot four frames back"};
+        if (!renderer_.land_write_backs(i.write_backs, false)) return false;
         if (i.snapshot >= 0 && !renderer_.snapshot_ready(i.snapshot)) {
             unsigned k = 0;
             while (k < max_peek_lag && i.fallbacks[k] >= 0 && !renderer_.snapshot_ready(i.fallbacks[k])) ++k;
@@ -831,6 +838,8 @@ private:
         return true;
     }
     void pump() {
+        // Copies read back since are written now, whether or not an interrupt waits for them.
+        renderer_.land_write_backs(renderer_.write_backs_issued(), false);
         while (!pending_.empty() && settle(pending_.front())) {
             const Interrupt i = pending_.front();
             pending_.pop_front();

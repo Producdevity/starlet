@@ -53,6 +53,14 @@ bool GlesResidentCopy::stamped(std::size_t block) const {
     return std::memcmp(destination + block * 32, &word, sizeof word) == 0;
 }
 bool GlesResidentCopy::intact() const {
+    if (expected) {
+        std::size_t from = 0;
+        for (const auto& r : covered) {
+            if (from < r.first && std::memcmp(destination + from, expected->data() + from, r.first - from) != 0) return false;
+            from = std::max(from, r.second);
+        }
+        return from >= bytes || std::memcmp(destination + from, expected->data() + from, bytes - from) == 0;
+    }
     return !stamp || sampled_blocks(bytes / 32, [this](std::size_t block) {
         return covers(block * 32, block * 32 + 32) || stamped(block);
     });
@@ -1462,6 +1470,16 @@ struct GlesDirect::Impl {
             if (seen.insert(text).second) std::fprintf(stderr, "%s\n", text);
         }
     }
+    // A written-back copy compares all its memory, so lookups do that once a frame: Super Mario
+    // Sunshine samples its goop map in some 30 draws a frame. A CPU write later in the frame is
+    // seen at the next frame's first lookup.
+    bool intact(const GlesResidentCopy& c) const {
+        if (!c.expected) return c.intact();
+        if (c.verified == frame) return true;
+        if (!c.intact()) return false;
+        c.verified = frame;
+        return true;
+    }
     GLuint resident(const TextureDescriptor& d, unsigned levels, MemoryReader& memory) {
         const auto bytes = texture_source_bytes(d, levels);
         auto found = overlapping(d.address, bytes);
@@ -1480,13 +1498,13 @@ struct GlesDirect::Impl {
             // With the copy's stride, texel (x, y) of a lookup no larger than the copy is the copy's texel (x, y).
             if (found[0]->first == d.address && levels == 1 && static_cast<unsigned>(d.format) == texture_copy_sample_format(p) &&
                 d.width <= width && d.height <= height &&
-                p.stride == std::size_t{(d.width + tile_width - 1u) / tile_width} * tile_bytes && c.intact()) {
+                p.stride == std::size_t{(d.width + tile_width - 1u) / tile_width} * tile_bytes && intact(c)) {
                 ++stats.resident_hits;
                 if (d.width == width && d.height == height) return c.texture;
                 return crop(found[0]->first, c, d.width, d.height);
             }
             if (found[0]->first == d.address && static_cast<unsigned>(d.format) == texture_copy_sample_format(p) &&
-                texture_copy_extends(p, d, levels) && c.intact()) {
+                texture_copy_extends(p, d, levels) && intact(c)) {
                 ++stats.resident_hits;
                 return extend(found[0]->first, c, d, memory);
             }
@@ -1699,7 +1717,8 @@ struct GlesDirect::Impl {
     void retire_shadowed(const GlesResidentCopy& c) {
         retire_target(int(c.plan.destination_width()), int(c.plan.destination_height()), c.texture, c.framebuffer);
     }
-    GlesDirect::ResidentTarget resident_copy(const TextureCopy& p, std::uint32_t token, std::uint8_t* destination, std::size_t capacity) {
+    GlesDirect::ResidentTarget resident_copy(const TextureCopy& p, std::uint32_t token, std::uint8_t* destination, std::size_t capacity,
+                                             std::uint64_t write_back) {
         const auto bytes = texture_copy_bytes(p);
         // Overlapped copies keep the bytes outside this one on the GPU until a lookup needs them.
         for (auto it : overlapping(token, bytes)) {
@@ -1718,7 +1737,11 @@ struct GlesDirect::Impl {
         const auto t = target_of(p.destination_width(), p.destination_height());
         auto& entry = copies[token];
         entry = {token, bytes, t.texture, t.framebuffer, p, destination, capacity};
-        if (limits.stamp_resident_copies) { entry.stamp = ++stamps; entry.write_stamps(); }
+        if (write_back) {
+            entry.write_back = write_back;
+            entry.expected = std::make_shared<const std::vector<std::uint8_t>>(destination, destination + bytes);
+            entry.verified = frame;
+        } else if (limits.stamp_resident_copies) { entry.stamp = ++stamps; entry.write_stamps(); }
         invalidate_pointer(destination, bytes);
         textures_changed();
         publish();
@@ -1747,6 +1770,36 @@ struct GlesDirect::Impl {
             });
         }
         return {texture, framebuffer};
+    }
+    bool land_write_back(std::uint32_t token, std::uint64_t write_back, std::vector<std::uint8_t> texels, bool encoded) {
+        GlesResidentCopy* c = nullptr;
+        const auto it = copies.find(token);
+        if (it != copies.end() && it->second.write_back == write_back) c = &it->second;
+        for (auto& s : shadowed) if (!c && s.write_back == write_back) c = &s;
+        if (!c || c->landed || !c->intact() || (encoded && texels.size() != c->bytes)) return false;
+        // Newer copies own the covered ranges: their bytes stay.
+        if (encoded) {
+            std::size_t from = 0;
+            for (const auto& r : c->covered) {
+                if (from < r.first) std::memcpy(c->destination + from, texels.data() + from, r.first - from);
+                from = std::max(from, r.second);
+            }
+            if (from < c->bytes) std::memcpy(c->destination + from, texels.data() + from, c->bytes - from);
+        } else {
+            std::vector<std::uint8_t> kept;
+            for (const auto& r : c->covered) kept.insert(kept.end(), c->destination + r.first, c->destination + r.second);
+            store_texture_copy(c->plan, {texels.data(), texels.size()}, c->destination, c->capacity);
+            auto from = kept.data();
+            for (const auto& r : c->covered) { std::memcpy(c->destination + r.first, from, r.second - r.first); from += r.second - r.first; }
+        }
+        // intact() compares only the uncovered bytes, which the encoded texels now equal.
+        if (encoded) c->expected = std::make_shared<const std::vector<std::uint8_t>>(std::move(texels));
+        else c->expected = std::make_shared<const std::vector<std::uint8_t>>(c->destination, c->destination + c->bytes);
+        c->landed = true;
+        c->verified = frame;
+        // Textures decoded from this memory are stale; the copy itself stays resident.
+        invalidate_pointer(c->destination, c->bytes);
+        return true;
     }
     void release(std::uint32_t token, std::size_t bytes) {
         for (auto it : overlapping(token, bytes)) { retire_target(it->second); copies.erase(it); }
@@ -3072,8 +3125,12 @@ void GlesDirect::next_frame() { ++impl_->frame; impl_->textures_changed(); impl_
 void GlesDirect::invalidate(const void* data, std::size_t size) {
     impl_->invalidate_pointer(static_cast<const std::uint8_t*>(data), size);
 }
-GlesDirect::ResidentTarget GlesDirect::resident_copy(const TextureCopy& p, std::uint32_t token, std::uint8_t* destination, std::size_t capacity) {
-    return impl_->resident_copy(p, token, destination, capacity);
+GlesDirect::ResidentTarget GlesDirect::resident_copy(const TextureCopy& p, std::uint32_t token, std::uint8_t* destination, std::size_t capacity,
+                                                     std::uint64_t write_back) {
+    return impl_->resident_copy(p, token, destination, capacity, write_back);
+}
+bool GlesDirect::land_write_back(std::uint32_t token, std::uint64_t write_back, std::vector<std::uint8_t> texels, bool encoded) {
+    return impl_->land_write_back(token, write_back, std::move(texels), encoded);
 }
 void GlesDirect::release(std::uint32_t token, std::size_t bytes) { impl_->release(token, bytes); }
 void GlesDirect::before_read(const void* data, std::size_t size) {

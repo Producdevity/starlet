@@ -230,6 +230,23 @@ readback and `store_texture_copy`, reproducing the CPU encoder's bytes.
 `release_resident` drops the copies in a range the port no longer lets the GX
 write (Galaxy unregisters its writable ranges this way).
 
+`GlesRenderer::write_back` names ranges whose copies the game's CPU also reads, as
+on the console, where a copy writes main memory (Super Mario Sunshine's goop maps:
+Mario slips, sinks and burns by them). Such a copy stays resident and is not
+stamped; after its pass the GL thread reads its target into a pixel-pack buffer
+behind a fence, and copies the texels out once the fence signals (after each task,
+and every millisecond while idle). `land_write_backs`, on the owner thread, then
+stores them as materializing would, outside newer copies' ranges, in issue order.
+A copy of one byte per texel (I8 sample format, whole 8x4 tiles, natural stride) is
+first packed on the GPU into its own tiled bytes, four to an RGBA8 pixel, so a
+quarter of the bytes are read back and landing is a copy: Sirena's 512 x 512 map is
+256 KiB a frame instead of 1 MiB and an encode.
+Until then, and after, the copy is intact while memory holds the bytes it held when
+the copy was made, or the landed bytes: a game that rewrote the memory first keeps
+its bytes, and the copy is dropped at its next lookup. A copy replaced, released or
+materialized before its readback arrived lands nothing. A landed copy materializes
+without a readback and is still sampled from the GPU.
+
 Host transfers on the game's behalf call `starlet::os::before_dma_read` or
 `before_dma_write` first: ARAM and disc DMA, card reads and writes, THP planes
 and audio DMA. gx_fifo passes one whose range holds a byte a resident copy owns

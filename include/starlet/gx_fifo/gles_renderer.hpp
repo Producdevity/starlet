@@ -23,6 +23,9 @@ public:
     bool resident_in(const void* data, std::size_t bytes) const override;
     void before_dma_read(const void* data, std::size_t bytes) override;
     void before_dma_write(const void* data, std::size_t bytes) override;
+    void write_back(std::uint32_t address, std::size_t bytes, bool on) override;
+    std::uint64_t write_backs_issued() const override;
+    bool land_write_backs(std::uint64_t through, bool wait) override;
     int snapshot_efb(const gx::EfbRegion& region) override;
     int snapshot_efb_exact(const gx::EfbRegion& region) override;
     bool snapshot_ready(int index) const override;

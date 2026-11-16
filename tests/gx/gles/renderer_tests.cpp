@@ -950,6 +950,55 @@ void stamped_resident_copies() {
     check(renderer.stats().direct.materialized==2 && std::all_of(bytes.begin(),bytes.end(),[](std::uint8_t b){return b==0x22;}),
           "a fully overwritten copy materializes nothing");
 }
+// Written-back copies (GlesRenderer::write_back): read back into a buffer after their pass without
+// a wait, their bytes stored once landed as materializing would, and still sampled on the GPU.
+void written_back_copies() {
+    GlesRenderer renderer; Fixture f; f.memory.bytes.resize(64,0xa5); f.bp(0x8b,0x100c0f);
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    TextureCopy p; p.width=16; p.height=4; p.format=8; p.stride=64;
+    alignas(32) std::array<std::uint8_t,64> bytes{}; bytes.fill(0x11);
+    // An R8 copy is packed into its own tiled bytes on the GPU, so the readback (the fake maps a
+    // pack buffer as (offset + i) % 251) is what memory gets.
+    alignas(32) std::array<std::uint8_t,64> expected{};
+    for (std::size_t i=0;i<expected.size();++i) expected[i]=std::uint8_t(i%251);
+    const auto all=[&](std::uint8_t v){ return std::all_of(bytes.begin(),bytes.end(),[v](std::uint8_t b){return b==v;}); };
+    fake::map_pattern=true;
+    renderer.write_back(0x8000,64,true);
+    const auto reads=fake::read_pixels, draws=fake::draws;
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    check(renderer.write_backs_issued()==1 && fake::read_pixels==reads+1 && fake::pack_pbo_seen!=0 && fake::pack_required==64 &&
+          fake::draws>draws && all(0x11),
+          "a written-back R8 copy is packed and read back into a buffer; memory keeps its bytes until it lands");
+    check(renderer.land_write_backs(1,false) && bytes==expected && renderer.stats().write_backs==1,
+          "landing stores the copy's bytes");
+    check(renderer.land_write_backs(1,false) && renderer.stats().write_backs==1,"a copy lands once");
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    auto s=renderer.stats().direct;
+    check(s.resident_hits==1 && s.materialized==0 && fake::read_pixels==reads+1,"the landed copy is still sampled on the GPU");
+    f.bp(0x8b,0x400c07);
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    s=renderer.stats().direct;
+    check(s.materialized==1 && fake::read_pixels==reads+1 && bytes==expected,"materializing a landed copy reads nothing back");
+    f.bp(0x8b,0x100c0f);
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    bytes[5]^=0xff;
+    const auto written=bytes;
+    check(renderer.land_write_backs(2,false) && bytes==written && renderer.stats().write_backs_dropped==1,
+          "a copy whose memory the game changed before it landed writes nothing");
+    bytes.fill(0x11);
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    check(all(0x11) && renderer.land_write_backs(4,false) && bytes==expected && renderer.stats().write_backs==2 &&
+          renderer.stats().write_backs_dropped==2,"a copy replaced before it landed is dropped; the newer one lands");
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    s=renderer.stats().direct;
+    check(s.resident_hits==2,"the newer landed copy is sampled on the GPU");
+    renderer.write_back(0x8000,64,false);
+    const auto before=fake::read_pixels;
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    check(renderer.write_backs_issued()==4 && fake::read_pixels==before,"copies outside write-back ranges stay on the GPU only");
+    fake::map_pattern=false;
+}
 // JFWDisplay::clearEfb on every draw path: the Z texel becomes the fragment depth, the depth
 // test runs ALWAYS with writes, and the bias is a uniform of the program.
 void z_texture_clear() {
@@ -2414,7 +2463,7 @@ int main() {
         rejected_program_skips_draws();
         unready_program_policy();
         program_reuse_across_tev_colours();
-        resident_copies(); resident_copy_crops(); resident_copy_extension(); resident_copy_chain(); dma_over_resident_copies(); stamped_resident_copies();
+        resident_copies(); resident_copy_crops(); resident_copy_extension(); resident_copy_chain(); dma_over_resident_copies(); stamped_resident_copies(); written_back_copies();
         z_texture_clear();
         direct_geometry_cache();
         direct_instancing();

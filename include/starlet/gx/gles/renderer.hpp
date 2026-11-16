@@ -36,6 +36,12 @@ struct GlesStats {
     std::uint64_t invalidations = 0;
     // Resident texture copies rendered in the pass of the copy before them (see renderer.md).
     std::uint64_t merged_copies = 0;
+    // Resident copies into write_back ranges: written to memory, dropped (replaced, released or
+    // overwritten by the game first), and landings that waited for their readback.
+    std::uint64_t write_backs = 0, write_backs_dropped = 0, write_back_waits = 0;
+    // GL-thread time for them: issuing the packing pass and readback, and copying the mapped
+    // readback out (microseconds).
+    std::uint64_t write_back_issue_us = 0, write_back_copy_us = 0;
     TextureCacheStats capture_cache;
     VertexCacheStats geometry_cache;
     GlesDirectStats direct;
@@ -140,6 +146,15 @@ public:
     // on the GPU. Cache stores and flushes are neither: they leave copies resident.
     void before_dma_read(const void* data, std::size_t bytes);
     void before_dma_write(const void* data, std::size_t bytes);
+    // Direct path, owner thread: resident copies into [token, token + bytes) also reach memory,
+    // for a game whose CPU reads them (a console copy writes main memory). Each one is read back
+    // after its pass without waiting; land_write_backs writes its bytes as materializing would.
+    // on = false drops the range. write_backs_issued counts the copies issued into such ranges;
+    // land_write_backs writes those read back, in order, up to through, and is true once all of
+    // them are written or dropped (wait: blocks until then).
+    void write_back(std::uint32_t token, std::size_t bytes, bool on);
+    std::uint64_t write_backs_issued() const;
+    bool land_write_backs(std::uint64_t through, bool wait);
     // Any thread: whether resident copies may hold bytes of [data, data + bytes); the
     // calls above change nothing otherwise.
     bool resident_in(const void* data, std::size_t bytes) const;

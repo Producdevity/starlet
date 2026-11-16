@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -73,13 +74,22 @@ struct GlesResidentCopy {
     std::size_t capacity = 0;
     // Nonzero when the destination is stamped; see GlesDirectLimits::stamp_resident_copies.
     std::uint64_t stamp = 0;
+    // Written-back copies (GlesRenderer::write_back) are not stamped. write_back is their sequence
+    // number; expected, the bytes their memory holds while the game leaves it alone: what it held
+    // when the copy was made, then the copy's own bytes once they landed.
+    std::uint64_t write_back = 0;
+    std::shared_ptr<const std::vector<std::uint8_t>> expected;
+    bool landed = false;
+    // The frame its memory last compared equal to expected (lookups compare once a frame).
+    mutable std::uint64_t verified = ~std::uint64_t{0};
     // Sorted, disjoint byte ranges [first, second) from destination that newer copies
     // replaced: the copy neither owns nor writes them.
     std::vector<std::pair<std::size_t, std::size_t>> covered;
     void write_stamps() const;
     // Whether the destination's 32-byte block still holds its stamp.
     bool stamped(std::size_t block) const;
-    // Unstamped, or every stamped block outside the covered ranges still holds its stamp.
+    // Unstamped, or every stamped block outside the covered ranges still holds its stamp; for a
+    // written-back copy, memory outside the covered ranges still holds the expected bytes.
     bool intact() const;
     // Whether [begin, end) from destination is covered.
     bool covers(std::size_t begin, std::size_t end) const;
@@ -174,7 +184,15 @@ public:
     // replaced; partly overlapped ones keep their other bytes on the GPU (see direct.md). Call after flush(),
     // and flush() again before rendering into the target: its creation is queued.
     struct ResidentTarget { unsigned texture = 0, framebuffer = 0; };
-    ResidentTarget resident_copy(const TextureCopy&, std::uint32_t token, std::uint8_t* destination, std::size_t capacity);
+    // write_back: nonzero for a copy that will also reach memory (GlesRenderer::write_back), its
+    // sequence number; it is not stamped, and land_write_back writes its bytes.
+    ResidentTarget resident_copy(const TextureCopy&, std::uint32_t token, std::uint8_t* destination, std::size_t capacity,
+                                 std::uint64_t write_back = 0);
+    // The written-back copy write_back at token, read back as RGBA8 texels (encoded: as its own
+    // bytes): its bytes are stored outside its covered ranges as materializing would. False when
+    // it is gone (replaced, released, materialized) or the game changed its memory first; nothing
+    // is written then.
+    bool land_write_back(std::uint32_t token, std::uint64_t write_back, std::vector<std::uint8_t> texels, bool encoded);
     // The token range no longer names memory; its resident copies are dropped.
     void release(std::uint32_t token, std::size_t bytes);
     // A host transfer (DMA on the game's behalf) is about to read [data, data + size):

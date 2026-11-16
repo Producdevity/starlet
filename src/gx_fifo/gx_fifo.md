@@ -130,6 +130,17 @@ GL thread waits less on the GPU, and the picture lags the game's input by one
 frame more, so it is off by default. Draw done, tokens, peeks that read the EFB
 and DMA over resident copies still wait for every command before them.
 
+## Copies the CPU reads
+
+A port names memory whose texture copies the game reads on the CPU with
+`Renderer::write_back` (the GLES backend reads such copies back without waiting;
+direct.md). Each draw-done and token interrupt waits for the copies issued before
+it: it is raised only once their bytes are in memory, as on the console, where the
+interrupt follows the copy's memory writes. The GPU thread keeps decoding meanwhile
+and writes each readback as it arrives; with nothing else queued it polls for the
+one the next interrupt needs every millisecond, which the idle GL thread publishes
+on that schedule, so new commands are never held up.
+
 ## Host transfers
 
 `start_gpu` observes `starlet::os::before_dma_read` and `before_dma_write`. A
@@ -160,4 +171,5 @@ and exact reads under `STARLET_GX_SYNC_READS=1`; `draw_sync_snapshot_tests.cpp`
 runs the exact draw-sync snapshots; `frame_ahead_tests.cpp` checks that the
 setting reaches the renderer and that sync points still wait. With GLES
 headers, `dma_tests.cpp` runs ARAM and disc DMA over resident texture copies of
-the GLES renderer on a recording GL fake.
+the GLES renderer on a recording GL fake, and `write_back_tests.cpp` checks that a
+token behind a written-back copy waits for its bytes.

@@ -46,6 +46,14 @@ public:
     virtual bool resident_in(const void*, std::size_t) const { return false; }
     virtual void before_dma_read(const void*, std::size_t) {}
     virtual void before_dma_write(const void*, std::size_t) {}
+    // Texture copies into [address, address + bytes) also reach memory, as on the console, for a
+    // game whose CPU reads them: each is read back without waiting, and its bytes are written
+    // before the next draw-done or token interrupt after it is raised. on = false drops the range.
+    // write_backs_issued counts such copies so far; land_write_backs writes those read back, up to
+    // that count, and is true once all of them are written (wait: blocks until then).
+    virtual void write_back(std::uint32_t, std::size_t, bool) {}
+    virtual std::uint64_t write_backs_issued() const { return 0; }
+    virtual bool land_write_backs(std::uint64_t, bool) { return true; }
     // Optional EFB snapshots (gx::EfbPeekBackend), for draw-sync callbacks that read the EFB:
     // the GPU thread retains the EFB at their token and the callback reads it once read back.
     // snapshot_ready and the snapshot peeks run on any thread, the rest on the GPU thread.
