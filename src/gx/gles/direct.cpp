@@ -1592,24 +1592,44 @@ struct GlesDirect::Impl {
             if (!t->pointer || (t->pointer < begin + size && begin < t->pointer + t->source_bytes)) { t->validated = 0; t->generation = 0; }
         textures_changed();
     }
+    // GL thread: target samples as from does (a copy's swizzle selects its decoded channels).
+    // Leaves target bound to texture unit 0.
+    static void copy_swizzle(GLuint from, GLuint target) {
+        static constexpr GLenum channels[] = {GL_TEXTURE_SWIZZLE_R, GL_TEXTURE_SWIZZLE_G, GL_TEXTURE_SWIZZLE_B, GL_TEXTURE_SWIZZLE_A};
+        GLint swizzle[4];
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, from);
+        for (unsigned i = 0; i < 4; ++i) glGetTexParameteriv(GL_TEXTURE_2D, channels[i], &swizzle[i]);
+        glBindTexture(GL_TEXTURE_2D, target);
+        for (unsigned i = 0; i < 4; ++i) glTexParameteri(GL_TEXTURE_2D, channels[i], swizzle[i]);
+    }
+    // GL thread: rows [first, first + count) of source's colour, width texels wide, into the same
+    // rows of destination. A blit is queued GPU work; glCopyTexSubImage2D waits on Mali's vendor
+    // driver for the GPU to finish the source's pass. Bindings and the scissor test are restored.
+    static void blit_rows(GLuint source, GLuint destination, unsigned width, unsigned first, unsigned count) {
+        GLint read = 0, draw = 0;
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+        const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, destination);
+        glBlitFramebuffer(0, GLint(first), GLint(width), GLint(first + count), 0, GLint(first), GLint(width), GLint(first + count),
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(read));
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, GLuint(draw));
+        if (scissor) glEnable(GL_SCISSOR_TEST);
+    }
     // Copies the resident copy's rows and columns below width and height into a texture of
     // that size, on the GPU after the copy's pass; kept until the copy is replaced or dropped.
     GLuint crop(std::uint32_t token, const GlesResidentCopy& c, unsigned width, unsigned height) {
         for (const auto& k : crops) if (k.token == token && k.width == width && k.height == height) return k.texture;
         const auto t = target_of(int(width), int(height));
         crops.push_back({token, width, height, t.texture, t.framebuffer});
-        pending.push_back([source = GLuint(c.framebuffer), from = GLuint(c.texture), texture = t.texture, width, height] {
-            static constexpr GLenum channels[] = {GL_TEXTURE_SWIZZLE_R, GL_TEXTURE_SWIZZLE_G, GL_TEXTURE_SWIZZLE_B, GL_TEXTURE_SWIZZLE_A};
-            GLint read = 0, swizzle[4];
-            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, from);
-            for (unsigned i = 0; i < 4; ++i) glGetTexParameteriv(GL_TEXTURE_2D, channels[i], &swizzle[i]);
-            glBindTexture(GL_TEXTURE_2D, texture);
-            for (unsigned i = 0; i < 4; ++i) glTexParameteri(GL_TEXTURE_2D, channels[i], swizzle[i]);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
-            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, GLsizei(width), GLsizei(height));
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(read));
+        pending.push_back([source = GLuint(c.framebuffer), from = GLuint(c.texture), texture = t.texture,
+                           framebuffer = t.framebuffer, width, height] {
+            copy_swizzle(from, texture);
+            blit_rows(source, framebuffer, width, 0, height);
         });
         ++stats.resident_crops;
         return t.texture;
@@ -1637,23 +1657,16 @@ struct GlesDirect::Impl {
         crops.push_back({token, d.width, d.height, t.texture, t.framebuffer, hash});
         auto rows = std::make_shared<std::vector<std::uint8_t>>(decode_texture_copy_tail(c.plan, d, view));
         const unsigned first = unsigned(c.plan.destination_height()), width = d.width;
-        pending.push_back([source = GLuint(c.framebuffer), from = GLuint(c.texture), texture = t.texture, width, first, rows] {
-            static constexpr GLenum channels[] = {GL_TEXTURE_SWIZZLE_R, GL_TEXTURE_SWIZZLE_G, GL_TEXTURE_SWIZZLE_B, GL_TEXTURE_SWIZZLE_A};
-            GLint read = 0, swizzle[4];
-            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, from);
-            for (unsigned i = 0; i < 4; ++i) glGetTexParameteriv(GL_TEXTURE_2D, channels[i], &swizzle[i]);
-            glBindTexture(GL_TEXTURE_2D, texture);
-            for (unsigned i = 0; i < 4; ++i) glTexParameteri(GL_TEXTURE_2D, channels[i], swizzle[i]);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
-            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, GLsizei(width), GLsizei(first));
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(read));
+        pending.push_back([source = GLuint(c.framebuffer), from = GLuint(c.texture), texture = t.texture,
+                           framebuffer = t.framebuffer, width, first, rows] {
+            copy_swizzle(from, texture);
+            // The tail from memory first: an upload into a texture the GPU has yet to write would wait for it.
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1); glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
             glPixelStorei(GL_UNPACK_SKIP_ROWS, 0); glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, GLint(first), GLsizei(width), GLsizei(rows->size() / (std::size_t(width) * 4)), GL_RGBA,
                             GL_UNSIGNED_BYTE, rows->data());
+            blit_rows(source, framebuffer, width, 0, first);
         });
         ++stats.resident_crops;
         return t.texture;

@@ -2,6 +2,7 @@
 #include <GLES3/gl32.h>
 #include <algorithm>
 #include <atomic>
+#include <set>
 #include <thread>
 #include <deque>
 #include <map>
@@ -92,6 +93,11 @@ std::vector<GLuint> blit_targets, array_targets;
 // Each texture's swizzle as last set.
 std::map<GLuint, std::array<GLint, 4>> swizzles;
 unsigned draws_at_blit = 0;
+// The last blit's read framebuffer, draw framebuffer and source rectangle (x0, y0, x1, y1).
+GLuint blit_source = 0, blit_destination = 0;
+std::array<GLint, 4> blit_rect{};
+// Capabilities other than the depth test, for glIsEnabled.
+std::set<GLenum> enabled;
 std::vector<GLuint> written_targets() {
     const auto found = draw_buffers.find(framebuffer);
     const std::vector<GLenum> buffers = found == draw_buffers.end() ? std::vector<GLenum>{GL_COLOR_ATTACHMENT0} : found->second;
@@ -200,6 +206,8 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
     ++fake::blits;
     fake::blit_targets = fake::written_targets();
     fake::draws_at_blit = fake::draws;
+    fake::blit_source = fake::read_framebuffer; fake::blit_destination = fake::framebuffer;
+    fake::blit_rect = {srcX0, srcY0, srcX1, srcY1};
 }
 void glDrawBuffers(GLsizei n, const GLenum* buffers) { fake::draw_buffers[fake::framebuffer].assign(buffers, buffers + n); }
 void glBufferSubData(GLenum, GLintptr, GLsizeiptr, const void*) {}
@@ -243,7 +251,8 @@ void glDeleteSync(GLsync sync) {}
 void glDeleteTextures(GLsizei n, const GLuint *textures) {}
 void glDeleteVertexArrays(GLsizei n, const GLuint *arrays) { for (GLsizei i = 0; i < n; ++i) fake::vertex_arrays.erase(arrays[i]); }
 void glDepthMask(GLboolean flag) { fake::depth_mask = flag; }
-void glDisable(GLenum cap) { if (cap == GL_DEPTH_TEST) fake::depth_test = GL_FALSE; }
+void glDisable(GLenum cap) { if (cap == GL_DEPTH_TEST) fake::depth_test = GL_FALSE; fake::enabled.erase(cap); }
+GLboolean glIsEnabled(GLenum cap) { return cap == GL_DEPTH_TEST ? fake::depth_test : fake::enabled.count(cap) ? GL_TRUE : GL_FALSE; }
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
     const auto& vao = fake::vertex_arrays[fake::vertex_array];
     if (vao.split) {
@@ -292,7 +301,7 @@ void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsize
 void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instances, GLint) {
     ++fake::instanced_draws; fake::instance_count = static_cast<unsigned>(instances); glDrawElements(mode, count, type, indices);
 }
-void glEnable(GLenum cap) { if (cap == GL_DEPTH_TEST) fake::depth_test = GL_TRUE; }
+void glEnable(GLenum cap) { if (cap == GL_DEPTH_TEST) fake::depth_test = GL_TRUE; fake::enabled.insert(cap); }
 void glEnableVertexAttribArray(GLuint index) { fake::vertex_arrays[fake::vertex_array].attributes.at(index).enabled = true; }
 GLsync glFenceSync(GLenum condition, GLbitfield flags) {
     fake::fences.push_back(reinterpret_cast<GLsync>(++fake::next));
@@ -356,6 +365,9 @@ void glGetIntegerv(GLenum pname, GLint *data) {
         break;
     case GL_READ_FRAMEBUFFER_BINDING:
         *data = GLint(fake::read_framebuffer);
+        break;
+    case GL_DRAW_FRAMEBUFFER_BINDING:
+        *data = GLint(fake::framebuffer);
         break;
     case GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT:
         *data = fake::uniform_alignment;

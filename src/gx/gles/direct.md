@@ -219,9 +219,12 @@ than luminance and RGB5A3 are framebuffer blits whose target swizzle selects
 the decoded channels, without the 4/5/6-bit quantization. A later lookup at the same
 address with that format, size, one level and natural tile stride samples the
 copy directly. A smaller lookup whose natural stride is the copy's reads the
-copy's top-left texels: it samples a texture of its own size that
-`glCopyTexSubImage2D` fills from the copy's framebuffer on the GPU, kept until
-the copy is replaced, so its sampler wraps and clamps at the lookup's edges.
+copy's top-left texels: it samples a texture of its own size that a framebuffer
+blit fills from the copy's framebuffer on the GPU, kept until the copy is
+replaced, so its sampler wraps and clamps at the lookup's edges. A taller lookup
+gets the copy's rows the same way and the rows below from memory, uploaded
+first. Not `glCopyTexSubImage2D`: on Mali's vendor driver (r20p0) it waits for
+the GPU to finish the copy's pass (Sirena Beach: 21 ms per frame on the GL thread).
 Any other overlapping lookup first materializes the copy with a
 readback and `store_texture_copy`, reproducing the CPU encoder's bytes.
 `release_resident` drops the copies in a range the port no longer lets the GX

@@ -32,6 +32,8 @@ extern GLboolean links;
 extern bool map_pattern;
 extern int read_pattern_row;
 extern unsigned blits;
+extern GLuint blit_source, blit_destination;
+extern std::array<GLint, 4> blit_rect;
 extern unsigned clears, uploads, draws, draw_first, sampler_seen, pack_seen, unpack_seen, pack_pbo_seen, unpack_pbo_seen;
 extern std::size_t pack_required, unpack_required;
 extern std::map<GLuint, GLuint> color_attachments;
@@ -718,21 +720,23 @@ void resident_copy_crops() {
     renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
     renderer.wait_until_idle();
     const auto copy_framebuffer=fake::array_framebuffer;
+    const auto blits=fake::blits;
     f.bp(0x8b,15u|(3u<<10)|(6u<<20)); // RGBA8 16x4
     renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
     auto s=renderer.stats().direct;
     check(s.resident_hits==1 && s.resident_crops==1 && s.materialized==0 && fake::read_pixels==reads &&
           bytes==std::array<std::uint8_t,512>{},"a shorter lookup of a resident copy neither materializes nor reads back");
-    check(fake::texture_copies==copies+1 && fake::copy_source==copy_framebuffer && fake::copy_rect==std::array<GLint,4>{0,0,16,4} &&
-          fake::draw_texture==fake::copy_texture && fake::color_attachments[copy_framebuffer]!=fake::copy_texture,
-          "the lookup samples a GPU copy of the copy's rows 0-3");
+    const auto crop=fake::color_attachments[fake::blit_destination];
+    check(fake::blits==blits+1 && fake::texture_copies==copies && fake::blit_source==copy_framebuffer &&
+          fake::blit_rect==std::array<GLint,4>{0,0,16,4} && fake::draw_texture==crop && crop!=fake::color_attachments[copy_framebuffer],
+          "the lookup samples a GPU blit of the copy's rows 0-3, queued rather than copied by the driver");
     renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
     s=renderer.stats().direct;
-    check(s.resident_hits==2 && s.resident_crops==1 && fake::texture_copies==copies+1,"the crop is reused while the copy stands");
+    check(s.resident_hits==2 && s.resident_crops==1 && fake::blits==blits+1,"the crop is reused while the copy stands");
     renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
     renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
     s=renderer.stats().direct;
-    check(s.resident_crops==2 && fake::texture_copies==copies+2 && s.materialized==0,"a new copy at the address is cropped anew");
+    check(s.resident_crops==2 && fake::blits>=blits+2 && fake::texture_copies==copies && s.materialized==0,"a new copy at the address is cropped anew");
     f.bp(0x8b,7u|(3u<<10)|(6u<<20)); // RGBA8 8x4: a narrower tile row than the copy's stride
     renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
     s=renderer.stats().direct;
@@ -749,16 +753,19 @@ void resident_copy_extension() {
     renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
     renderer.wait_until_idle();
     const auto copy_framebuffer=fake::array_framebuffer;
+    const auto blits=fake::blits;
     f.bp(0x8b,15u|(15u<<10)|(1u<<20)); // I8 16x16
     renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
     auto s=renderer.stats().direct;
     check(s.resident_hits==1 && s.resident_crops==1 && s.materialized==0 && fake::read_pixels==reads &&
           bytes==std::array<std::uint8_t,128>{},"a taller lookup of a resident copy neither materializes nor reads back");
-    check(fake::texture_copies==copies+1 && fake::copy_source==copy_framebuffer && fake::copy_rect==std::array<GLint,4>{0,0,16,8} &&
-          fake::uploads==uploads+1 && fake::draw_texture==fake::copy_texture,"the lookup samples the copy's rows on the GPU and uploads the memory rows below");
+    check(fake::blits==blits+1 && fake::texture_copies==copies && fake::blit_source==copy_framebuffer &&
+          fake::blit_rect==std::array<GLint,4>{0,0,16,8} && fake::uploads==uploads+1 &&
+          fake::draw_texture==fake::color_attachments[fake::blit_destination],
+          "the lookup samples the copy's rows blitted on the GPU and uploads the memory rows below");
     renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
     s=renderer.stats().direct;
-    check(s.resident_hits==2 && s.resident_crops==1 && fake::texture_copies==copies+1 && fake::uploads==uploads+1,"the texture is reused while the rows below stay as they were");
+    check(s.resident_hits==2 && s.resident_crops==1 && fake::blits==blits+1 && fake::uploads==uploads+1,"the texture is reused while the rows below stay as they were");
     f.memory.bytes[128]^=0xff;
     renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
     s=renderer.stats().direct;
