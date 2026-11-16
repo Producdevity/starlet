@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <stdexcept>
 #include <vector>
 
 extern "C" {
