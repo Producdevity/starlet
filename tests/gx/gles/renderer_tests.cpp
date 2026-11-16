@@ -11,6 +11,8 @@
 #include <functional>
 #include <deque>
 #include <condition_variable>
+#include <chrono>
+#include <functional>
 #include <thread>
 #include <map>
 
@@ -27,7 +29,8 @@ extern unsigned submitted_index_count;
 extern GLuint current_program;
 extern std::map<std::pair<GLuint,std::string>,GLint> uniform_locations;
 extern std::map<GLint,std::array<double,4>> uniform_values;
-extern GLenum error, wait_result;
+extern GLenum error;
+extern std::atomic<GLenum> wait_result;
 extern GLboolean links;
 extern bool map_pattern;
 extern int read_pattern_row;
@@ -2049,6 +2052,36 @@ void panfrost_readback() {
     }
     fake::renderer_name = name;
 }
+// A snapshot whose fence signals after its readback task ran is published by the idle GL thread,
+// with no later GL work; wait_snapshot waits for that publication rather than for queued work.
+void idle_snapshot_publication() {
+    GlesLimits limits; limits.direct.shading = DirectShading::fast; limits.direct.snapshot_scale = 1;
+    GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
+    renderer.start_submission([] {}, [] {}, [] {});
+    const auto until = [](const std::function<bool()>& done) {
+        for (int i = 0; i < 500 && !done(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return done();
+    };
+    renderer.draw_direct(f.decoder.state(), command, f.memory);
+    fake::wait_result = GL_TIMEOUT_EXPIRED;
+    const int first = renderer.snapshot_efb();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    check(first >= 0 && !renderer.snapshot_ready(first), "a snapshot whose fence has not signalled is not read back");
+    fake::wait_result = GL_ALREADY_SIGNALED;
+    check(until([&] { return renderer.snapshot_ready(first); }), "the idle GL thread publishes it once the fence signals");
+    renderer.draw_direct(f.decoder.state(), command, f.memory);
+    fake::wait_result = GL_TIMEOUT_EXPIRED;
+    const int second = renderer.snapshot_efb();
+    std::thread signal([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        fake::wait_result = GL_ALREADY_SIGNALED;
+    });
+    renderer.wait_snapshot(second);
+    signal.join();
+    check(second >= 0 && renderer.snapshot_ready(second), "wait_snapshot returns once the readback is published");
+    renderer.stop_submission();
+    renderer.release_snapshots();
+}
 void region_snapshots() {
     GlesLimits limits; limits.direct.shading = DirectShading::fast; limits.direct.snapshot_scale = 1;
     GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
@@ -2416,7 +2449,7 @@ int main() {
         full_resolution_snapshots();
         exact_snapshots();
         frames_in_flight();
-        region_snapshots(); panfrost_readback();
+        region_snapshots(); panfrost_readback(); idle_snapshot_publication();
         texture_generations();
         present_mapping(); no_blits_on_the_frame_path();
         std::cout << "GLES dispatch boundary tests passed (not GPU rendering proof)\n";

@@ -409,12 +409,14 @@ struct GlesRenderer::Impl {
     }
     struct PendingRead { std::size_t index; std::uint64_t generation; };
     std::vector<PendingRead> pending_reads;
-    // GL thread: copies signalled snapshot readbacks; wait forces the one for index.
-    void collect_snapshots(int wait = -1) {
+    // GL thread: copies signalled snapshot readbacks; wait forces the one for index. flush submits
+    // queued commands first, so fences the driver still holds can signal (an idle GL thread).
+    void collect_snapshots(int wait = -1, bool flush = false) {
         for (auto it = pending_reads.begin(); it != pending_reads.end();) {
             auto& d = snapshots[it->index];
             const bool forced = int(it->index) == wait;
-            const auto status = glClientWaitSync(d.ready, forced ? GL_SYNC_FLUSH_COMMANDS_BIT : 0, forced ? 1000000000 : 0);
+            const bool flush_now = forced || (flush && it == pending_reads.begin());
+            const auto status = glClientWaitSync(d.ready, flush_now ? GL_SYNC_FLUSH_COMMANDS_BIT : 0, forced ? 1000000000 : 0);
             if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) {
                 if (forced) throw std::runtime_error("EFB snapshot readback did not retire within one second");
                 ++it; continue;
@@ -435,6 +437,8 @@ struct GlesRenderer::Impl {
         return snapshot_readable[std::size_t(index)].load(std::memory_order_acquire) ==
                snapshot_generation[std::size_t(index)].load(std::memory_order_relaxed);
     }
+    // Recording thread: until snapshot index is read back (GlesRenderer::wait_snapshot).
+    void wait_readback(int index);
     // The selected snapshot's bytes for an EFB pixel, once its readback is mapped;
     // null when peeks go to the live EFB.
     const std::uint8_t* peek_snapshot(int x, int y, bool color);
@@ -475,6 +479,8 @@ struct GlesRenderer::Impl {
         std::deque<std::function<void()>> queue;
         std::uint64_t submitted = 0, completed = 0;
         bool running = false, stopping = false;
+        // Set by a thread waiting for a snapshot readback: the idle GL thread polls (and flushes) now.
+        bool poll_now = false;
         std::exception_ptr failure;
         std::function<void()> unbind;
         // Set when GL work runs on a thread the host owns instead of this renderer's own.
@@ -526,10 +532,11 @@ struct GlesRenderer::Impl {
         }
         q.done.notify_all();
     }
-    // Idle GL thread: publishes arrived depth readbacks, latching a failure as run_task does.
-    void poll_depth_readbacks() {
+    // Idle GL thread: publishes arrived snapshot and depth readbacks, latching a failure as run_task
+    // does. Queued commands are flushed first: with no more work coming, the driver may hold them.
+    void poll_readbacks() {
         auto& q = submission;
-        try { collect_depth_readbacks(); }
+        try { if (!pending_reads.empty()) collect_snapshots(-1, true); if (depth_readbacks_pending()) collect_depth_readbacks(); }
         catch (...) {
             std::lock_guard<std::mutex> lock(q.mutex);
             if (!q.failure) {
@@ -546,12 +553,17 @@ struct GlesRenderer::Impl {
             std::function<void()> op;
             {
                 std::unique_lock<std::mutex> lock(q.mutex);
-                if (depth_readbacks_pending()) {
-                    // A readback is in flight: wake every millisecond to publish it once its fence signals.
-                    q.ready.wait_for(lock, std::chrono::milliseconds(1), [&] { return q.stopping || !q.queue.empty(); });
+                if (depth_readbacks_pending() || !pending_reads.empty()) {
+                    // A readback is in flight: wake every millisecond, or when a reader waits for one,
+                    // to publish it once its fence signals, without waiting for later GL work.
+                    {
+                        sync_stats::Wait idle("gl-idle-readback-pending");
+                        q.ready.wait_for(lock, std::chrono::milliseconds(1), [&] { return q.stopping || !q.queue.empty() || q.poll_now; });
+                    }
                     if (q.queue.empty() && !q.stopping) {
+                        q.poll_now = false;
                         lock.unlock();
-                        poll_depth_readbacks();
+                        poll_readbacks();
                         continue;
                     }
                 } else {
@@ -2243,7 +2255,28 @@ void GlesRenderer::wait_snapshot(int index) {
     if (g.snapshot_ready(index)) return;
     ++g.stats.peek_waits;
     sync_stats::Context ctx_2295("snapshot-wait");
-    g.execute([&] { try { g.collect_snapshots(index); } catch (...) { g.failed = true; throw; } }, true);
+    g.wait_readback(index);
+}
+// Waits until the GL thread publishes the snapshot's readback, which it does after each task and,
+// while idle, every millisecond: the wait covers the GPU work up to the snapshot, not the GL work
+// queued after it. A GL thread the host owns (start_submission_on) runs a collection task instead.
+void GlesRenderer::Impl::wait_readback(int index) {
+    auto& q = submission;
+    if (!q.running || q.post || std::this_thread::get_id() == q.id) {
+        execute([&] { try { collect_snapshots(index); } catch (...) { failed = true; throw; } }, true);
+        return;
+    }
+    std::unique_lock<std::mutex> lock(q.mutex);
+    if (q.failure) std::rethrow_exception(q.failure);
+    q.poll_now = true;
+    q.ready.notify_one();
+    bool arrived;
+    {
+        sync_stats::Wait blocked(sync_stats::context("gl-sync-other"));
+        arrived = q.done.wait_for(lock, std::chrono::seconds(2), [&] { return snapshot_ready(index) || q.failure; });
+    }
+    if (q.failure) std::rethrow_exception(q.failure);
+    if (!arrived) throw std::runtime_error("EFB snapshot readback did not arrive within two seconds");
 }
 namespace {
 std::uint32_t packed_depth(const std::uint8_t* p) { return (std::uint32_t(p[0]) << 16) | (std::uint32_t(p[1]) << 8) | p[2]; }
@@ -2377,7 +2410,7 @@ const std::uint8_t* GlesRenderer::Impl::peek_snapshot(int x, int y, bool color) 
     if (!snapshot_ready(snapshot)) {
         ++stats.peek_waits;
         sync_stats::Context ctx_2423("peek-snapshot-wait");
-        execute([&] { try { collect_snapshots(snapshot); } catch (...) { failed = true; throw; } }, true);
+        wait_readback(snapshot);
     }
     if (!snapshot_region[std::size_t(snapshot)].contains(x, y)) {
         // Outside the read-back region: the retained snapshot itself, after queued GL work.

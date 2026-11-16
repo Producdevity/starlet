@@ -33,7 +33,8 @@ GLuint current_program=0;
 std::map<std::pair<GLuint,std::string>,GLint> uniform_locations;
 std::map<GLint,std::array<double,4>> uniform_values;
 GLenum error = GL_NO_ERROR;
-GLenum wait_result = GL_ALREADY_SIGNALED;
+// Atomic: tests change it while the submission thread polls fences.
+std::atomic<GLenum> wait_result{GL_ALREADY_SIGNALED};
 // Mapped pack buffers hold byte i % 251 instead of zeros.
 bool map_pattern = false;
 // With map_pattern, a read into client memory gets the same pattern as a mapped pack
