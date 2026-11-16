@@ -39,8 +39,8 @@ struct GlesStats {
     // Resident copies into write_back ranges: written to memory, dropped (replaced, released or
     // overwritten by the game first), and landings that waited for their readback.
     std::uint64_t write_backs = 0, write_backs_dropped = 0, write_back_waits = 0;
-    // GL-thread time for them: issuing the packing pass and readback, and copying the mapped
-    // readback out (microseconds).
+    // Time for them: issuing the packing pass and readback on the GL thread, and copying the
+    // mapped readback out on the owner thread (microseconds).
     std::uint64_t write_back_issue_us = 0, write_back_copy_us = 0;
     TextureCacheStats capture_cache;
     VertexCacheStats geometry_cache;
