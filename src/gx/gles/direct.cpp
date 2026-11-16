@@ -384,6 +384,10 @@ struct GlesDirect::Impl {
         bool split = false;
         std::uint32_t static_offset = 0, dynamic_offset = 0;
     };
+    // Mali-G31 r20p0 fetches wrong attributes for some draws whose split vertex bindings start
+    // off this boundary.
+    static constexpr std::size_t binding_alignment = 64;
+    static std::size_t align_binding(std::size_t offset) { return (offset + binding_alignment - 1) & ~(binding_alignment - 1); }
     GeometryDraw stream_geometry(ConvertedGeometry& entry, const StreamFormat& format) {
         const auto& converted = entry.stream.vertices();
         const auto& elements = entry.stream.indices();
@@ -403,6 +407,7 @@ struct GlesDirect::Impl {
             }
             auto& page = stream_pages[open_stream_page];
             entry.page = open_stream_page;
+            page.data->resize(align_binding(page.data->size()));
             entry.static_offset = static_cast<std::uint32_t>(page.data->size());
             page.data->insert(page.data->end(), converted.begin(), converted.end());
             page.data->resize((page.data->size() + 3) & ~std::size_t{3});
@@ -420,6 +425,7 @@ struct GlesDirect::Impl {
         }
         if (entry.dynamic_segment != segment || (entry.stream.changed_columns() & 3u)) {
             const auto stride = 12u + format.normal_vectors * 12u;
+            dynamic_vertices.resize(align_binding(dynamic_vertices.size()));
             entry.dynamic_offset = static_cast<std::uint32_t>(dynamic_vertices.size());
             dynamic_vertices.resize(dynamic_vertices.size() + count * stride);
             for (std::size_t i = 0; i < count; ++i)

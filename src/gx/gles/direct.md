@@ -72,7 +72,10 @@ different indices remain distinct even when their current values are equal.
 Unchanged generations avoid reads, with periodic byte comparisons as above.
 Missing source identities take the uncached path. `STARLET_VERIFY_STREAM=1`
 compares every referenced vertex against a fresh conversion before submission.
-Indices and the interleaved stream still upload with their segment.
+Entries of at least eight vertices keep their other attributes and indices in GPU
+pages and upload only changed positions and normals with their segment. Both vertex
+bindings start on 64-byte boundaries: Mali-G31 r20p0 fetches wrong attributes for
+some draws whose buffer offsets do not (black patches on Resident Evil 4's Leon).
 
 Recording computes per-program uniform changes and adjacent raster and texture
 changes. Submission skips unchanged groups. A skipped unready program invalidates

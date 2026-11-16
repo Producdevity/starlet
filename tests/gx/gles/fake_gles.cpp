@@ -19,7 +19,7 @@ std::map<GLuint, VertexArray> vertex_arrays;
 std::map<GLuint, std::vector<unsigned char>> buffers;
 std::vector<unsigned char> split_vertices;
 std::vector<std::uint32_t> split_indices;
-unsigned static_buffer_uploads = 0, split_draws = 0;
+unsigned static_buffer_uploads = 0, split_draws = 0, split_misaligned = 0;
 GLenum submitted_index_type = 0;
 
 bool track_uniforms=false;
@@ -258,6 +258,7 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices
         }
         const auto vertices = *std::max_element(fake::split_indices.begin(), fake::split_indices.end()) + 1;
         const auto& statics = vao.bindings[1];
+        if (statics.offset % 64 || vao.bindings[0].offset % 64) ++fake::split_misaligned;
         const auto& data = fake::buffers.at(statics.buffer);
         if (statics.offset + vertices * statics.stride > data.size()) throw std::runtime_error("split static vertices outside buffer");
         fake::split_vertices.assign(data.begin() + statics.offset, data.begin() + statics.offset + vertices * statics.stride);

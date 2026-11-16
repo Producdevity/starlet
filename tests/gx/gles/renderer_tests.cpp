@@ -20,7 +20,7 @@ extern unsigned uniform_updates, negative_uniform_updates, transform_uploads;
 extern starlet::gx::TransformUniforms uploaded_transform;
 extern std::vector<unsigned char> submitted_vertices, split_vertices;
 extern std::vector<std::uint32_t> split_indices;
-extern unsigned split_draws, static_buffer_uploads;
+extern unsigned split_draws, static_buffer_uploads, split_misaligned;
 extern GLenum submitted_index_type;
 extern std::vector<std::uint16_t> submitted_indices;
 extern unsigned submitted_index_count;
@@ -1281,6 +1281,7 @@ void split_stream_geometry() {
     renderer.wait_until_idle();
     verify();
     check(fake::split_draws >= start + payloads.size(), "CPU cache eviction retains buffers until queued draws finish");
+    check(fake::split_misaligned == 0, "split vertex bindings start on 64-byte boundaries");
 }
 void large_split_stream_indices() {
     struct Arrays : test::Memory {
