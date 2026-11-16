@@ -1,5 +1,6 @@
 #include "starlet/os/crash_report.hpp"
 
+#include "async_interrupts.hpp"
 #include "starlet/os/guest_cpu.hpp"
 #include "starlet/os/host_allocation.hpp"
 #include <initializer_list>
@@ -222,6 +223,8 @@ _Unwind_Reason_Code find_signal_frame(_Unwind_Context* context, void* argument) 
         search.past_own = true;
         return _URC_NO_REASON;
     }
+    // An asynchronous interrupt (async_interrupts.cpp) is no fault: the fault is above it.
+    if (frame->info.si_signo == async::interrupt_signal && frame->info.si_code == SI_TKILL) return _URC_NO_REASON;
     search.found = frame;
     return _URC_END_OF_STACK;
 }

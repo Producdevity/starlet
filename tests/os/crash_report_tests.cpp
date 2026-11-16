@@ -1,7 +1,8 @@
 // The fatal signal report describes the original fault when another handler caught it first and
 // raised the signal again: SDL's console cleanup restores the previous handler, unblocks the signal
 // and raises it from inside its own handler; a plain handler's raise arrives after it returns.
-// A fault on a guest thread, a stack overflow included, names that thread.
+// A fault on a guest thread, a stack overflow included, names that thread. An abort in an interrupt
+// handler taken asynchronously is reported as itself: the interrupt's signal frame is no fault.
 #include "starlet/os/crash_report.hpp"
 #include "starlet/os/game_memory.hpp"
 #include "starlet/os/guest_cpu.hpp"
@@ -11,10 +12,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+
+extern "C" const char __start_starlet_crash_guest[];
+extern "C" const char __stop_starlet_crash_guest[];
 
 namespace {
 
@@ -83,6 +90,35 @@ bool overflow_guest = false;
     _exit(0);
 }
 
+volatile int never = 0;
+
+__attribute__((noinline)) void raise_abort() {
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        starlet::os::raise_interrupt([] { std::abort(); });
+    }).detach();
+}
+
+__attribute__((section("starlet_crash_guest"), noinline)) int spin_into_abort() {
+    raise_abort();
+    while (!never) {
+    }
+    return 0;
+}
+
+[[noreturn]] void abort_in_async_handler() {
+    starlet::os::install_fatal_signal_report("crash_test");
+    static std::vector<unsigned char> arena(std::size_t{1} << 20);
+    starlet::os::set_arena(arena.data(), arena.size());
+    const std::uintptr_t hints[] = {0x10000000, 0x20000000, 0x30000000};
+    starlet::os::set_stack_pool(std::size_t{16} << 20, 0x40000000, hints, 3);
+    starlet::os::initialize_os({});
+    starlet::os::add_guest_code(__start_starlet_crash_guest, __stop_starlet_crash_guest);
+    if (!starlet::os::enable_async_interrupts(5)) _exit(0);
+    starlet::os::run_main_thread(spin_into_abort);
+    _exit(0);
+}
+
 template <class Child> std::string run_child(Child child, int& status) {
     int pipe_fds[2];
     if (pipe(pipe_fds)) return {};
@@ -145,6 +181,19 @@ int main() {
         expect(pc != std::string::npos && report.find(function, pc) < report.find('\n', pc), "pc names the guest's function", report);
         expect(report.find("  at ") != std::string::npos, "a backtrace on the guest stack", report);
     }
+#if defined(__aarch64__)
+    {
+        int status = 0;
+        const std::string report = run_child([] { abort_in_async_handler(); }, status);
+        if (report.find("asynchronous interrupts stay off") == std::string::npos) {
+            expect(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT, "an abort in an asynchronous interrupt ends the process", report);
+            expect(report.find("crash_test: fatal signal 6 sent by process ") != std::string::npos, "the abort is reported", report);
+            expect(report.find("raised again") == std::string::npos, "the interrupt's signal frame is not taken for a fault", report);
+            expect(report.find("guest16, OSThread 0x") != std::string::npos && report.find(", in an interrupt handler") != std::string::npos,
+                   "the report names the interrupted thread and the handler", report);
+        }
+    }
+#endif
     std::printf("%s\n", failures ? "crash_report: failures" : "crash_report: ok");
     return failures ? 1 : 0;
 }

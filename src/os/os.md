@@ -75,7 +75,9 @@ declared in `include/starlet/sdk/os.h`. Moved from the Pikmin 2 port's platform 
   (`map_fixed`) and the guest stack pool are game memory that hardware addresses resolve to.
 - `host_allocation`: global new and delete by thread: guest threads use the game's heap once the
   port installs it, host code uses malloc; `host_allocation_scope` marks host work on guest threads.
-- `crash_report`: async-signal-safe reports for players' logs, and the fatal signal handler.
+- `crash_report`: async-signal-safe reports for players' logs, and the fatal signal handler. A
+  fault inside an interrupt taken asynchronously is reported as itself: the search for an
+  original fault skips the SIGURG signal frame.
 
 A port checks its decompilation's SDK layouts against `starlet/sdk/os.h` by including it with
 `STARLET_SDK_TYPES_ONLY` before its own headers and asserting sizes and offsets.
@@ -84,5 +86,5 @@ Linux only. Test: `tests/os` (threads, priorities, messages, mutexes, conditions
 alarms, disabled interrupts, waiting for an interrupt, switching, interrupts that wake the idle
 guest CPU thread, preemption; spins that only an interrupt handler ends, with and without
 asynchronous interrupts, host frames and disabled interrupts that defer them, their logs; the
-image's physical addresses; crash reports after another handler raised the signal again, and
-on guest threads).
+image's physical addresses; crash reports after another handler raised the signal again, on
+guest threads and in asynchronous interrupts).
