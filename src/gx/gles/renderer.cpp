@@ -705,16 +705,19 @@ struct GlesRenderer::Impl {
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth, 0);
         if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
             throw std::runtime_error("GX RGBA8/D24 EFB allocation failed");
-        glGenFramebuffers(1, &strip_framebuffer); glBindFramebuffer(GL_FRAMEBUFFER, strip_framebuffer);
-        glGenTextures(1, &strip_color); glBindTexture(GL_TEXTURE_2D, strip_color);
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, efb_width, efb_strip_height);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, strip_color, 0);
-        glGenTextures(1, &strip_depth); glBindTexture(GL_TEXTURE_2D, strip_depth);
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_DEPTH_COMPONENT24, efb_width, efb_strip_height);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, strip_depth, 0);
-        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-            throw std::runtime_error("EFB strip allocation failed");
-        glClearColor(0, 0, 0, 1); glClearDepthf(1); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        // A frame of all 528 rows leaves no strip.
+        if (efb_strip_height) {
+            glGenFramebuffers(1, &strip_framebuffer); glBindFramebuffer(GL_FRAMEBUFFER, strip_framebuffer);
+            glGenTextures(1, &strip_color); glBindTexture(GL_TEXTURE_2D, strip_color);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, efb_width, efb_strip_height);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, strip_color, 0);
+            glGenTextures(1, &strip_depth); glBindTexture(GL_TEXTURE_2D, strip_depth);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_DEPTH_COMPONENT24, efb_width, efb_strip_height);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, strip_depth, 0);
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                throw std::runtime_error("EFB strip allocation failed");
+            glClearColor(0, 0, 0, 1); glClearDepthf(1); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        }
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
         glGenVertexArrays(1, &vao); glBindVertexArray(vao);
         glGenBuffers(1, &vbo); glBindBuffer(GL_ARRAY_BUFFER, vbo);
