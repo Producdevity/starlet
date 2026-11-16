@@ -12,8 +12,12 @@
 
 namespace starlet::gx_fifo {
 
-// Guest side: queue command bytes, in order, for the GPU thread.
-void gpu_submit(std::vector<std::uint8_t>&& bytes);
+// Guest side: queue the first `used` command bytes, in order, for the GPU thread. Once they have
+// run, the buffer is kept for gpu_take_buffer.
+void gpu_submit(std::vector<std::uint8_t>&& bytes, std::size_t used);
+// Guest side: a buffer of `size` bytes, one the GPU thread has finished with when there is one.
+// Its bytes are not cleared.
+std::vector<std::uint8_t> gpu_take_buffer(std::size_t size);
 // Guest side: wait until the GPU thread has run everything queued so far.
 void gpu_drain();
 // Guest side: true when the GPU thread has run everything queued so far. Does not wait.

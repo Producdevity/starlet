@@ -263,8 +263,37 @@ struct FrameBufferInfo {
 
 struct Job {
     std::vector<std::uint8_t> bytes;
+    std::size_t used = 0;
     std::function<void()> call;
 };
+
+// Command buffers the GPU thread has run, for the guest's next ones: a fresh buffer costs the guest
+// an allocation and clearing it.
+class BufferPool {
+public:
+    std::vector<std::uint8_t> take(std::size_t size) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto i = buffers_.rbegin(); i != buffers_.rend(); ++i)
+                if (i->size() == size) {
+                    std::vector<std::uint8_t> found = std::move(*i);
+                    buffers_.erase(std::next(i).base());
+                    return found;
+                }
+        }
+        return std::vector<std::uint8_t>(size);
+    }
+    void give(std::vector<std::uint8_t>&& buffer) {
+        if (buffer.empty()) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (buffers_.size() == 8) buffers_.erase(buffers_.begin());
+        buffers_.push_back(std::move(buffer));
+    }
+private:
+    std::mutex mutex_;
+    std::vector<std::vector<std::uint8_t>> buffers_;
+};
+BufferPool buffer_pool;
 
 // Token values whose draw-sync callback read the EFB, and per token value the pixels it read
 // last time (bit 56 valid, then y1, x1, y0, x0 in 10 bits each above the token). Later tokens
@@ -311,7 +340,7 @@ public:
         thread_ = std::thread([this] { run(); });
     }
     ~Gpu() {
-        post({{}, [this] { stopping_ = true; }});
+        post({{}, 0, [this] { stopping_ = true; }});
         thread_.join();
     }
 
@@ -614,7 +643,8 @@ private:
                 jobs_.pop_front();
             }
             try {
-                if (!job.bytes.empty()) feed(job.bytes);
+                if (job.used) feed({job.bytes.data(), job.used});
+                buffer_pool.give(std::move(job.bytes));
                 if (job.call) job.call();
             } catch (const std::exception& error) {
                 const auto& st = decoder_->state();
@@ -632,9 +662,9 @@ private:
         if (setup_.stop) setup_.stop();
     }
 
-    void feed(const std::vector<std::uint8_t>& bytes) {
-        decoded_ += bytes.size();
-        const auto status = decoder_->feed({bytes.data(), bytes.size()});
+    void feed(gx::ByteView bytes) {
+        decoded_ += bytes.size;
+        const auto status = decoder_->feed(bytes);
         if (!status) {
             report("GX command stream failed: " + status.message);
             new_decoder();
@@ -874,9 +904,14 @@ void flush_dirty_state() {
     dirty_state();
 }
 
-void gpu_submit(std::vector<std::uint8_t>&& bytes) {
+void gpu_submit(std::vector<std::uint8_t>&& bytes, std::size_t used) {
     host_allocation_scope host;
-    gpu->post({std::move(bytes), {}});
+    gpu->post({std::move(bytes), used, {}});
+}
+
+std::vector<std::uint8_t> gpu_take_buffer(std::size_t size) {
+    host_allocation_scope host;
+    return buffer_pool.take(size);
 }
 
 void gpu_drain() {
@@ -891,12 +926,12 @@ bool gpu_idle() {
 
 void gpu_post_function(std::function<void()> call) {
     host_allocation_scope host;
-    gpu->post({{}, std::move(call)});
+    gpu->post({{}, 0, std::move(call)});
 }
 
 void gpu_call_function(const std::function<void()>& call) {
     host_allocation_scope host;
-    gpu->post({{}, call});
+    gpu->post({{}, 0, call});
     gpu->drain();
 }
 

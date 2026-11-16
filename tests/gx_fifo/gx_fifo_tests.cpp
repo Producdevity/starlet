@@ -115,6 +115,19 @@ int guest_main() {
     GXDrawDone();
     require(interrupts == std::vector<std::string>{"token 4660", "done"}, "a token after 200000 NOPs");
 
+    // Chunk buffers are reused: a short chunk runs only its own bytes, not what an earlier, full
+    // chunk left after them (token register writes, which raise no interrupt).
+    for (int i = 0; i < 40000; ++i) bp(0x47, 0x2222);
+    GXDrawDone();
+    require(GXReadDrawSync() == 0x2222, "token register writes over several chunks");
+    for (int round = 0; round < 12; ++round) {
+        bp(0x47, 0x3333);
+        GXDrawDone();
+    }
+    require(GXReadDrawSync() == 0x3333, "a reused chunk runs only the bytes written into it");
+    bp(0x47, 0x1234);
+    GXDrawDone();
+
     // Unlinked CPU FIFO: writes land in its memory, big-endian, until the GPU is pointed at it.
     interrupts.clear();
     GXSetCPUFifo(&fifo_b);

@@ -45,7 +45,7 @@ const GXFifoObjPriv* priv(const GXFifoObj* fifo) { return reinterpret_cast<const
 
 void new_chunk() {
     os::host_allocation_scope host;
-    chunk = new std::vector<std::uint8_t>(chunk_bytes);
+    chunk = new std::vector<std::uint8_t>(gpu_take_buffer(chunk_bytes));
     starlet_gx_stage.cur = chunk->data();
     starlet_gx_stage.end = chunk->data() + chunk->size();
 }
@@ -215,11 +215,11 @@ void flush_stage() {
     const std::size_t used = std::size_t(starlet_gx_stage.cur - chunk->data());
     if (!used) return;
     os::host_allocation_scope host;
-    chunk->resize(used);
-    gpu_submit(std::move(*chunk));
+    gpu_submit(std::move(*chunk), used);
     ++submissions;
-    delete chunk;
-    new_chunk();
+    *chunk = gpu_take_buffer(chunk_bytes);
+    starlet_gx_stage.cur = chunk->data();
+    starlet_gx_stage.end = chunk->data() + chunk->size();
 }
 
 void end_peek_frame() {
@@ -408,7 +408,8 @@ void GXSetGPFifo(GXFifoObj* fifo) {
             bytes.assign(read, f->top);
             bytes.insert(bytes.end(), f->base, write);
         }
-        gpu_submit(std::move(bytes));
+        const std::size_t used = bytes.size();
+        gpu_submit(std::move(bytes), used);
         ++submissions;
         f->rdPtr = f->wrPtr;
         f->count = 0;
