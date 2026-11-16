@@ -2374,9 +2374,11 @@ const std::uint8_t* GlesRenderer::Impl::peek_snapshot(int x, int y, bool color) 
     const int snapshot = selected_snapshot;
     ++stats.peeks;
     if (snapshot < 0) return nullptr;
-    if (!snapshot_ready(snapshot) && ++stats.peek_waits)
+    if (!snapshot_ready(snapshot)) {
+        ++stats.peek_waits;
         sync_stats::Context ctx_2423("peek-snapshot-wait");
         execute([&] { try { collect_snapshots(snapshot); } catch (...) { failed = true; throw; } }, true);
+    }
     if (!snapshot_region[std::size_t(snapshot)].contains(x, y)) {
         // Outside the read-back region: the retained snapshot itself, after queued GL work.
         ++stats.region_misses;
