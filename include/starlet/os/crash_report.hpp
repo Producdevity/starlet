@@ -28,6 +28,10 @@ void report_game_messages();
 // describes the original fault.
 void install_fatal_signal_report(const char* program);
 
+// Gives the calling thread its own signal stack, so a fault from a stack overflow on it is still
+// reported. install_fatal_signal_report does this for its caller.
+void install_signal_stack();
+
 // Called from the fatal signal handler with the fault's ucontext_t, after the registers, for a
 // port's own checks of them. It must be async-signal-safe.
 void set_fault_details(void (*details)(const void* context));

@@ -3,6 +3,7 @@
 find_package(Threads REQUIRED)
 add_library(starlet_os STATIC
     crash_report.cpp
+    fiber.cpp
     game_memory.cpp
     guest_cpu.cpp
     host_allocation.cpp

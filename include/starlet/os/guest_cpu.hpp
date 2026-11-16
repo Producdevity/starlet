@@ -10,21 +10,25 @@ struct OSThread;
 
 namespace starlet::os {
 
-// The console's single PowerPC core. Guest threads (OSThread) run on host
-// threads, one at a time, chosen by OS priority as the Dolphin OS scheduler
-// chooses them. Switches happen inside OS calls: a blocking call, a wakeup
-// that readies a higher-priority thread, a yield, or a checkpoint that finds an
-// interrupt pending. Interrupt handlers run on the running thread when it has
-// interrupts enabled, as the console's CPU takes them, and on a dedicated
-// interrupt thread when no thread runs, so game code never runs concurrently
-// with game code.
+// The console's single PowerPC core. Guest threads (OSThread) are user-mode
+// contexts with their own stacks on one host thread, the guest CPU thread, and
+// run one at a time, chosen by OS priority as the Dolphin OS scheduler chooses
+// them. Switches happen inside OS calls: a blocking call, a wakeup that readies
+// a higher-priority thread, a yield, or a checkpoint that finds an interrupt
+// pending; a switch swaps stacks and registers without the kernel. Interrupt
+// handlers run on the running thread when it has interrupts enabled, as the
+// console's CPU takes them, and on a dedicated interrupt thread when no thread
+// runs, so game code never runs concurrently with game code. The guest CPU
+// thread sleeps only while no guest thread is ready; raise_interrupt and
+// wakeups from host threads wake it.
 
 // Host service threads (timers, disc, audio) queue interrupt handlers here.
 // Handlers run in order with the CPU held and interrupts disabled.
 void raise_interrupt(std::function<void()> handler);
 
-// Starts the CPU with the game's main thread, at priority 16 as on the
-// console, running entry on a low stack. Returns the entry's result.
+// Makes the calling host thread the guest CPU thread (named guest_cpu_thread_name) and runs the
+// game's main thread on it, at priority 16 as on the console, with entry on a low stack. Returns
+// the entry's result once the main thread ends; other guest threads do not run after that.
 int run_main_thread(int (*entry)());
 
 // Guest code only: delivers pending interrupts and lets a higher-priority ready
@@ -53,5 +57,17 @@ std::size_t guest_thread_count();
 // thread CPU time of that turn in microseconds.
 using SwitchTrace = void (*)(char kind, std::uint32_t value);
 void set_switch_trace(SwitchTrace trace);
+
+constexpr const char* guest_cpu_thread_name = "guest-cpu";
+
+// Profiler support, async-signal-safe: an id for the guest thread running on the calling host
+// thread, guest_sample_base plus its priority at creation plus one (0: the interrupt thread),
+// or 0 on other threads. Profiles name it "guest<priority>".
+constexpr std::uint32_t guest_sample_base = 0x40000000u;
+std::uint32_t guest_sample_id();
+
+// Crash reports, async-signal-safe: a line naming the guest thread running on the calling host
+// thread, if any.
+void report_guest_thread();
 
 }

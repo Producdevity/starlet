@@ -1,7 +1,11 @@
 // The fatal signal report describes the original fault when another handler caught it first and
 // raised the signal again: SDL's console cleanup restores the previous handler, unblocks the signal
 // and raises it from inside its own handler; a plain handler's raise arrives after it returns.
+// A fault on a guest thread, a stack overflow included, names that thread.
 #include "starlet/os/crash_report.hpp"
+#include "starlet/os/game_memory.hpp"
+#include "starlet/os/guest_cpu.hpp"
+#include "starlet/os/os_core.hpp"
 
 #include <signal.h>
 #include <sys/wait.h>
@@ -10,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -34,7 +39,7 @@ void details(const void*) { (void)!write(STDERR_FILENO, "port details\n", 13); }
 // SDL's handler takes a siginfo; without SA_SIGINFO the kernel leaves the frame's siginfo unset.
 enum class Order { report_only, nested_raise, nested_raise_siginfo, raise_after_return };
 
-[[noreturn]] void fault(Order order) {
+[[noreturn]] __attribute__((noinline)) void fault(Order order) {
     starlet::os::install_fatal_signal_report("crash_test");
     starlet::os::set_fault_details(details);
     unblock = order == Order::nested_raise || order == Order::nested_raise_siginfo;
@@ -52,23 +57,51 @@ enum class Order { report_only, nested_raise, nested_raise_siginfo, raise_after_
     _exit(0);
 }
 
-std::string run(Order order, int& status) {
+__attribute__((noinline)) void fault_on_guest() { *reinterpret_cast<volatile int*>(std::uintptr_t{0x1238}) = 1; }
+
+__attribute__((noinline)) int overflow(int depth) {
+    volatile char frame[512];
+    frame[0] = char(depth);
+    return overflow(depth + 1) + frame[0];
+}
+
+bool overflow_guest = false;
+
+[[noreturn]] void fault_guest(bool overflowing) {
+    starlet::os::install_fatal_signal_report("crash_test");
+    static std::vector<unsigned char> arena(std::size_t{1} << 20);
+    starlet::os::set_arena(arena.data(), arena.size());
+    const std::uintptr_t hints[] = {0x10000000, 0x20000000, 0x30000000};
+    starlet::os::set_stack_pool(std::size_t{16} << 20, 0x40000000, hints, 3);
+    starlet::os::initialize_os({});
+    overflow_guest = overflowing;
+    starlet::os::run_main_thread([]() -> int {
+        if (overflow_guest) return overflow(0);
+        fault_on_guest();
+        return 0;
+    });
+    _exit(0);
+}
+
+template <class Child> std::string run_child(Child child, int& status) {
     int pipe_fds[2];
     if (pipe(pipe_fds)) return {};
-    const pid_t child = fork();
-    if (child == 0) {
+    const pid_t pid = fork();
+    if (pid == 0) {
         dup2(pipe_fds[1], STDERR_FILENO);
         close(pipe_fds[0]);
-        fault(order);
+        child();
     }
     close(pipe_fds[1]);
     std::string text;
     char buffer[4096];
     for (ssize_t n; (n = read(pipe_fds[0], buffer, sizeof buffer)) > 0;) text.append(buffer, std::size_t(n));
     close(pipe_fds[0]);
-    waitpid(child, &status, 0);
+    waitpid(pid, &status, 0);
     return text;
 }
+
+std::string run(Order order, int& status) { return run_child([order] { fault(order); }, status); }
 
 int failures = 0;
 
@@ -100,6 +133,17 @@ int main() {
         expect(pc != std::string::npos && report.find("5fault", pc) < report.find('\n', pc),
                "pc names the faulting function", report);
         expect(report.find("port details") != std::string::npos, "the port's details", report);
+    }
+    for (bool overflowing : {false, true}) {
+        int status = 0;
+        const std::string report = run_child([overflowing] { fault_guest(overflowing); }, status);
+        expect(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV, "a guest thread's fault ends the process with the signal", report);
+        expect(report.find("crash_test: fatal signal 11 at 0x") != std::string::npos, "a guest thread's fault is reported", report);
+        expect(report.find("  on guest thread guest16, OSThread 0x") != std::string::npos, "the report names the guest thread", report);
+        const auto pc = report.find("  pc ");
+        const char* function = overflowing ? "8overflow" : "14fault_on_guest";
+        expect(pc != std::string::npos && report.find(function, pc) < report.find('\n', pc), "pc names the guest's function", report);
+        expect(report.find("  at ") != std::string::npos, "a backtrace on the guest stack", report);
     }
     std::printf("%s\n", failures ? "crash_report: failures" : "crash_report: ok");
     return failures ? 1 : 0;

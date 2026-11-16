@@ -3,6 +3,7 @@
 // frame pointers ends instead of faulting.
 #include "starlet/os/profiler.hpp"
 
+#include "starlet/os/guest_cpu.hpp"
 #include "starlet/os/thread_name.hpp"
 
 #include <algorithm>
@@ -62,7 +63,9 @@ void on_sample(int, siginfo_t*, void* context) {
     if (index >= capacity) return;
     Sample& s = samples[index];
     s.milliseconds = milliseconds;
-    s.thread = std::uint32_t(syscall(SYS_gettid));
+    // Guest threads share the guest CPU's host thread; a sample names the one that ran.
+    const std::uint32_t guest = guest_sample_id();
+    s.thread = guest ? guest : std::uint32_t(syscall(SYS_gettid));
 #if defined(__aarch64__)
     const auto& registers = static_cast<ucontext_t*>(context)->uc_mcontext;
     s.pc = registers.pc;
@@ -145,6 +148,9 @@ void start_profiler(const char* prefix_text) {
                 }
                 bool match = false;
                 for (const auto& prefix : prefixes) match = match || std::strncmp(name, prefix.c_str(), prefix.size()) == 0;
+                // The guest CPU thread runs every guest thread ("guest16" selects it too).
+                if (std::strcmp(name, guest_cpu_thread_name) == 0)
+                    for (const auto& prefix : prefixes) match = match || prefix.compare(0, 5, "guest") == 0;
                 // Threads are named after they start; decide once the name is set.
                 if (std::strcmp(name, process) != 0) chosen[tid] = match;
                 return match;
@@ -194,6 +200,17 @@ void write_profile(const char* capture_dir) {
         }
         closedir(tasks);
     }
+    const std::size_t count = std::min(taken.load(), capacity);
+    {
+        bool named[64] = {};
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::uint32_t slot = samples[i].thread - guest_sample_base;
+            if (samples[i].thread >= guest_sample_base && slot < 64 && !named[slot]) {
+                named[slot] = true;
+                std::fprintf(out, "# thread %u guest%d\n", samples[i].thread, int(slot) - 1);
+            }
+        }
+    }
     if (std::FILE* maps = std::fopen("/proc/self/maps", "r")) {
         char line[512];
         while (std::fgets(line, sizeof line, maps))
@@ -202,7 +219,6 @@ void write_profile(const char* capture_dir) {
     }
     const std::size_t marked = std::min(frame_count.load(), frames.size());
     for (std::size_t i = 0; i < marked; ++i) std::fprintf(out, "# frame %u\n", frames[i]);
-    const std::size_t count = std::min(taken.load(), capacity);
     for (std::size_t i = 0; i < count; ++i) {
         const Sample& sample = samples[i];
         std::fprintf(out, "%u %u %lx %lx", sample.milliseconds, sample.thread, (unsigned long)sample.pc, (unsigned long)sample.lr);

@@ -1,12 +1,13 @@
 #include "starlet/os/guest_cpu.hpp"
 
+#include "fiber.hpp"
+#include "starlet/os/crash_report.hpp"
 #include "starlet/os/game_memory.hpp"
 #include "starlet/os/host_allocation.hpp"
 #include "starlet/os/thread_name.hpp"
 
 #include "starlet/sdk/os.h"
 
-#include <pthread.h>
 #include <time.h>
 
 #include <algorithm>
@@ -19,7 +20,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
-#include <vector>
 
 using namespace starlet::sdk;
 
@@ -32,21 +32,21 @@ constexpr int priority_slots = OS_PRIORITY_MAX + 2;  // Slot 0 is the interrupt 
 // SDL, GL) run on guest stacks, so stacks get at least this much.
 constexpr std::size_t minimum_stack = std::size_t{1} << 20;
 
+// A guest thread is a fiber on the guest CPU's host thread: handing the CPU to another guest
+// thread swaps stacks and registers on that thread, with no kernel wakeup.
 struct Guest {
     OSThread* os = nullptr;
-    pthread_t host{};
-    std::condition_variable turn;
+    fiber::Context fiber;
     bool interrupts = true;  // MSR[EE] of this thread's context.
     bool interrupt_thread = false;
     bool queued = false;      // In a ready slot.
-    bool started = false;     // Host thread exists.
-    bool killed = false;      // Cancelled: the host thread ends when it next wakes.
-    bool reap = true;         // The host thread hands its stack back when it ends (not the main thread).
-    bool retired = false;     // The host thread queued itself for reaping; no one else joins it.
+    bool killed = false;      // Cancelled while it held the CPU: it ends at its next switch.
+    bool detached = false;    // Ended detached: the context that frees its stack deletes it.
     void* stack = nullptr;
     std::size_t stack_size = 0;
     void* (*entry)(void*) = nullptr;
     void* parameter = nullptr;
+    char name[16] = {};
     int priority() const { return interrupt_thread ? interrupt_priority : os->priority; }
 };
 
@@ -61,9 +61,21 @@ std::unordered_map<OSThread*, Guest*> guests;
 int scheduler_disabled = 0;
 Guest interrupt_guest;
 OSThread* last_guest = nullptr;
-thread_local Guest* self = nullptr;
 std::atomic<SwitchTrace> switch_trace{nullptr};
-thread_local std::uint64_t run_cpu_start = 0;
+
+// The guest CPU's host thread: its own context runs only while no guest thread is ready.
+fiber::Context idle;
+std::condition_variable cpu_wake;
+bool cpu_waiting = false;
+bool cpu_stopped = false;  // The main thread ended.
+Guest* main_guest = nullptr;
+// A thread that ended and switched away from its stack, which the next context frees.
+Guest* exited = nullptr;
+
+// The guest thread running on this host thread (only the guest CPU's thread has one).
+thread_local Guest* self = nullptr;
+thread_local bool handling_in_place = false;
+std::uint64_t run_cpu_start = 0;
 
 std::uint64_t thread_cpu_us() {
     timespec t{};
@@ -71,42 +83,6 @@ std::uint64_t thread_cpu_us() {
     return std::uint64_t(t.tv_sec) * 1000000u + std::uint64_t(t.tv_nsec) / 1000u;
 }
 
-// Host threads that ended: the next thread creation joins them and reuses their stacks.
-struct Finished {
-    pthread_t host;
-    void* stack;
-    std::size_t size;
-};
-std::mutex finished_mutex;
-std::vector<Finished> finished;
-
-// Under the scheduler lock, before the host thread lets go of it.
-Finished retire(Guest* g) {
-    g->retired = g->reap;
-    return {pthread_self(), g->reap ? g->stack : nullptr, g->stack_size};
-}
-
-[[noreturn]] void exit_host(const Finished& done) {
-    if (done.stack) {
-        host_allocation_scope host_;
-        std::lock_guard<std::mutex> lock(finished_mutex);
-        finished.push_back(done);
-    }
-    pthread_exit(nullptr);
-}
-
-void reap_finished() {
-    std::vector<Finished> done;
-    {
-        host_allocation_scope host_;
-        std::lock_guard<std::mutex> lock(finished_mutex);
-        done.swap(finished);
-    }
-    for (const Finished& f : done) {
-        pthread_join(f.host, nullptr);
-        release_stack(f.stack, f.size);
-    }
-}
 std::atomic<bool> in_handler{false};
 
 int slot(const Guest* g) { return g->priority() + 1; }
@@ -152,8 +128,8 @@ void dequeue(Guest* g) {
     update_best();
 }
 
-// The CPU is free: hand it to the best ready thread, if any.
-void dispatch() {
+// The CPU is free: gives it to the best ready thread, if any.
+Guest* take_next() {
     if (running) throw std::logic_error("dispatch with the CPU held");
     for (int i = 0; i < priority_slots; ++i) {
         if (ready[i].empty()) continue;
@@ -167,40 +143,68 @@ void dispatch() {
             next->os->state = OS_THREAD_STATE_RUNNING;
             last_guest = next->os;
         }
-        next->turn.notify_one();
-        return;
+        return next;
     }
+    return nullptr;
 }
 
-[[noreturn]] void end_host_thread(std::unique_lock<std::mutex>& lock) {
-    Guest* g = self;
-    const Finished done = retire(g);
-    // A cancelled detached thread is out of the table; no one else holds it.
-    const bool detached = g->os && (g->os->attr & OS_THREAD_ATTR_DETACH);
+// Host threads (interrupts, wakeups) that find the CPU idle wake its host thread.
+void wake_cpu() {
+    if (!running && cpu_waiting) cpu_wake.notify_one();
+}
+
+void release_fiber(Guest* g) {
+    fiber::release(g->fiber);
+    if (g->stack) release_stack(g->stack, g->stack_size);
+    g->stack = nullptr;
+}
+
+// Each context does this when it resumes, under the scheduler lock: the thread that ended and
+// switched here is off its stack now.
+void free_exited() {
+    Guest* g = exited;
+    if (!g) return;
+    exited = nullptr;
+    release_fiber(g);
+    if (g->detached) delete g;
+}
+
+// Continues on to (the CPU thread's own context when null) and returns once this context is
+// switched to again. The lock is not held across the switch: a host thread may raise an interrupt
+// in between, which only queues it.
+void transfer(fiber::Context& from, Guest* to, std::unique_lock<std::mutex>& lock) {
     lock.unlock();
-    if (detached) delete g;
-    exit_host(done);
+    self = to;
+    fiber::switch_to(from, to ? to->fiber : idle);
+    lock.lock();
+    free_exited();
 }
 
-void wait_turn(Guest* g, std::unique_lock<std::mutex>& lock) {
-    while (running != g) {
-        if (g->killed) end_host_thread(lock);
-        g->turn.wait(lock);
-    }
-    trace_resume(g);
-}
-
-// Gives up the CPU (the caller has already queued or parked itself) and waits
-// until it is dispatched again.
-void switch_away(std::unique_lock<std::mutex>& lock) {
-    Guest* g = self;
+// The running thread g ended: its stack is freed by the next context.
+[[noreturn]] void end_current(Guest* g, std::unique_lock<std::mutex>& lock) {
     trace_release(g);
     running = nullptr;
-    dispatch();
-    wait_turn(g, lock);
+    g->detached = g->os->attr & OS_THREAD_ATTR_DETACH;
+    if (exited) throw std::logic_error("two guest threads ended without a switch between them");
+    exited = g;
+    Guest* next = nullptr;
+    if (g == main_guest) cpu_stopped = true;
+    else next = take_next();
+    transfer(g->fiber, next, lock);
+    std::abort();
 }
 
-thread_local bool handling_in_place = false;
+// Gives up the CPU (the caller has already queued or parked itself) and returns once this
+// thread is dispatched again.
+void switch_away(std::unique_lock<std::mutex>& lock) {
+    Guest* g = self;
+    if (g->killed) end_current(g, lock);
+    trace_release(g);
+    running = nullptr;
+    Guest* next = take_next();
+    if (next != g) transfer(g->fiber, next, lock);
+    trace_resume(g);
+}
 
 // Runs the pending interrupt handlers on the running thread, as the console's CPU takes an
 // interrupt on the thread it interrupts, instead of handing the CPU to the interrupt thread and back.
@@ -264,7 +268,7 @@ void make_ready(Guest* g) {
         return;
     }
     enqueue(g);
-    if (!running) dispatch();
+    wake_cpu();
 }
 
 Guest* guest_of(OSThread* thread) {
@@ -272,11 +276,13 @@ Guest* guest_of(OSThread* thread) {
     return found == guests.end() ? nullptr : found->second;
 }
 
-void interrupt_loop() {
+// The interrupt thread runs the handlers raised while no guest thread held the CPU.
+[[noreturn]] void interrupt_loop() {
     host_allocation_scope host_;  // Scheduler containers must not take game memory.
     std::unique_lock<std::mutex> lock(scheduler);
+    free_exited();
+    trace_resume(&interrupt_guest);
     for (;;) {
-        wait_turn(&interrupt_guest, lock);
         in_handler.store(true, std::memory_order_relaxed);
         while (!pending.empty()) {
             auto handler = std::move(pending.front());
@@ -290,45 +296,50 @@ void interrupt_loop() {
         in_handler.store(false, std::memory_order_relaxed);
         trace_release(&interrupt_guest);
         running = nullptr;
-        dispatch();
+        Guest* next = take_next();
+        if (next != &interrupt_guest) transfer(interrupt_guest.fiber, next, lock);
+        trace_resume(&interrupt_guest);
     }
 }
 
-void* host_entry(void* argument) {
+[[noreturn]] void fiber_entry(void* argument) {
     auto* g = static_cast<Guest*>(argument);
-    self = g;
-    set_guest_allocation(true);
-    {
-        char name[16];
-        std::snprintf(name, sizeof name, "guest%d", g->priority());
-        name_thread(name);
-    }
-    if (g->interrupt_thread) {
-        interrupt_loop();
-        return nullptr;
-    }
+    if (g->interrupt_thread) interrupt_loop();
     {
         host_allocation_scope host_;  // Scheduler containers must not take game memory.
-        std::unique_lock<std::mutex> lock(scheduler);
-        wait_turn(g, lock);
+        std::lock_guard<std::mutex> lock(scheduler);
+        free_exited();
+        trace_resume(g);
     }
     void* result = g->entry(g->parameter);
     OSExitThread(result);
-    return nullptr;
+    std::abort();
 }
 
-void start_host_thread(Guest* g, std::size_t requested) {
+void start_fiber(Guest* g, std::size_t requested) {
     const std::size_t size = std::max(minimum_stack, requested * 4);
-    reap_finished();
+    std::snprintf(g->name, sizeof g->name, "guest%d", g->priority());
     g->stack = allocate_stack(size);
     g->stack_size = size;
-    pthread_attr_t attributes;
-    pthread_attr_init(&attributes);
-    pthread_attr_setstack(&attributes, g->stack, size);
-    const int error = pthread_create(&g->host, &attributes, host_entry, g);
-    pthread_attr_destroy(&attributes);
-    if (error) throw std::runtime_error("could not create a guest thread");
-    g->started = true;
+    fiber::prepare(g->fiber, g->stack, size, fiber_entry, g, g->name);
+    g->fiber.sample_id = guest_sample_base + std::uint32_t(slot(g));
+}
+
+// The guest CPU's host thread: runs guest threads until the main thread ends, sleeping while none
+// is ready.
+void cpu_loop() {
+    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    std::unique_lock<std::mutex> lock(scheduler);
+    while (!cpu_stopped) {
+        Guest* next = take_next();
+        if (!next) {
+            cpu_waiting = true;
+            cpu_wake.wait(lock);
+            cpu_waiting = false;
+            continue;
+        }
+        transfer(idle, next, lock);
+    }
 }
 
 void init_queue(OSThreadQueue* queue) { queue->head = queue->tail = nullptr; }
@@ -415,7 +426,7 @@ void raise_interrupt(std::function<void()> handler) {
     pending_flag.store(true, std::memory_order_release);
     interrupt_raised.notify_all();
     if (running != &interrupt_guest && !interrupt_guest.queued) enqueue(&interrupt_guest);
-    if (!running) dispatch();
+    wake_cpu();
 }
 
 bool interrupt_pending() { return pending_flag.load(std::memory_order_acquire); }
@@ -455,22 +466,43 @@ int run_main_thread(int (*entry)()) {
     static int (*main_entry)() = nullptr;
     static int result = 0;
     main_entry = entry;
+    name_thread(guest_cpu_thread_name);
+    install_signal_stack();  // A guest stack overflow still gets its crash report.
     {
         host_allocation_scope host_;  // Scheduler containers must not take game memory.
         std::lock_guard<std::mutex> lock(scheduler);
+        fiber::adopt_current(idle);
         interrupt_guest.interrupt_thread = true;
         interrupt_guest.interrupts = false;
-        start_host_thread(&interrupt_guest, 0);
+        start_fiber(&interrupt_guest, 0);
     }
     OSCreateThread(&main_thread, [](void*) -> void* {
         result = main_entry();
         return nullptr;
     }, nullptr, main_thread_stack_marker + sizeof main_thread_stack_marker, 0, 16, 0);
-    Guest* g = guest_of(&main_thread);
-    g->reap = false;  // Joined below.
+    {
+        host_allocation_scope host_;
+        std::lock_guard<std::mutex> lock(scheduler);
+        main_guest = guest_of(&main_thread);
+    }
     OSResumeThread(&main_thread);
-    pthread_join(g->host, nullptr);
+    cpu_loop();
     return result;
+}
+
+std::uint32_t guest_sample_id() { return fiber::current_sample_id(); }
+
+void report_guest_thread() {
+    const Guest* g = self;
+    if (!g) return;
+    report_text("  on guest thread ");
+    report_text(g->name);
+    if (g->os) {
+        report_text(", OSThread 0x");
+        report_hex(reinterpret_cast<std::uintptr_t>(g->os));
+    }
+    if (handling_in_place) report_text(", in an interrupt handler");
+    report_text("\n");
 }
 
 }
@@ -544,7 +576,7 @@ BOOL OSCreateThread(OSThread* thread, OSThreadStartFunction func, void* param, v
     host_allocation_scope host_;  // Scheduler containers must not take game memory.
     std::lock_guard<std::mutex> lock(scheduler);
     guests[thread] = g;
-    start_host_thread(g, stackSize);
+    start_fiber(g, stackSize);
     return TRUE;
 }
 
@@ -554,15 +586,7 @@ void OSExitThread(void* val) {
     std::unique_lock<std::mutex> lock(scheduler);
     Guest* g = self;
     terminate(g, val);
-    trace_release(g);
-    running = nullptr;
-    dispatch();
-    // A joiner may delete g once the lock is released.
-    const bool detached = g->os->attr & OS_THREAD_ATTR_DETACH;
-    const Finished done = retire(g);
-    lock.unlock();
-    if (detached) delete g;
-    exit_host(done);
+    end_current(g, lock);
 }
 
 void OSCancelThread(OSThread* thread) {
@@ -576,7 +600,11 @@ void OSCancelThread(OSThread* thread) {
     }
     g->killed = true;
     terminate(g, nullptr);
-    g->turn.notify_one();
+    // A thread that holds the CPU (a host thread cancelled it) ends at its next switch; any other
+    // never runs again.
+    if (g == running) return;
+    release_fiber(g);
+    if (thread->attr & OS_THREAD_ATTR_DETACH) delete g;
 }
 
 void OSDetachThread(OSThread* thread) {
@@ -663,18 +691,9 @@ BOOL OSJoinThread(OSThread* thread, void** val) {
     if (val) *val = thread->val;
     thread->state = OS_THREAD_STATE_NULL;
     if (Guest* g = guest_of(thread)) {
+        // It ended (its stack is free) or was cancelled.
         guests.erase(thread);
-        if (g->retired) {
-            // Its host thread queued itself for reaping and no longer touches g.
-            lock.unlock();
-            delete g;
-            return TRUE;
-        }
-        g->reap = false;
-        pthread_t host = g->host;
-        lock.unlock();
-        pthread_join(host, nullptr);
-        release_stack(g->stack, g->stack_size);
+        release_fiber(g);
         delete g;
     }
     return TRUE;

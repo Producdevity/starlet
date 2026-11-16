@@ -11,6 +11,8 @@ namespace starlet::os {
 // everything else (and code inside a host_allocation_scope) from malloc.
 // Deletion is routed by address: arena memory goes back to the game's heap.
 void set_guest_allocation(bool guest);
+// The calling thread's current routing (the guest CPU saves it with each guest thread's context).
+bool allocating_for_guest();
 
 // The game's allocator, installed once the game is linked in (by the port).
 // Before the game has a current heap (static construction), guest threads use malloc.

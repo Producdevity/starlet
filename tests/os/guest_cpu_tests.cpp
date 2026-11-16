@@ -1,13 +1,15 @@
 // The guest CPU runs one thread at a time by Dolphin OS priority, switches only
 // inside OS calls, and takes interrupts on the running thread, or on its interrupt thread while
-// no thread runs.
+// no thread runs. Guest threads are contexts on one host thread.
 #include "starlet/os/game_memory.hpp"
 #include "starlet/os/guest_cpu.hpp"
+#include "starlet/os/host_allocation.hpp"
 #include "starlet/os/os_core.hpp"
 
 #include "starlet/sdk/os.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -293,6 +295,122 @@ void interrupts_in_place() {
     expect(kinds == "ijxhgxhg", "no hand-over for the interrupt; one each way for the woken thread");
 }
 
+// Guest threads run on the guest CPU's host thread, each on its own stack in game memory, and keep
+// their own errno and host allocation routing across switches.
+std::thread::id main_host;
+void* main_stack = nullptr;
+
+void* ping_pong(void*) {
+    int local = 0;
+    expect(std::this_thread::get_id() == main_host, "a guest thread runs on the guest CPU thread");
+    expect(&local != main_stack && starlet::os::game_visible(&local, sizeof local), "its own stack, in game memory");
+    for (int i = 0; i < 1000; ++i) {
+        errno = 1000 + i;
+        OSMessage message;
+        OSReceiveMessage(&queue, &message, OS_MESSAGE_BLOCK);
+        expect(errno == 1000 + i, "errno kept across a switch");
+        expect(starlet::os::allocating_for_guest(), "allocation routing kept across a switch");
+        if (!message) break;
+        ++shared;
+    }
+    return nullptr;
+}
+
+void switching() {
+    int local = 0;
+    main_host = std::this_thread::get_id();
+    main_stack = &local;
+    OSInitMessageQueue(&queue, messages, 1);
+    shared = 0;
+    OSCreateThread(&thread_a, ping_pong, nullptr, stack_a + sizeof stack_a, sizeof stack_a, 10, 0);
+    OSResumeThread(&thread_a);
+    for (int i = 0; i < 999; ++i) {
+        errno = 7;
+        OSSendMessage(&queue, reinterpret_cast<OSMessage>(std::uintptr_t{1}), OS_MESSAGE_BLOCK);
+        expect(errno == 7, "the sender's errno kept");
+        if (errno != 7) break;
+    }
+    OSSendMessage(&queue, nullptr, OS_MESSAGE_BLOCK);
+    OSJoinThread(&thread_a, nullptr);
+    expect(shared == 999, "1000 switches each way");
+    expect(starlet::os::allocating_for_guest(), "the main thread's routing kept");
+}
+
+// The guest CPU thread sleeps while no guest thread is ready and an interrupt from a host thread
+// wakes it, however close the two come (a lost wakeup hangs this test).
+void interrupts_wake_the_cpu() {
+    OSInitThreadQueue(&alarm_waiters);
+    static std::atomic<int> raised{0}, published{0};
+    static int handled = 0;
+    static OSThread* current_in_handler = nullptr;
+    handled = 0;
+    raised = 0;
+    published = 0;
+    std::atomic<bool> stop{false};
+    std::thread host([&] {
+        int delay = 0;
+        while (!stop.load()) {
+            if (raised.load() != published.load()) {
+                std::this_thread::yield();
+                continue;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(delay));
+            delay = (delay + 37) % 300;
+            ++raised;
+            starlet::os::raise_interrupt([] {
+                ++handled;
+                current_in_handler = OSGetCurrentThread();
+                OSWakeupThread(&alarm_waiters);
+            });
+        }
+    });
+    const BOOL enabled = OSDisableInterrupts();
+    for (int round = 1; round <= 500; ++round) {
+        while (handled < round) OSSleepThread(&alarm_waiters);
+        published.store(handled);
+    }
+    OSRestoreInterrupts(enabled);
+    stop = true;
+    host.join();
+    expect(handled == 500 || handled == 501, "every interrupt woke the sleeping CPU");
+    expect(current_in_handler == OSGetCurrentThread(), "the interrupt thread names the last guest thread");
+}
+
+// A thread that an interrupt readies with a better priority preempts the running one at its next
+// checkpoint; a thread readied by the running one preempts it at once.
+void priority_preemption() {
+    trace.clear();
+    OSInitThreadQueue(&alarm_waiters);
+    OSCreateThread(&thread_b, [](void*) -> void* {
+        OSSleepThread(&alarm_waiters);
+        trace += 'H';
+        return nullptr;
+    }, nullptr, stack_b + sizeof stack_b, sizeof stack_b, 5, 0);
+    OSResumeThread(&thread_b);  // Runs at once and sleeps.
+    OSCreateThread(&thread_c, [](void*) -> void* {
+        trace += 'L';
+        std::thread([] { starlet::os::raise_interrupt([] { OSWakeupThread(&alarm_waiters); }); }).join();
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (trace.find('H') == std::string::npos && std::chrono::steady_clock::now() < until) OSGetTime();
+        trace += 'l';
+        return nullptr;
+    }, nullptr, stack_c + sizeof stack_c, sizeof stack_c, 20, 0);
+    OSResumeThread(&thread_c);
+    trace += 'm';
+    OSJoinThread(&thread_c, nullptr);
+    OSJoinThread(&thread_b, nullptr);
+    expect(trace == "mLHl", "the woken thread preempted the busy lower one at its checkpoint");
+    // Equal priority does not preempt; a yield gives way to it.
+    trace.clear();
+    OSCreateThread(&thread_a, mark, const_cast<char*>("a"), stack_a + sizeof stack_a, sizeof stack_a, 16, 0);
+    OSResumeThread(&thread_a);
+    trace += 'm';
+    OSYieldThread();
+    trace += 'M';
+    OSJoinThread(&thread_a, nullptr);
+    expect(trace == "maM", "equal priority waits for a yield");
+}
+
 int run_tests() {
     priorities();
     messages_block();
@@ -304,6 +422,9 @@ int run_tests() {
     stacks_return();
     preempting_messages();
     interrupts_in_place();
+    switching();
+    interrupts_wake_the_cpu();
+    priority_preemption();
     return failures;
 }
 

@@ -1,4 +1,7 @@
 #include "starlet/os/crash_report.hpp"
+
+#include "starlet/os/guest_cpu.hpp"
+#include "starlet/os/host_allocation.hpp"
 #include <initializer_list>
 #include <ucontext.h>
 #include <signal.h>
@@ -265,6 +268,7 @@ void fatal_signal(int signal, siginfo_t* info, void* context) {
     report_text(build_id_text);
     report_text("\n");
     if (raised_again) report_text("  raised again by another signal handler; the original fault:\n");
+    report_guest_thread();
 #if defined(__aarch64__) && defined(__linux__)
     const auto& registers = static_cast<ucontext_t*>(context)->uc_mcontext;
     // brk #0x550b is -fsanitize-trap=return: decompiled code with no return statement.
@@ -301,6 +305,17 @@ void fatal_signal(int signal, siginfo_t* info, void* context) {
 
 const char* build_id() { return build_id_text; }
 
+void install_signal_stack() {
+    constexpr std::size_t size = 65536;
+    stack_t current{};
+    if (sigaltstack(nullptr, &current) == 0 && !(current.ss_flags & SS_DISABLE)) return;
+    host_allocation_scope host;
+    stack_t stack{};
+    stack.ss_sp = new char[size];
+    stack.ss_size = size;
+    sigaltstack(&stack, nullptr);
+}
+
 void set_fault_details(void (*details)(const void* context)) { fault_details = details; }
 
 void install_fatal_signal_report(const char* program) {
@@ -324,11 +339,7 @@ void install_fatal_signal_report(const char* program) {
     }, nullptr);
     void* warm[1];
     backtrace(warm, 1);  // Loads the unwinder now rather than inside the handler.
-    static char alternate[65536];
-    stack_t stack{};
-    stack.ss_sp = alternate;
-    stack.ss_size = sizeof(alternate);
-    sigaltstack(&stack, nullptr);
+    install_signal_stack();
     struct sigaction action{};
     action.sa_sigaction = fatal_signal;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;

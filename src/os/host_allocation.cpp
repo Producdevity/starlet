@@ -35,6 +35,7 @@ void release(void* pointer) {
 }
 
 void set_guest_allocation(bool guest) { guest_allocation = guest; }
+bool allocating_for_guest() { return guest_allocation; }
 void set_game_heap(GameHeap heap) { game_heap = heap; }
 
 host_allocation_scope::host_allocation_scope() : previous_(guest_allocation) { guest_allocation = false; }
