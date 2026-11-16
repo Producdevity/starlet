@@ -550,6 +550,8 @@ struct GlesRenderer::Impl {
             }
             failed = true;
         }
+        // Readers check snapshot_ready under the mutex: taking it orders the publication before their wait.
+        { std::lock_guard<std::mutex> lock(q.mutex); }
         q.done.notify_all();
     }
     void run_submission() {
