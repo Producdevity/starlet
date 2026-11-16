@@ -293,7 +293,9 @@ with an `EfbRegion` retains the whole EFB on the GPU but reads back only that
 rectangle; a peek outside it waits for the readback and the queue, then reads
 the retained snapshot, so it stays exact (`GlesStats::region_misses`).
 `wait_snapshot` waits for a snapshot's readback without reading a pixel, for a
-port that delivers a token once its snapshot is ready.
+port that delivers a token once its snapshot is ready. It waits for the GPU work
+up to the snapshot, not for GL work queued after it: the GL thread publishes
+readbacks after each task and, while idle, every millisecond, flushing first.
 
 Readbacks into memory (snapshots and materialization) use `glReadPixels`, except
 on Panfrost. Its Mesa driver serves `glReadPixels` on the CPU, into a buffer too
