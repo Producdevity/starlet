@@ -44,6 +44,8 @@ namespace starlet::os {
 namespace {
 
 constexpr int max_ranges = 16;
+// Guest threads stopped inside an asynchronous interrupt (guest_thread_preempted).
+std::atomic<int> preempted{0};
 std::atomic<std::uintptr_t> range_begin[max_ranges], range_end[max_ranges];
 std::atomic<int> range_count{0};
 std::mutex registering;
@@ -212,7 +214,9 @@ void on_signal(int, siginfo_t*, void* context) {
         sigemptyset(&own);
         sigaddset(&own, async::interrupt_signal);
         pthread_sigmask(SIG_UNBLOCK, &own, nullptr);
+        preempted.fetch_add(1, std::memory_order_relaxed);
         async::take_interrupts();
+        preempted.fetch_sub(1, std::memory_order_relaxed);
     }
     errno = saved_errno;
 }
@@ -307,6 +311,8 @@ bool add_guest_code(const void* begin, const void* end) {
     range_count.store(count + 1, std::memory_order_release);
     return true;
 }
+
+bool guest_thread_preempted() { return preempted.load(std::memory_order_relaxed) > 0; }
 
 bool enable_async_interrupts(unsigned threshold) {
 #if STARLET_ASYNC_INTERRUPTS

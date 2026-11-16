@@ -52,6 +52,10 @@ void wait_for_interrupt();
 // returns false elsewhere.
 bool enable_async_interrupts(unsigned threshold_ms = 20);
 
+// True while an asynchronous interrupt has stopped a guest thread at an arbitrary instruction, where
+// it may hold game memory in registers. Guest CPU thread only.
+bool guest_thread_preempted();
+
 // Registers [begin, end) as guest code for asynchronous interrupts: code that the console's CPU may
 // interrupt at any instruction, such as the game's. It keeps frame records (-fno-omit-frame-pointer),
 // and between its instructions it holds no host lock and leaves no host state half-updated. A

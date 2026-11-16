@@ -97,7 +97,7 @@ void gpu_present(const void* frame_buffer, bool black);
 void flush_dirty_state();
 
 // Guest side: hands the staged bytes of a linked FIFO to the GPU thread.
-void flush_stage();
+void flush_stage(bool make_room = false);
 
 // Guest side, at VIFlush: a frame of peek groups ends (gx_sdk.cpp).
 void end_peek_frame();

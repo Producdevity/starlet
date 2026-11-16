@@ -14,6 +14,7 @@
 #include "starlet/sdk/gx.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cstdio>
 #include <stdexcept>
 #include <vector>
@@ -43,11 +44,19 @@ bool linked() { return cpu_fifo == nullptr || cpu_fifo == gp_fifo; }
 GXFifoObjPriv* priv(GXFifoObj* fifo) { return reinterpret_cast<GXFifoObjPriv*>(fifo); }
 const GXFifoObjPriv* priv(const GXFifoObj* fifo) { return reinterpret_cast<const GXFifoObjPriv*>(fifo); }
 
+// Stage bytes before this were submitted by a flush that left the stage in place (flush_stage).
+std::uint8_t* submitted_to = nullptr;
+
+void point_stage_at_chunk() {
+    starlet_gx_stage.cur = chunk->data();
+    starlet_gx_stage.end = chunk->data() + chunk->size();
+    submitted_to = nullptr;
+}
+
 void new_chunk() {
     os::host_allocation_scope host;
     chunk = new std::vector<std::uint8_t>(gpu_take_buffer(chunk_bytes));
-    starlet_gx_stage.cur = chunk->data();
-    starlet_gx_stage.end = chunk->data() + chunk->size();
+    point_stage_at_chunk();
 }
 
 // Unlinked CPU FIFO: writes land in its memory as on the console, wrapping at its end.
@@ -210,16 +219,31 @@ bool late_peek(bool depth, int x, int y, std::uintptr_t site, std::uint32_t& val
 
 }
 
-void flush_stage() {
+// A guest thread stopped by an asynchronous interrupt may hold starlet_gx_stage.cur in a register
+// and store it once it resumes. While one is stopped, a flush submits a copy of the new bytes and
+// leaves the stage in place. Making room for a writer moves it anyway: two threads writing at once
+// corrupt the console's FIFO too.
+void flush_stage(bool make_room) {
     if (!linked() || !chunk) return;
-    const std::size_t used = std::size_t(starlet_gx_stage.cur - chunk->data());
-    if (!used) return;
+    std::uint8_t* const from = submitted_to ? submitted_to : chunk->data();
+    const std::size_t used = std::size_t(starlet_gx_stage.cur - from);
+    if (!used && !make_room) return;
     os::host_allocation_scope host;
-    gpu_submit(std::move(*chunk), used);
-    ++submissions;
-    *chunk = gpu_take_buffer(chunk_bytes);
-    starlet_gx_stage.cur = chunk->data();
-    starlet_gx_stage.end = chunk->data() + chunk->size();
+    if (!make_room && os::guest_thread_preempted()) {
+        std::vector<std::uint8_t> copy = gpu_take_buffer(chunk_bytes);
+        std::memcpy(copy.data(), from, used);
+        gpu_submit(std::move(copy), used);
+        ++submissions;
+        submitted_to = starlet_gx_stage.cur;
+        return;
+    }
+    if (used) {
+        if (from != chunk->data()) std::memmove(chunk->data(), from, used);
+        gpu_submit(std::move(*chunk), used);
+        ++submissions;
+        *chunk = gpu_take_buffer(chunk_bytes);
+    }
+    point_stage_at_chunk();
 }
 
 void end_peek_frame() {
@@ -316,7 +340,7 @@ void starlet_gx_reserve(unsigned bytes) {
     starlet::os::checkpoint();
     if (linked()) {
         if (!chunk) new_chunk();
-        if (std::size_t(starlet_gx_stage.end - starlet_gx_stage.cur) < bytes) flush_stage();
+        if (std::size_t(starlet_gx_stage.end - starlet_gx_stage.cur) < bytes) flush_stage(true);
         return;
     }
     // The console's FIFO wraps from its end to its base once the GPU has read past; an unlinked
@@ -383,8 +407,7 @@ void GXSetCPUFifo(GXFifoObj* fifo) {
     cpu_fifo_wrapped = false;
     if (linked()) {
         if (!chunk) new_chunk();
-        starlet_gx_stage.cur = chunk->data();
-        starlet_gx_stage.end = chunk->data() + chunk->size();
+        point_stage_at_chunk();
     } else {
         target_fifo_memory();
     }
@@ -418,8 +441,7 @@ void GXSetGPFifo(GXFifoObj* fifo) {
     if (!cpu_fifo) return;
     if (linked()) {
         if (!chunk) new_chunk();
-        starlet_gx_stage.cur = chunk->data();
-        starlet_gx_stage.end = chunk->data() + chunk->size();
+        point_stage_at_chunk();
     } else {
         target_fifo_memory();
     }
