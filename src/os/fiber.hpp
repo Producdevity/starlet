@@ -36,4 +36,12 @@ void switch_to(Context& from, Context& to);
 // Async-signal-safe.
 std::uint32_t current_sample_id();
 
+// Calls function(argument) from a frame record that marks the bottom of the code it runs, after
+// storing that record's address to *frame. function is a void* (*)(void*) or an int (*)(); returns
+// its result register.
+std::uintptr_t call_entry(const void* function, void* argument, void** frame);
+
+// The return address in the frame record of call_entry's callee. Async-signal-safe.
+std::uintptr_t entry_return_address();
+
 }

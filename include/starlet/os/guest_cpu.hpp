@@ -41,6 +41,24 @@ bool interrupt_pending();
 // interrupt in the middle of the loop.
 void wait_for_interrupt();
 
+// Asynchronous interrupts, off until a port opts in. The console's CPU takes an interrupt at any
+// instruction while interrupts are enabled, and some game loops spin on state that only an
+// interrupt handler changes. Once enabled, a watchdog thread signals (SIGURG) the guest CPU thread
+// while interrupts have been pending for threshold_ms and it keeps running. The signal takes them
+// as a checkpoint would, at the interrupted instruction, only if that instruction and every return
+// address down to the thread's entry lie in code registered with add_guest_code; otherwise it
+// returns and a later signal retries. Logs each program counter where it took interrupts once, and
+// the stack of a thread that found no safe point for 1 s. AArch64 Linux only, and not under TSan:
+// returns false elsewhere.
+bool enable_async_interrupts(unsigned threshold_ms = 20);
+
+// Registers [begin, end) as guest code for asynchronous interrupts: code that the console's CPU may
+// interrupt at any instruction, such as the game's. It keeps frame records (-fno-omit-frame-pointer),
+// and between its instructions it holds no host lock and leaves no host state half-updated. A
+// thread's entry function (run_main_thread's or OSCreateThread's) is one of its frames. Returns
+// false, and logs, for a range that holds Starlet's own code. At most 16 ranges.
+bool add_guest_code(const void* begin, const void* end);
+
 // True on a guest thread (including the interrupt thread).
 bool on_guest_thread();
 

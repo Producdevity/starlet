@@ -23,6 +23,8 @@
 // stack pointer to *save, loads load and pops the registers saved there. starlet_fiber_start is
 // where a prepared context's first switch returns: it calls entry(argument) from the registers
 // prepare() stored, with no return address, so unwinders and frame-pointer walks end there.
+// starlet_fiber_call_entry(function, argument, frame) calls function(argument) from a frame record
+// whose address it stores to *frame; its callee's return address is starlet_fiber_entry_return.
 #if defined(__aarch64__)
 __asm__(
     ".text\n"
@@ -73,7 +75,33 @@ __asm__(
     "    blr x19\n"
     "    brk #1\n"
     "    .cfi_endproc\n"
-    ".size starlet_fiber_start, .-starlet_fiber_start\n");
+    ".size starlet_fiber_start, .-starlet_fiber_start\n"
+    ".p2align 4\n"
+    ".globl starlet_fiber_call_entry\n"
+    ".hidden starlet_fiber_call_entry\n"
+    ".type starlet_fiber_call_entry, %function\n"
+    "starlet_fiber_call_entry:\n"
+    "    .cfi_startproc\n"
+    "    stp x29, x30, [sp, #-16]!\n"
+    "    .cfi_def_cfa_offset 16\n"
+    "    .cfi_offset x29, -16\n"
+    "    .cfi_offset x30, -8\n"
+    "    mov x29, sp\n"
+    "    .cfi_def_cfa x29, 16\n"
+    "    str x29, [x2]\n"
+    "    mov x9, x0\n"
+    "    mov x0, x1\n"
+    "    blr x9\n"
+    ".globl starlet_fiber_entry_return\n"
+    ".hidden starlet_fiber_entry_return\n"
+    "starlet_fiber_entry_return:\n"
+    "    ldp x29, x30, [sp], #16\n"
+    "    .cfi_def_cfa sp, 0\n"
+    "    .cfi_restore x29\n"
+    "    .cfi_restore x30\n"
+    "    ret\n"
+    "    .cfi_endproc\n"
+    ".size starlet_fiber_call_entry, .-starlet_fiber_call_entry\n");
 #elif defined(__x86_64__)
 __asm__(
     ".text\n"
@@ -112,7 +140,31 @@ __asm__(
     "    callq *%r12\n"
     "    ud2\n"
     "    .cfi_endproc\n"
-    ".size starlet_fiber_start, .-starlet_fiber_start\n");
+    ".size starlet_fiber_start, .-starlet_fiber_start\n"
+    ".p2align 4\n"
+    ".globl starlet_fiber_call_entry\n"
+    ".hidden starlet_fiber_call_entry\n"
+    ".type starlet_fiber_call_entry, @function\n"
+    "starlet_fiber_call_entry:\n"
+    "    .cfi_startproc\n"
+    "    pushq %rbp\n"
+    "    .cfi_def_cfa_offset 16\n"
+    "    .cfi_offset %rbp, -16\n"
+    "    movq %rsp, %rbp\n"
+    "    .cfi_def_cfa_register %rbp\n"
+    "    movq %rbp, (%rdx)\n"
+    "    movq %rdi, %rax\n"
+    "    movq %rsi, %rdi\n"
+    "    callq *%rax\n"
+    ".globl starlet_fiber_entry_return\n"
+    ".hidden starlet_fiber_entry_return\n"
+    "starlet_fiber_entry_return:\n"
+    "    popq %rbp\n"
+    "    .cfi_def_cfa %rsp, 8\n"
+    "    .cfi_restore %rbp\n"
+    "    ret\n"
+    "    .cfi_endproc\n"
+    ".size starlet_fiber_call_entry, .-starlet_fiber_call_entry\n");
 #else
 #error "starlet::os fibers need a context switch for this architecture"
 #endif
@@ -121,6 +173,9 @@ __asm__(
 // offset in its section (GCC with ld.bfd).
 extern "C" __attribute__((visibility("hidden"))) void starlet_fiber_switch(void** save, void* load);
 extern "C" __attribute__((visibility("hidden"))) void starlet_fiber_start();
+extern "C" __attribute__((visibility("hidden"))) std::uintptr_t starlet_fiber_call_entry(const void* function, void* argument,
+                                                                                       void** frame);
+extern "C" __attribute__((visibility("hidden"))) void starlet_fiber_entry_return();
 
 namespace starlet::os::fiber {
 namespace {
@@ -194,5 +249,11 @@ void switch_to(Context& from, Context& to) {
 }
 
 std::uint32_t current_sample_id() { return sample_id; }
+
+std::uintptr_t call_entry(const void* function, void* argument, void** frame) {
+    return starlet_fiber_call_entry(function, argument, frame);
+}
+
+std::uintptr_t entry_return_address() { return reinterpret_cast<std::uintptr_t>(&starlet_fiber_entry_return); }
 
 }

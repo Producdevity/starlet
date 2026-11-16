@@ -2,6 +2,7 @@
 # time, arena and game memory, reports and crash reports. Linux, C++17.
 find_package(Threads REQUIRED)
 add_library(starlet_os STATIC
+    async_interrupts.cpp
     crash_report.cpp
     fiber.cpp
     game_memory.cpp

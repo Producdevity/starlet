@@ -1,5 +1,6 @@
 #include "starlet/os/guest_cpu.hpp"
 
+#include "async_interrupts.hpp"
 #include "fiber.hpp"
 #include "starlet/os/crash_report.hpp"
 #include "starlet/os/game_memory.hpp"
@@ -8,7 +9,9 @@
 
 #include "starlet/sdk/os.h"
 
+#include <sys/syscall.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -45,7 +48,9 @@ struct Guest {
     void* stack = nullptr;
     std::size_t stack_size = 0;
     void* (*entry)(void*) = nullptr;
+    int (*main)() = nullptr;  // The entry of run_main_thread's thread, instead of entry.
     void* parameter = nullptr;
+    void* entry_frame = nullptr;  // fiber::call_entry's frame record on this thread's stack.
     char name[16] = {};
     int priority() const { return interrupt_thread ? interrupt_priority : os->priority; }
 };
@@ -57,6 +62,8 @@ std::atomic<int> best_ready{priority_slots};  // Slot index of the best ready th
 std::deque<std::function<void()>> pending;
 std::condition_variable interrupt_raised;
 std::atomic<bool> pending_flag{false};
+std::atomic<bool> tracking_pending{false};
+std::atomic<std::uint64_t> pending_since_ns{0};  // CLOCK_MONOTONIC; 0 while none are pending.
 std::unordered_map<OSThread*, Guest*> guests;
 int scheduler_disabled = 0;
 Guest interrupt_guest;
@@ -65,10 +72,12 @@ std::atomic<SwitchTrace> switch_trace{nullptr};
 
 // The guest CPU's host thread: its own context runs only while no guest thread is ready.
 fiber::Context idle;
+std::atomic<pid_t> cpu_thread{0};
 std::condition_variable cpu_wake;
 bool cpu_waiting = false;
 bool cpu_stopped = false;  // The main thread ended.
 Guest* main_guest = nullptr;
+int main_result = 0;
 // A thread that ended and switched away from its stack, which the next context frees.
 Guest* exited = nullptr;
 
@@ -84,6 +93,22 @@ std::uint64_t thread_cpu_us() {
 }
 
 std::atomic<bool> in_handler{false};
+
+std::uint64_t monotonic_ns() {
+    timespec t{};
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return std::uint64_t(t.tv_sec) * 1000000000u + std::uint64_t(t.tv_nsec);
+}
+
+// Takes the next pending handler, with the scheduler locked.
+std::function<void()> next_handler() {
+    auto handler = std::move(pending.front());
+    pending.pop_front();
+    const bool more = !pending.empty();
+    pending_flag.store(more, std::memory_order_release);
+    if (!more) pending_since_ns.store(0, std::memory_order_relaxed);
+    return handler;
+}
 
 int slot(const Guest* g) { return g->priority() + 1; }
 
@@ -213,9 +238,7 @@ void handle_in_place(Guest* g, std::unique_lock<std::mutex>& lock) {
     in_handler.store(true, std::memory_order_relaxed);
     const bool enabled = g->interrupts;
     while (!pending.empty()) {
-        auto handler = std::move(pending.front());
-        pending.pop_front();
-        pending_flag.store(!pending.empty(), std::memory_order_release);
+        auto handler = next_handler();
         g->interrupts = false;
         lock.unlock();
         {
@@ -285,9 +308,7 @@ Guest* guest_of(OSThread* thread) {
     for (;;) {
         in_handler.store(true, std::memory_order_relaxed);
         while (!pending.empty()) {
-            auto handler = std::move(pending.front());
-            pending.pop_front();
-            pending_flag.store(!pending.empty(), std::memory_order_release);
+            auto handler = next_handler();
             interrupt_guest.interrupts = false;
             lock.unlock();
             handler();
@@ -311,8 +332,11 @@ Guest* guest_of(OSThread* thread) {
         free_exited();
         trace_resume(g);
     }
-    void* result = g->entry(g->parameter);
-    OSExitThread(result);
+    // Through call_entry, so the asynchronous interrupt signal finds where the thread's own frames end.
+    const void* code = g->main ? reinterpret_cast<const void*>(g->main) : reinterpret_cast<const void*>(g->entry);
+    const std::uintptr_t result = fiber::call_entry(code, g->parameter, &g->entry_frame);
+    if (g->main) main_result = int(result);
+    OSExitThread(g->main ? nullptr : reinterpret_cast<void*>(result));
     std::abort();
 }
 
@@ -422,6 +446,8 @@ void set_switch_trace(SwitchTrace trace) { switch_trace.store(trace, std::memory
 void raise_interrupt(std::function<void()> handler) {
     host_allocation_scope host_;  // Scheduler containers must not take game memory.
     std::lock_guard<std::mutex> lock(scheduler);
+    if (pending.empty() && tracking_pending.load(std::memory_order_relaxed))
+        pending_since_ns.store(monotonic_ns(), std::memory_order_relaxed);
     pending.push_back(std::move(handler));
     pending_flag.store(true, std::memory_order_release);
     interrupt_raised.notify_all();
@@ -463,9 +489,6 @@ void checkpoint() {
 }
 
 int run_main_thread(int (*entry)()) {
-    static int (*main_entry)() = nullptr;
-    static int result = 0;
-    main_entry = entry;
     name_thread(guest_cpu_thread_name);
     install_signal_stack();  // A guest stack overflow still gets its crash report.
     {
@@ -476,21 +499,63 @@ int run_main_thread(int (*entry)()) {
         interrupt_guest.interrupts = false;
         start_fiber(&interrupt_guest, 0);
     }
-    OSCreateThread(&main_thread, [](void*) -> void* {
-        result = main_entry();
-        return nullptr;
-    }, nullptr, main_thread_stack_marker + sizeof main_thread_stack_marker, 0, 16, 0);
+    OSCreateThread(&main_thread, nullptr, nullptr, main_thread_stack_marker + sizeof main_thread_stack_marker, 0, 16, 0);
     {
         host_allocation_scope host_;
         std::lock_guard<std::mutex> lock(scheduler);
         main_guest = guest_of(&main_thread);
+        main_guest->main = entry;
     }
+    cpu_thread.store(pid_t(syscall(SYS_gettid)), std::memory_order_release);
     OSResumeThread(&main_thread);
     cpu_loop();
-    return result;
+    cpu_thread.store(0, std::memory_order_release);
+    return main_result;
 }
 
 std::uint32_t guest_sample_id() { return fiber::current_sample_id(); }
+
+namespace async {
+
+const char* const nothing_pending = "no interrupt pending";
+
+// On the guest CPU thread, from a signal that interrupted its code: the code holds no scheduler
+// state unless Starlet's frames are on the stack, which the caller rules out before acting on this.
+Interruptee interruptee() {
+    Interruptee out;
+    const Guest* g = self;
+    if (!g) {
+        out.refusal = "not a guest thread";
+        return out;
+    }
+    out.name = g->name;
+    out.stack_low = reinterpret_cast<std::uintptr_t>(g->stack);
+    out.stack_high = out.stack_low + g->stack_size;
+    out.entry_frame = reinterpret_cast<std::uintptr_t>(g->entry_frame);
+    if (!pending_flag.load(std::memory_order_acquire)) out.refusal = nothing_pending;
+    else if (g->interrupt_thread) out.refusal = "the interrupt thread runs";
+    else if (handling_in_place) out.refusal = "in an interrupt handler";
+    else if (running != g || !g->entry_frame) out.refusal = "switching threads";
+    else if (!g->interrupts) out.refusal = "interrupts disabled";
+    else if (scheduler_disabled) out.refusal = "scheduler disabled";
+    return out;
+}
+
+void take_interrupts() {
+    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    std::unique_lock<std::mutex> lock(scheduler);
+    reschedule(lock, false);
+}
+
+void track_pending() { tracking_pending.store(true, std::memory_order_relaxed); }
+
+std::uint64_t pending_since() { return pending_since_ns.load(std::memory_order_relaxed); }
+
+pid_t guest_cpu_thread() { return cpu_thread.load(std::memory_order_acquire); }
+
+std::uint64_t now_ns() { return monotonic_ns(); }
+
+}
 
 void report_guest_thread() {
     const Guest* g = self;
