@@ -65,11 +65,15 @@ struct GpuSetup {
     bool frame_ahead = false;
     // Draw-sync callbacks that read the EFB are answered from the group's snapshot one frame
     // earlier; with this on, one that is not read back yet when its token arrives is answered
-    // from the snapshot two frames earlier when that is, instead of the GPU thread waiting for the
-    // GPU to finish the frame before. The callback sees values one frame older than otherwise (a
-    // sun flare's occlusion or Mario's silhouette changes one frame later). Off by default;
-    // STARLET_GX_PEEK_LAG=1 in the environment turns it on as well. sync_reads overrides it.
+    // from the newest of the group's snapshots up to peek_lag_frames frames earlier still that
+    // is, instead of the GPU thread waiting for the GPU to finish the frame before. With none read
+    // back the GPU thread waits for the oldest. The callback then sees values up to that many
+    // frames older (a sun flare's occlusion or Mario's silhouette changes that much later), and the
+    // game may run that many frames further ahead of the GPU. Off by default;
+    // STARLET_GX_PEEK_LAG=N (1 to 3) in the environment turns it on with N frames. sync_reads
+    // overrides it.
     bool peek_lag = false;
+    unsigned peek_lag_frames = 1;
     Diagnostics diagnostics;
 };
 

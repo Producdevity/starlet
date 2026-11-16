@@ -15,6 +15,7 @@
 #include "starlet/os/thread_name.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -276,8 +277,9 @@ bool token_reads_efb(std::uint16_t token) { return peek_tokens[token >> 6].load(
 
 // GpuSetup::sync_reads, fixed before the GPU thread starts.
 bool sync_reads = false;
-// GpuSetup::peek_lag.
-bool peek_lag = false;
+// GpuSetup::peek_lag: how many frames older than the last one a draw-sync callback may read.
+unsigned peek_lag = 0;
+constexpr unsigned max_peek_lag = 3;
 // Peek groups and draw-sync callbacks answered from a snapshot one frame earlier, for the stats line.
 std::atomic<std::uint64_t> late_reads{0};
 
@@ -596,10 +598,10 @@ private:
                 while (!pending_.empty() && jobs_.empty()) {
                     if (wake_.wait_for(lock, std::chrono::milliseconds(1), [&] { return !jobs_.empty(); })) break;
                     lock.unlock();
-                    if (!renderer_.snapshot_ready(pending_.front().snapshot)) {
+                    if (!settle(pending_.front())) {
                         gx::sync_stats::Context ctx("token-snapshot-wait");
                         gx::sync_stats::Wait blocked("token-snapshot-wait (gpu)");
-                        renderer_.wait_snapshot(pending_.front().snapshot);
+                        renderer_.wait_snapshot(awaited_snapshot());
                     }
                     pump();
                     lock.lock();
@@ -655,11 +657,14 @@ private:
     std::unordered_map<std::uintptr_t, FrameBufferInfo> frame_buffers_;
     GpuEvents events_;
     // Draw-done and token interrupts in command order; a token with a snapshot holds back
-    // itself and everything after it until its snapshot is read back.
+    // itself and everything after it until its snapshot is read back, or one of its fallbacks:
+    // older snapshots of the same group (peek_lag), newest first. The newest one read back
+    // answers it.
     struct Interrupt {
         bool draw_done;
         std::uint16_t token;
         int snapshot;
+        std::array<int, max_peek_lag> fallbacks{{-1, -1, -1}};
     };
     std::deque<Interrupt> pending_;
     // Draw-sync callbacks that read the EFB, by token value and its ordinal among that value's
@@ -668,9 +673,14 @@ private:
         std::uint16_t token;
         unsigned ordinal, frame;
         int snapshot;
-        // With peek_lag: the snapshot of the frame before, held by the group (older_frame its frame).
-        int older = -1;
-        unsigned older_frame = 0;
+        // With peek_lag: the snapshots of the frames before, newest first, held by the group;
+        // past_frames their frames.
+        std::array<int, max_peek_lag> past{{-1, -1, -1}};
+        std::array<unsigned, max_peek_lag> past_frames{};
+        void drop_past(Renderer& renderer) {
+            for (int& p : past)
+                if (p >= 0) renderer.release_snapshot(p), p = -1;
+        }
     };
     std::vector<TokenGroup> token_groups_;
     std::vector<std::pair<std::uint16_t, unsigned>> token_counts_;
@@ -696,28 +706,31 @@ private:
         const int current = renderer_.snapshot_efb(region);
         Interrupt i{false, token, -1};
         if (peek_lag && group->snapshot >= 0 && group->frame + 1 == display_frame_ && !poked_) {
-            // The group keeps the last frame's snapshot as its older one; the callback gets a new
-            // reference to it, or to the one before when the last frame's is not read back yet.
-            const bool use_older = group->older >= 0 && group->older_frame + 2 == display_frame_ &&
-                                   !renderer_.snapshot_ready(group->snapshot) && renderer_.snapshot_ready(group->older);
-            if (use_older) {
-                i.snapshot = group->older;
-                gx::sync_stats::note("token: answered from the snapshot two frames back", 0);
-            } else {
-                i.snapshot = group->snapshot;
-                renderer_.retain_snapshot(group->snapshot);
-                if (group->older >= 0) renderer_.release_snapshot(group->older);
-                gx::sync_stats::note("token: answered from last frame's snapshot", 0);
+            // The callback gets the last frame's snapshot and, as fallbacks, the group's ones from
+            // up to peek_lag frames before it: the newest one read back answers it, so the token
+            // waits for the GPU only when the GPU is further behind than that. The group then
+            // keeps the last frame's snapshot as its newest past one.
+            i.snapshot = group->snapshot;
+            renderer_.retain_snapshot(group->snapshot);
+            for (unsigned k = 0; k < peek_lag && group->past[k] >= 0 && group->past_frames[k] + 2 + k == display_frame_; ++k) {
+                i.fallbacks[k] = group->past[k];
+                renderer_.retain_snapshot(group->past[k]);
             }
-            group->older = group->snapshot;
-            group->older_frame = group->frame;
+            if (group->past[peek_lag - 1] >= 0) renderer_.release_snapshot(group->past[peek_lag - 1]);
+            for (unsigned k = peek_lag - 1; k > 0; --k) {
+                group->past[k] = group->past[k - 1];
+                group->past_frames[k] = group->past_frames[k - 1];
+            }
+            group->past[0] = group->snapshot;
+            group->past_frames[0] = group->frame;
+            if (i.fallbacks[0] < 0) gx::sync_stats::note("token: answered from last frame's snapshot", 0);
             late_reads.fetch_add(1, std::memory_order_relaxed);
         } else if (group->snapshot >= 0 && group->frame + 1 == display_frame_ && !poked_) {
             i.snapshot = group->snapshot;
             late_reads.fetch_add(1, std::memory_order_relaxed);
             gx::sync_stats::note("token: answered from last frame's snapshot", 0);
         } else {
-            if (group->older >= 0) { renderer_.release_snapshot(group->older); group->older = -1; }
+            group->drop_past(renderer_);
             gx::sync_stats::note(group->snapshot < 0 ? "token: first appearance of its group, own snapshot"
                                  : group->frame + 1 != display_frame_ ? "token: group skipped a frame, own snapshot"
                                  : "token: EFB poked this frame, own snapshot", 0);
@@ -739,7 +752,7 @@ private:
                 continue;
             }
             if (it->snapshot >= 0) renderer_.release_snapshot(it->snapshot);
-            if (it->older >= 0) renderer_.release_snapshot(it->older);
+            it->drop_past(renderer_);
             it = token_groups_.erase(it);
         }
     }
@@ -757,12 +770,40 @@ private:
         pending_.push_back(i);
         pump();
     }
+    // An interrupt is ready once its snapshot or a fallback is read back; the newest such one
+    // answers it and the others are released.
+    bool settle(Interrupt& i) {
+        static const char* const answered[max_peek_lag + 1] = {
+            "token: answered from last frame's snapshot", "token: answered from the snapshot two frames back",
+            "token: answered from the snapshot three frames back", "token: answered from the snapshot four frames back"};
+        if (i.snapshot >= 0 && !renderer_.snapshot_ready(i.snapshot)) {
+            unsigned k = 0;
+            while (k < max_peek_lag && i.fallbacks[k] >= 0 && !renderer_.snapshot_ready(i.fallbacks[k])) ++k;
+            if (k == max_peek_lag || i.fallbacks[k] < 0) return false;
+            renderer_.release_snapshot(i.snapshot);
+            i.snapshot = i.fallbacks[k];
+            i.fallbacks[k] = -1;
+            gx::sync_stats::note(answered[k + 1], 0);
+        } else if (i.fallbacks[0] >= 0) {
+            gx::sync_stats::note(answered[0], 0);
+        }
+        for (int& f : i.fallbacks)
+            if (f >= 0) renderer_.release_snapshot(f), f = -1;
+        return true;
+    }
     void pump() {
-        while (!pending_.empty() && (pending_.front().snapshot < 0 || renderer_.snapshot_ready(pending_.front().snapshot))) {
+        while (!pending_.empty() && settle(pending_.front())) {
             const Interrupt i = pending_.front();
             pending_.pop_front();
             raise(i);
         }
+    }
+    // The snapshot the front interrupt can be answered from soonest: its oldest fallback.
+    int awaited_snapshot() const {
+        const Interrupt& i = pending_.front();
+        for (unsigned k = max_peek_lag; k > 0; --k)
+            if (i.fallbacks[k - 1] >= 0) return i.fallbacks[k - 1];
+        return i.snapshot;
     }
     std::atomic<std::uint16_t> token_{0};
     std::thread thread_;
@@ -808,7 +849,9 @@ void start_gpu(GpuSetup setup) {
     const char* exact = std::getenv("STARLET_GX_SYNC_READS");
     sync_reads = setup.sync_reads || (exact && std::strcmp(exact, "1") == 0);
     const char* lag = std::getenv("STARLET_GX_PEEK_LAG");
-    peek_lag = (setup.peek_lag || (lag && std::strcmp(lag, "1") == 0)) && !sync_reads;
+    // STARLET_GX_PEEK_LAG=N allows N frames (1 to 3); 1 is GpuSetup::peek_lag's default.
+    const unsigned lag_frames = lag && lag[0] >= '1' && lag[0] <= '3' && !lag[1] ? unsigned(lag[0] - '0') : 0;
+    peek_lag = sync_reads ? 0 : std::max(lag_frames, setup.peek_lag ? std::clamp(setup.peek_lag_frames, 1u, max_peek_lag) : 0u);
     const char* ahead = std::getenv("STARLET_GX_FRAME_AHEAD");
     setup.frame_ahead = setup.frame_ahead || (ahead && std::strcmp(ahead, "1") == 0);
     host_allocation_scope host;

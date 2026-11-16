@@ -1,6 +1,8 @@
 // Draw-sync callbacks with GpuSetup::peek_lag: a token whose previous-frame snapshot is not read back
 // yet is answered from the one before, without the GPU thread waiting; with the setting off it waits.
-// Snapshot references are balanced either way.
+// With neither read back, the GPU thread waits for the older one, which the GPU reaches first, and a
+// token whose two candidates are both read back gets the newer. Snapshot references are balanced
+// either way.
 #include "starlet/compat/gx_fifo.h"
 #include "starlet/gx_fifo/gpu.hpp"
 #include "starlet/gx_fifo/renderer.hpp"
@@ -56,7 +58,23 @@ public:
     bool snapshot_ready(int index) const override { return ready_[index].load(); }
     void wait_snapshot(int index) override {
         ++forced_waits;
+        last_waited = index;
         ready_[index] = true;
+    }
+    // Every snapshot taken so far is read back.
+    void ready_all() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (int i = 0; i < slots; ++i)
+            if (held_[i]) ready_[i] = true;
+    }
+    std::uint32_t value(int index) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return values_[index];
+    }
+    // The newest snapshot taken.
+    int latest() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return latest_;
     }
     bool peek_depth_snapshot(int index, int x, int y, std::uint32_t& value) const override {
         if (!ready_[index] || !regions_[index].contains(x, y)) return false;
@@ -95,7 +113,7 @@ public:
 
     static constexpr int slots = 16;
     std::atomic<bool> ready_at_once{true}, hold{false};
-    std::atomic<int> taken{0}, exact{0}, released{0}, live_peeks{0}, forced_waits{0};
+    std::atomic<int> taken{0}, exact{0}, released{0}, live_peeks{0}, forced_waits{0}, last_waited{-1};
     mutable std::atomic<int> snapshot_peeks{0};
 
 private:
@@ -111,6 +129,7 @@ private:
         last_region_ = region;
         ready_[index] = ready_at_once.load();
         held_[index] = 1;
+        latest_ = index;
         return index;
     }
     std::mutex mutex_;
@@ -120,11 +139,13 @@ private:
     std::atomic<bool> ready_[slots] = {};
     int held_[slots] = {};
     int selected_ = -1;
+    int latest_ = -1;
 };
 
 GroupRenderer renderer;
 std::uint8_t* arena = nullptr;
 bool lag = false;
+unsigned lag_frames = 1;
 std::vector<u32> peeked;
 
 void bp(std::uint8_t address, std::uint32_t value) {
@@ -192,6 +213,47 @@ int guest_main() {
     token(0x10);
     GXDrawDone();
     require(peeked.size() == before + 1, "the callback ran");
+    const int frame4 = renderer.latest();
+    if (lag) {
+        // Frames 5 to 7: snapshots stop being read back. Frame 5 is answered from frame 4's (read
+        // back), frame 6 from frame 4's as the fallback of frame 5's.
+        display_copy();
+        renderer.ready_at_once = false;
+        const int before5 = renderer.forced_waits;
+        token(0x10);
+        GXDrawDone();
+        const int frame5 = renderer.latest();
+        display_copy();
+        token(0x10);
+        GXDrawDone();
+        const int frame6 = renderer.latest();
+        require(renderer.forced_waits == before5, "a read-back candidate answers without a wait");
+        display_copy();
+        // Frame 7: neither frame 6's nor frame 5's snapshot is read back. With one frame of lag the
+        // GPU thread waits for frame 5's, the older one, and the callback reads it; with two,
+        // frame 4's answers without a wait.
+        const int waits = renderer.forced_waits;
+        token(0x10);
+        GXDrawDone();
+        if (lag_frames == 1) {
+            require(renderer.forced_waits == waits + 1 && renderer.last_waited == frame5,
+                    "with neither candidate read back the GPU thread waits for the older one");
+            require(peeked.back() == renderer.value(frame5), "and the callback reads it");
+        } else {
+            require(renderer.forced_waits == waits && peeked.back() == renderer.value(frame4),
+                    "two frames of lag answer from the snapshot three frames back without a wait");
+        }
+        display_copy();
+        // Frame 8: frame 7's and frame 6's snapshots are both read back: the newer answers.
+        renderer.ready_all();
+        renderer.ready_at_once = true;
+        const int waits8 = renderer.forced_waits;
+        token(0x10);
+        GXDrawDone();
+        require(renderer.forced_waits == waits8, "read-back candidates need no wait");
+        require(peeked.back() != renderer.value(frame6) && peeked.back() > renderer.value(frame6),
+                "with both candidates read back the callback reads the newer one");
+    }
     // A CPU write into the EFB makes the token read its own snapshot, lag or not.
     display_copy();
     gx_fifo::note_efb_poke();
@@ -210,7 +272,8 @@ int guest_main() {
 }
 
 int main(int argc, char** argv) {
-    lag = argc > 1 && std::strcmp(argv[1], "lag") == 0;
+    lag = argc > 1 && (std::strcmp(argv[1], "lag") == 0 || std::strcmp(argv[1], "lag2") == 0);
+    lag_frames = argc > 1 && std::strcmp(argv[1], "lag2") == 0 ? 2 : 1;
     constexpr std::size_t arena_size = 16 * 1024 * 1024;
     arena = static_cast<std::uint8_t*>(os::map_fixed(0x10000000, arena_size, "test arena"));
     os::set_memory_map({0x10000000});
@@ -223,9 +286,10 @@ int main(int argc, char** argv) {
     setup.efb.height = 448;
     setup.flush_dirty_state = [] {};
     setup.peek_lag = lag;
+    setup.peek_lag_frames = lag_frames;
     gx_fifo::start_gpu(setup);
     const int result = os::run_main_thread(guest_main);
-    std::printf("peek_lag%s: %s\n", lag ? " (on)" : " (off)", result == 0 ? "passed" : "failed");
+    std::printf("peek_lag%s: %s\n", !lag ? " (off)" : lag_frames == 2 ? " (two frames)" : " (on)", result == 0 ? "passed" : "failed");
     std::fflush(nullptr);
     std::_Exit(result);
 }
