@@ -2334,6 +2334,23 @@ void GlesRenderer::copy_texture_known(const TextureCopy& p, std::uint8_t* destin
     const auto address = reinterpret_cast<std::uintptr_t>(destination);
     if (!destination || (address & 31) || capacity < required || capacity > UINTPTR_MAX-address)
         throw std::invalid_argument("invalid native texture-copy destination span");
+    if (contents && !p.clear) {
+        // The copy leaves the EFB as it is, and its bytes are known: no GPU copy. Memory takes
+        // them as a host write would, after earlier write-backs into it, and lookups read them there.
+        try {
+            std::uint64_t earlier = 0;
+            for (const auto& w : g.issued_write_backs)
+                if (w->token < std::uint64_t{token} + required && token < std::uint64_t{w->token} + w->bytes) earlier = w->sequence;
+            if (earlier) land_write_backs(earlier, true);
+            for (const auto& c : g.pending_copies)
+                if (c.token < std::uint64_t{token} + required && token < c.token + c.bytes) { g.flush_copies(); break; }
+            g.direct->before_write(destination, required);
+            std::memcpy(destination, contents, required);
+            g.direct->invalidate(destination, required);
+            ++g.stats.known_copies;
+        } catch (...) { g.failed = true; throw; }
+        return;
+    }
     if (p.clear && (p.clear->rgba6 != p.rgba6 || p.clear->depth > 0xffffff ||
         p.clear->rectangle.x != p.x || p.clear->rectangle.y != g.efb_height-p.y-p.height ||
         p.clear->rectangle.width != p.width || p.clear->rectangle.height != p.height))

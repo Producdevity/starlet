@@ -139,9 +139,11 @@ public:
     // pending, and presentation waits for the previous frame. Consecutive resident copies that
     // differ only in their target render in one pass (renderer.md).
     void copy_texture_resident(const TextureCopy&, std::uint8_t*, std::size_t, std::uint32_t token) override;
-    // Direct path: copy_texture_resident into a write_back range whose encoded bytes the caller
-    // computed. Memory takes contents at once, as a landed write-back; nothing is read back.
-    // Earlier write-backs into the range land first. Without the direct path, a plain copy.
+    // Direct path: a copy whose encoded bytes the caller computed. Earlier write-backs into its
+    // memory land first, then memory takes contents at once; nothing is read back. A copy that
+    // leaves the EFB as it is renders nothing: resident copies of the range are dropped as by a
+    // host write, and lookups read memory. One that clears the EFB is kept resident as well, like
+    // copy_texture_resident. Without the direct path, a plain copy.
     void copy_texture_known(const TextureCopy&, std::uint8_t*, std::size_t, std::uint32_t token, const std::uint8_t* contents);
     void release_resident(std::uint32_t token, std::size_t bytes) override;
     // Direct path, for host transfers on the game's behalf (DMA engines, card and disc
