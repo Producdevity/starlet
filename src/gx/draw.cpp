@@ -312,7 +312,8 @@ GlesDrawResult plan_gles_draw(const DrawPacket& packet, FramebufferFetch fetch, 
     for (unsigned i = 0; i < packet.tev->pipeline.stage_count; ++i) {
         const auto& stage = packet.indirect->stages[i];
         p.key.insert(p.key.end(), {stage.matrix, stage.lookup,
-                                   static_cast<std::uint8_t>(stage.bias | stage.format << 3 | stage.lod_unmodified << 5)});
+                                   static_cast<std::uint8_t>(stage.bias | stage.format << 3 | stage.lod_unmodified << 5),
+                                   static_cast<std::uint8_t>(stage.wrap_s | stage.wrap_t << 3)});
     }
     if (packet.indirect->lookup_mask & ~15u) return reject("invalid indirect lookup mask");
     for (unsigned i = 0; i < 4; ++i) if (packet.indirect->lookup_mask & (1u << i)) {

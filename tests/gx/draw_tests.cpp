@@ -258,6 +258,10 @@ void indirect_formats_and_lod() {
     check(tiled.fragment.find("textureGrad(uGxTexture3,")!=std::string::npos &&
           tiled.fragment.find("dFdx((gx_tex1.xy/gx_tex1.z)*uGxCoordinateScale[0])")!=std::string::npos,
           "LOD derivatives come from the unmodified coordinate");
+    f.bp(0x10,0x0c8208); // The tiled stage with wrap 32 instead of 16.
+    const auto rewrapped_capture=f.capture(); const auto rewrapped_plan=plan_gles_draw(packet(rewrapped_capture));
+    const auto& rewrapped=pipeline(rewrapped_plan);
+    check(rewrapped.fragment!=tiled.fragment && rewrapped.key!=tiled.key,"wrap modes are part of program identity");
     f.bp(0x10,0x0da278);
     const auto biased_capture=f.capture(); const auto biased_plan=plan_gles_draw(packet(biased_capture));
     const auto& biased=pipeline(biased_plan);
