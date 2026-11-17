@@ -39,11 +39,12 @@ and the disc handling and SDL services its ports share:
   SIGTERM into a prompt exit with the saves flushed. C++17 and SDL2.
 
 A port feeds the command stream to a `Decoder` and gives it a `MemoryReader` for
-the memory the commands refer to; [src/gx/decoder.md](src/gx/decoder.md) describes
-that contract. [src/disc/disc.md](src/disc/disc.md) describes the disc formats,
-their limits and the setup flow; [src/card/card.md](src/card/card.md) the card
-folders, images and CARD calls; [src/host/host.md](src/host/host.md) the audio,
-controller and quit contracts.
+the memory the commands refer to; [docs/GX-model.md](docs/GX-model.md) describes
+that contract. [docs/Discs-and-memory-cards.md](docs/Discs-and-memory-cards.md)
+describes the disc formats, their limits and the setup flow, and the card folders,
+images and CARD calls; [docs/Host-services.md](docs/Host-services.md) the audio,
+controller and quit contracts. The other pages in [docs/](docs/Home.md) cover the
+GLES renderer, the OS and GX FIFO services and the other SDK services.
 
 ## Layout
 
@@ -53,7 +54,7 @@ include/starlet/gx/gles/  OpenGL ES renderer headers
 include/starlet/disc/     disc image, FST and setup headers
 include/starlet/card/     memory card headers
 include/starlet/host/     audio, controller and quit headers
-src/gx/                   GX model, with a note per module
+src/gx/                   GX model
 src/gx/gles/              OpenGL ES renderer
 src/disc/                 disc images and setup
 src/card/                 memory cards
@@ -62,6 +63,7 @@ tests/gx/                 host tests
 tests/disc/               disc host tests
 tests/card/               memory card tests
 tests/host/               audio, controller and quit tests
+docs/                     subsystem pages, mirrored to the GitHub wiki
 third_party/zstd/         Zstandard v1.5.6 (submodule)
 ```
 

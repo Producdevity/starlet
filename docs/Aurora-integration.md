@@ -192,6 +192,58 @@ Other GPUs and other Aurora games are untested.
 | Display list call with a host pointer | Ignored |
 | Anything else | Logged once, then Starlet stops decoding for the run |
 
+### Bridge internals
+
+- Threads. Upstream trees: `process()` and `end_frame()` run on the main thread; the bridge's GL
+  thread owns the context from `initialize()` on, runs the renderer and swaps, so Aurora's main
+  thread issues no GL call. At most two frames wait for it, so the game cannot run ahead. GL
+  objects die on that thread. GLES fork: Aurora's render worker owns the context and calls
+  `present(fbo, w, h)`, which draws into the present target and leaves Aurora's GL state shadow
+  invalid. Aurora's non-stencil UI passes can leave an invalid cached stencil enum pending, so
+  ownership boundaries clear it and Starlet diagnoses only its own GL calls.
+- Aurora subcommands. `aurora_commands.hpp` follows the tree it is built against. The fork
+  (`bmdhacks/aurora 3fbacee`) uses `0x38` for `REQUEST_DEPTH_SNAPSHOT` (no payload). Upstream
+  `5179721` has none of `0x38`, `0x3b` and `0x52`; `5794daa` has `0x38` as `SET_TEX_IMG_PTR`
+  (u8 map, u64 pointer), `0x3b` and `0x52`. Each optional command compiles in when `GXAurora.h`
+  defines its macro. `STARLET_AURORA_UPSTREAM` selects the host glue (the fork owns its GL
+  context through its render worker; upstream trees do not). The bridge's own subcommand carries a
+  display-list pointer, a u32 size and the list's u64 write stamp; the next size bytes of the FIFO
+  are that copy.
+- Addresses. Starlet's decoder works in 32-bit GX addresses. The game's MEM1 arena maps linearly
+  into `[0, 512 MiB)` (addresses below the arena base stay invalid, so a null address reads
+  nothing; the arena ends at the window base); other ranges get addresses from a second window,
+  and every address keeps its pointer's alignment modulo 32, which texture and TLUT registers rely
+  on. GX texture registers hold 29-bit addresses, hence the 512 MiB end. A palette address above
+  64 MiB does not fit BP `0x64` (21 bits of 32-byte units) and loads from its bytes. A TLUT name
+  maps to a TMEM line (512 bytes): `GX_TLUT0..15` hold up to 256 entries, `GX_BIGTLUT0..3` up to
+  16384.
+- Write tracking. `aurora_starlet_note_write` advances the write stamp of arena blocks (1 KiB)
+  and the generation of every big-endian array and loaded texture the range touches. Host-order
+  arrays, which PC code writes without reporting, are hashed once per feed (the game does not run
+  while a FIFO drains) and their generation advances when the hash changes; arrays above a size
+  limit keep generation zero. A texture rewritten during the frame is copied at load
+  (`texture_data()`), so each draw reads it as it was loaded.
+- EFB copies. Aurora keeps each copy as a texture named by its destination pointer, and PC code
+  can copy the frame at full size into a buffer it still describes at half size, so a texture whose
+  data pointer is a copy destination reads the copy as made. The bridge gives every destination a
+  private address range and storage: copies never write game memory or overlap. A display copy
+  (BP `0x52` bit 14) has no destination of its own and is not planned, since the frame is presented
+  from the EFB. Aurora clears colour, alpha and depth to the copy-clear values when a frame begins,
+  whatever the update masks, and the game relies on it.
+- Offscreen passes. `GXCreateFrameBuffer` stands in for `GXSetViewport(0, 0, w, h, 0, 1)` and
+  `GXSetScissor(0, 0, w, h)`; `GXRestoreFrameBuffer` puts back the frame's viewport and scissor.
+  Draws and copies between them use a separate cleared target and leave the EFB as it was.
+- Scissor offset. The fork has no `GXSetScissorBoxOffset`, so the bridge writes BP `0x59` at the
+  first feed: 171 (342 halved), what `GXSetScissor` and `GXSetViewport` add. Upstream trees encode each
+  half as `(offset - 342) >> 1` in ten bits; the console field is `(offset + 342) >> 1`, which the
+  bridge rebuilds from the signed offset.
+- Texture state. J3D display lists write console TMEM offsets and truncated pointers for image and
+  TLUT addresses; the bridge takes them from `LOAD_TEXOBJ`, as Aurora's renderer does. Aurora's
+  textures may pass 1024 texels (a font's pages joined into one), while the image register keeps
+  only the low ten bits of each size. A texture's negative LOD bias is sign-extended over bits
+  17..23, since the PC build converts the float bias to an integer the console truncated to its
+  8-bit field.
+
 ### PC texture formats
 
 | Format | Handling |
