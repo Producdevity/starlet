@@ -1,5 +1,3 @@
-// AX against hand-built ARAM and parameter blocks: the accelerator's decoding and looping, sample-rate
-// conversion, the mixer, aux routing, the compressor, voice allocation and the AI-paced frames.
 #include "../ai/fake_ai_platform.hpp"
 #include "../../src/ax/ax_internal.hpp"
 

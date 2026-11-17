@@ -278,7 +278,6 @@ struct VideoDecoder::Impl {
             ac[i] = &huffman[ac_index];
         }
     }
-    // Decodes one block into the 8x8 area of plane component at (x, y).
     void block(BitReader &bits, unsigned component, int &prediction, unsigned x, unsigned y) {
         const auto &q = quantization[quantization_selector[component]];
         bits.refill();

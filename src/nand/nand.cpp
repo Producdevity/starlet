@@ -334,7 +334,7 @@ void* run_requests(void*) {
                 std::lock_guard<std::mutex> lock(mutex);
                 *next = {};
             }
-            // Completion owns no caller memory after the callback; it may resubmit its block.
+            // The slot is free before the callback runs, so a callback may resubmit its block.
             if (hooks.complete) hooks.complete(request.callback, result, request.block);
             else request.callback(result, request.block);
         }

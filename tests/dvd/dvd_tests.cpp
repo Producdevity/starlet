@@ -1,5 +1,3 @@
-// starlet::dvd on one installed disc: path resolution with the SDK's rules, the current
-// directory and directory listings.
 #include "starlet/dvd/dvd.hpp"
 #include "starlet/os/game_memory.hpp"
 #include "starlet/os/guest_cpu.hpp"

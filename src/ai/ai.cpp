@@ -1,6 +1,3 @@
-// The audio interface DMA. AIInitDMA programs the next block, which the DMA latches when the
-// current one finishes; the latch raises the AI interrupt, so the game programs the block after it
-// from the callback, as on the console.
 #include "starlet/ai/ai.hpp"
 
 #include "platform.hpp"
@@ -95,7 +92,6 @@ struct State {
     bool running = false;
     std::uint32_t selector = 0;
     unsigned rate = 0;
-    // The DMA registers, and the blocks they and the running transfer use.
     std::uint32_t address = 0, length = 0;
     Block blocks[3];
     int active = -1, pending = -1;

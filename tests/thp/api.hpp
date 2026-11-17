@@ -1,6 +1,4 @@
 #pragma once
-// The call shapes these tests were first written against (Super Mario Galaxy's platform layer),
-// over starlet::thp.
 #include "starlet/thp/thp.hpp"
 #include <array>
 #include <cstdint>

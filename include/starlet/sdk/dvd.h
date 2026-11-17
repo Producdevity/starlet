@@ -1,8 +1,5 @@
 #pragma once
 
-// The DVD SDK types and functions starlet::dvd implements, with the console SDK's layouts
-// (see os.h for how a port checks them against its own headers).
-
 #include "starlet/sdk/os.h"
 
 namespace starlet::sdk {

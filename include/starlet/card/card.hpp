@@ -1,6 +1,6 @@
 #pragma once
 
-// Memory cards stored as Dolphin GCI folders (src/card/card.md).
+// Memory cards stored as Dolphin GCI folders.
 //
 // Folder: one slot's card as files on the host, one .gci per card file plus
 // card.txt holding the card's identity. Both levels use it:

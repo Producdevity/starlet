@@ -1,4 +1,3 @@
-// GameCube controller reads from the application's input sampling.
 #include "starlet/pad/pad.hpp"
 
 #include "starlet/sdk/pad.h"

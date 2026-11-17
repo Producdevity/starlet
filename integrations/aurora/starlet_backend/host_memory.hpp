@@ -68,7 +68,7 @@ public:
   std::uint64_t source_generation(const void* pointer) override;
   // Snapshots of textures written this frame reuse this pool every frame; they keep no generation.
   void set_snapshot_pool(const std::uint8_t* pool, std::size_t size) { pool_ = pool; pool_size_ = size; }
-  // Host pointer for a GX address, or null.
+  // Null when the address is unmapped.
   std::uint8_t* pointer(std::uint32_t address, std::size_t size) const;
   // Forgets addresses outside the arena; their pointers may be reused by new allocations.
   void reset_window();

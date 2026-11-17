@@ -113,11 +113,9 @@ public:
     std::uint64_t size() const;
     void read(std::uint64_t offset, void* output, std::size_t size);
 
-    // sys/boot.bin.
     std::array<std::uint8_t, 0x440> boot();
     // sys/main.dol, up to the end of its furthest section.
     std::vector<std::uint8_t> main_dol();
-    // sys/fst.bin.
     std::vector<std::uint8_t> fst();
 
 private:

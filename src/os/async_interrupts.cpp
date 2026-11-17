@@ -1,6 +1,3 @@
-// Asynchronous interrupts (enable_async_interrupts): a watchdog thread signals the guest CPU thread
-// while interrupts stay pending and it keeps running; the handler takes them when the interrupted
-// code and every frame below it down to the thread's entry are registered guest code.
 #include "async_interrupts.hpp"
 
 #include "fiber.hpp"

@@ -145,8 +145,6 @@ std::string folder_for(const std::string& saves_dir, Region region, int slot) {
     return saves_dir + "/" + name + "/Card " + char('A' + slot);
 }
 
-// ---- Folder ----
-
 Folder::Folder(std::string path, int slot, Console console, int size_mbits, Log log)
     : path_(std::move(path)), slot_(slot), size_mbits_(size_mbits), console_(console), log_(std::move(log)) {
     if (!valid_size(size_mbits_) || slot_ < 0 || slot_ > 1) {
@@ -357,8 +355,6 @@ Result Folder::import_image(const std::uint8_t* image, std::size_t size) {
     }
     return result;
 }
-
-// ---- Card ----
 
 Card::Card(std::shared_ptr<Folder> folder, const char game[4], const char company[2]) : folder_(std::move(folder)) {
     std::memcpy(game_, game, 4);

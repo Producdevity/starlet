@@ -1,5 +1,3 @@
-// Remaining OS services: processor registers, exception context, error handlers, the locked cache
-// switch and the IPL ROM font.
 #include "starlet/os/guest_cpu.hpp"
 #include "starlet/sdk/os.h"
 

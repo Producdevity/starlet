@@ -1,6 +1,3 @@
-// DVD file services over the installed disc trees. Entry numbers, offsets and lengths are each
-// disc's own, so FST-based game code sees the disc's file system. Reads run in order on one drive
-// thread and complete as interrupts, like the drive's.
 #include "starlet/dvd/dvd.hpp"
 
 #include "starlet/disc/fst.hpp"
@@ -156,8 +153,8 @@ private:
                 return DVD_RESULT_FATAL_ERROR;
             }
         }
-        // Reads past the end of a file return the bytes that exist; the drive would read whatever
-        // follows on the disc, which no correct caller uses.
+        // Bytes past the end of a file read as zero and count in the result; the drive would read
+        // whatever follows on the disc, which no correct caller uses.
         auto* out = static_cast<std::uint8_t*>(r.address);
         if (r.length > 0) os::before_dma_write(out, std::size_t(r.length));
         s32 done = 0;

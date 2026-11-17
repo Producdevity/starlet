@@ -1,7 +1,5 @@
-// The AX microcode's frame: the DSP accelerator reading samples from ARAM, the sample-rate converter,
-// the per-voice envelope, filter and mixer, the aux exchange with the CPU, the compressor and the
-// output. Follows Dolphin's AX HLE (Source/Core/Core/HW/DSPHLE/UCodes/AX.cpp, AXVoice.h) and its
-// accelerator (Source/Core/Core/DSP/DSPAccelerator.cpp); ax.md lists the differences.
+// Follows Dolphin's AX HLE (Source/Core/Core/HW/DSPHLE/UCodes/AX.cpp, AXVoice.h) and its accelerator
+// (Source/Core/Core/DSP/DSPAccelerator.cpp); docs/SDK-services.md lists the differences.
 #include "ax_internal.hpp"
 
 #include <algorithm>

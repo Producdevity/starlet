@@ -1,10 +1,5 @@
 #pragma once
 
-// The Wii and GameCube SDK's THP movie types and the decoder calls that starlet::thp_sdk implements,
-// with the console SDK's layouts. A port's decompilation declares the same types; it asserts at
-// compile time that they match these. Functions have C linkage, so the game's calls bind to them by
-// name.
-
 #include <cstdint>
 
 namespace starlet::sdk {

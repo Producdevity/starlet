@@ -1,7 +1,3 @@
-// The CPU side of AX as the SDK implements it (AX, AXAlloc, AXAux, AXCL, AXOut, AXProf, AXSPB,
-// AXVPB): voice stacks and priorities, the parameter-block setters and their sync flags, the
-// per-frame sync with its DSP cycle budget, depop, aux buffers and callbacks, and the AI interrupt
-// that runs a frame. The DSP's frame (dsp.cpp) runs inside that interrupt, right after the sync.
 #include "starlet/ax/ax.hpp"
 
 #include "ax_internal.hpp"
@@ -630,7 +626,7 @@ void AXSetMode(u32 mode) { cl_mode = mode; }
 u32 AXGetMode() { return cl_mode; }
 void AXSetCompressor(u32 on) { compressor = on; }
 
-// Single-stepping is a debug-build DSP feature; release builds store the flag and never read it.
+// Single-stepping is a debug-build DSP feature; the flag is ignored.
 void AXSetStepMode(u32) {}
 
 AXCallback AXRegisterCallback(AXCallback callback) {

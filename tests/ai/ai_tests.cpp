@@ -1,4 +1,3 @@
-// The AI DMA against hand-driven pulls: latching, interrupts, replay of a late block, registers.
 #include "fake_ai_platform.hpp"
 
 #include "starlet/ai/ai.hpp"

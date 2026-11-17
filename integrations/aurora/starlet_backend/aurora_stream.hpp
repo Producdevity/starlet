@@ -53,7 +53,6 @@ public:
   static void configure(starlet::gx::Limits& limits);
   // One drained FIFO buffer, big-endian, starting at a command boundary.
   void feed(const std::uint8_t* data, std::size_t size);
-  // CommandSink::host_command and filter_bp for the decoder's sink.
   bool host_command(starlet::gx::ByteView input, std::size_t& consumed);
   bool filter_bp(std::uint8_t address, std::uint32_t& value);
   const StreamStats& stats() const { return stats_; }

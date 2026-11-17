@@ -66,7 +66,6 @@ public:
             size -= static_cast<std::size_t>(count);
         }
     }
-    // The SHA-1 of everything written.
     std::string close() {
         const auto fd = fd_;
         fd_ = -1;
@@ -97,14 +96,12 @@ std::string format_list(unsigned accepted) {
     return text;
 }
 
-// One output file or directory and the volume bytes it holds.
 struct Span {
     std::string path;
     std::uint64_t offset = 0, size = 0;
     bool directory = false;
 };
 
-// True when reference holds exactly the span's bytes.
 bool same_as_reference(GameVolume& volume, const Span& span, const std::string& reference, std::vector<std::uint8_t>& block) {
     const int fd = ::open(reference.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return false;

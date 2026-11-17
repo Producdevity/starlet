@@ -5,7 +5,6 @@
 
 #include <cstdint>
 
-// What async_interrupts.cpp needs from the guest CPU (guest_cpu.cpp).
 namespace starlet::os::async {
 
 // The watchdog sends it with tgkill; its default action is to ignore it.

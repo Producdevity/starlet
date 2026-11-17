@@ -1,5 +1,4 @@
-// Auxiliary RAM (16 MiB) and its DMA engine. Transfers copy at once and complete
-// as interrupts, which is one timing the hardware's queued DMA can produce.
+// Transfers copy when posted and complete as interrupts: one timing the hardware's queued DMA can produce.
 #include "starlet/ar/ar.hpp"
 
 #include "starlet/os/game_memory.hpp"

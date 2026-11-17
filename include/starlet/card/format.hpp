@@ -1,6 +1,6 @@
 #pragma once
 
-// GameCube memory card contents (src/card/card.md): the 64-byte directory entry,
+// GameCube memory card contents: the 64-byte directory entry,
 // Dolphin GCI files, and whole card images with their ID, directory and block
 // allocation table, as the Dolphin SDK's CARD library writes and verifies them.
 

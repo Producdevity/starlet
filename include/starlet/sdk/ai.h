@@ -1,8 +1,5 @@
 #pragma once
 
-// The audio interface (AI) SDK types and functions starlet::ai implements, with the console SDK's
-// signatures.
-
 #include "starlet/sdk/os.h"
 
 namespace starlet::sdk {

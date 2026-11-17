@@ -1,6 +1,3 @@
-// AX's audio diagnostics: what the voice parameter checks, the per-second counters and the rolling clip
-// buffer report. Always on; the work per 5 ms frame is a few dozen compares per running voice, three
-// passes over the aux buffers and a copy of 160 frames into the ring.
 #include "diagnostics.hpp"
 
 #include <algorithm>

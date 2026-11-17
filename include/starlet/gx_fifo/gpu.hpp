@@ -23,8 +23,8 @@ struct Diagnostics {
     // Renderer and decoder counters every 300 retraces.
     bool stats = false;
     // The EFB written as <capture_dir>/efb-<retrace>.ppm just before the first display copy after
-    // these retraces. The renderer's GL work
-    // must run on the GPU thread (no submission thread) for the read-back.
+    // these retraces. The renderer's GL work must run on the GPU thread (no submission thread) for
+    // the read-back.
     std::vector<unsigned> efb_dumps;
     std::string capture_dir = "/tmp";
     // The state of the first trace_draws draws from retrace trace_from on, on stdout.
@@ -63,15 +63,15 @@ struct GpuSetup {
     // lags its input by one frame more. Sync points still wait for all work before them. Off by
     // default; STARLET_GX_FRAME_AHEAD=1 in the environment turns it on as well.
     bool frame_ahead = false;
-    // Draw-sync callbacks that read the EFB are answered from the group's snapshot one frame
-    // earlier; with this on, one that is not read back yet when its token arrives is answered
-    // from the newest of the group's snapshots up to peek_lag_frames frames earlier still that
-    // is, instead of the GPU thread waiting for the GPU to finish the frame before. With none read
-    // back the GPU thread waits for the oldest. The callback then sees values up to that many
-    // frames older (a sun flare's occlusion or Mario's silhouette changes that much later), and the
-    // game may run that many frames further ahead of the GPU. Off by default;
-    // STARLET_GX_PEEK_LAG=N (1 to 3) in the environment turns it on with N frames. sync_reads
-    // overrides it.
+    // Draw-sync callbacks that read the EFB are answered from the snapshot their token took one
+    // frame earlier. With this on, a callback whose snapshot is not read back yet when its token
+    // arrives is answered from the newest older snapshot of the same token and ordinal that is,
+    // up to peek_lag_frames frames before, instead of the GPU thread waiting for the GPU to
+    // finish the frame. With none read back, the GPU thread waits for the oldest. The callback
+    // then sees values up to that many frames older (a sun flare's occlusion or Mario's
+    // silhouette changes that much later), and the game may run that many frames further ahead of
+    // the GPU. Off by default; STARLET_GX_PEEK_LAG=N (1 to 3) in the environment turns it on with
+    // N frames. sync_reads overrides it.
     bool peek_lag = false;
     unsigned peek_lag_frames = 1;
     Diagnostics diagnostics;

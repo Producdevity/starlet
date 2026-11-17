@@ -1,5 +1,5 @@
-// The SDK's CARD calls (starlet/sdk/card.h) on starlet::card and starlet::os
-// (src/card/card.md). Slot A is a Dolphin GCI folder; slot B is empty.
+// The SDK's CARD calls (starlet/sdk/card.h) on starlet::card and starlet::os.
+// Slot A is a Dolphin GCI folder; slot B is empty.
 //
 // starlet::card::Card does the card work synchronously. This file adds the SDK's
 // control-block rules (busy, attached) and its timing: requests that move data run in
@@ -109,7 +109,6 @@ Controller& controller() {
     return *channel;
 }
 
-// Runs f on the slot's card under the engine lock.
 template <class F> auto with_card(Slot& slot, F f) {
     host_allocation_scope host;
     std::lock_guard<std::mutex> lock(cards().engine);

@@ -1,7 +1,5 @@
 #pragma once
 
-// The ARAM (AR, ARQ) SDK types and functions starlet::ar implements, with the console SDK's layouts.
-
 #include "starlet/sdk/os.h"
 
 namespace starlet::sdk {

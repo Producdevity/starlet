@@ -1,4 +1,3 @@
-// The AI model on starlet::os and starlet::host.
 #include "platform.hpp"
 
 #include "starlet/os/game_memory.hpp"

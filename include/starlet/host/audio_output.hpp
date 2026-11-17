@@ -31,9 +31,8 @@ struct AudioStats {
 //
 // The device plays once the ring first holds its buffer plus four 5 ms slices; after that
 // a request the ring cannot fill gets silence for the rest and counts as an underrun.
-// open_pull: a Starlet thread pulls 5 ms slices on a steady clock and keeps that much
-// queued, so a port's DMA completions stay evenly spaced even when the device takes 2048
-// frames or more at once. open_push: the port writes frames as it produces them.
+// open_pull: a Starlet thread pulls 5 ms slices on a steady clock. open_push: the port
+// writes frames as it produces them.
 //
 // open_*, close and the destructor allocate and free host memory: a port with its own
 // operator new calls them in its host-allocation scope, from one thread at a time.

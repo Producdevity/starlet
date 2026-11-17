@@ -1,5 +1,3 @@
-// The GPU thread: decodes the game's GX command stream with Starlet and hands draws, copies and
-// presentation to the renderer, in command order.
 #include "gpu_internal.hpp"
 
 #include "starlet/gx/decoder.hpp"
@@ -143,8 +141,7 @@ private:
 
 void note_cpu_write(const void* data, std::size_t bytes) { PageGenerations::get().wrote(data, bytes); }
 
-// Every GX address is a physical address in starlet::os's memory window. Memory holds canonical
-// (big-endian) GX bytes, except registered host-order arrays.
+// Every GX address is a physical address in starlet::os's memory window.
 class GuestMemory final : public MemoryReader {
 public:
     GuestMemory() {

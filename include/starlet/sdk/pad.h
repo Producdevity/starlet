@@ -1,7 +1,5 @@
 #pragma once
 
-// The PAD SDK types and functions starlet::pad implements, with the console SDK's layouts.
-
 #include "starlet/sdk/os.h"
 
 namespace starlet::sdk {

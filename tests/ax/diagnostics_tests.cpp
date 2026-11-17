@@ -1,5 +1,3 @@
-// AX audio diagnostics: the voice parameter checks, the rate limiter, the clip ring, the WAV writer and
-// a clip saved from the always-on state.
 #include "../../src/ax/diagnostics.hpp"
 
 #include <cstdio>

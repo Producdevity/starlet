@@ -35,8 +35,6 @@ constexpr int priority_slots = OS_PRIORITY_MAX + 2;  // Slot 0 is the interrupt 
 // SDL, GL) run on guest stacks, so stacks get at least this much.
 constexpr std::size_t minimum_stack = std::size_t{1} << 20;
 
-// A guest thread is a fiber on the guest CPU's host thread: handing the CPU to another guest
-// thread swaps stacks and registers on that thread, with no kernel wakeup.
 struct Guest {
     OSThread* os = nullptr;
     fiber::Context fiber;
@@ -153,7 +151,6 @@ void dequeue(Guest* g) {
     update_best();
 }
 
-// The CPU is free: gives it to the best ready thread, if any.
 Guest* take_next() {
     if (running) throw std::logic_error("dispatch with the CPU held");
     for (int i = 0; i < priority_slots; ++i) {
@@ -327,7 +324,7 @@ Guest* guest_of(OSThread* thread) {
     auto* g = static_cast<Guest*>(argument);
     if (g->interrupt_thread) interrupt_loop();
     {
-        host_allocation_scope host_;  // Scheduler containers must not take game memory.
+        host_allocation_scope host_;
         std::lock_guard<std::mutex> lock(scheduler);
         free_exited();
         trace_resume(g);
@@ -352,7 +349,7 @@ void start_fiber(Guest* g, std::size_t requested) {
 // The guest CPU's host thread: runs guest threads until the main thread ends, sleeping while none
 // is ready.
 void cpu_loop() {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     while (!cpu_stopped) {
         Guest* next = take_next();
@@ -444,7 +441,7 @@ u8 main_thread_stack_marker[16];
 void set_switch_trace(SwitchTrace trace) { switch_trace.store(trace, std::memory_order_relaxed); }
 
 void raise_interrupt(std::function<void()> handler) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::lock_guard<std::mutex> lock(scheduler);
     if (pending.empty() && tracking_pending.load(std::memory_order_relaxed))
         pending_since_ns.store(monotonic_ns(), std::memory_order_relaxed);
@@ -462,7 +459,7 @@ bool on_guest_thread() { return self != nullptr; }
 bool in_interrupt() { return self == &interrupt_guest || handling_in_place; }
 
 std::size_t guest_thread_count() {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::lock_guard<std::mutex> lock(scheduler);
     return guests.size();
 }
@@ -483,7 +480,7 @@ void checkpoint() {
     if (!g || g->interrupt_thread) return;
     // reschedule() leaves the interrupt thread out while this thread has interrupts disabled.
     if (best_ready.load(std::memory_order_acquire) >= slot(g)) return;
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     reschedule(lock, false);
 }
@@ -492,7 +489,7 @@ int run_main_thread(int (*entry)()) {
     name_thread(guest_cpu_thread_name);
     install_signal_stack();  // A guest stack overflow still gets its crash report.
     {
-        host_allocation_scope host_;  // Scheduler containers must not take game memory.
+        host_allocation_scope host_;
         std::lock_guard<std::mutex> lock(scheduler);
         fiber::adopt_current(idle);
         interrupt_guest.interrupt_thread = true;
@@ -542,7 +539,7 @@ Interruptee interruptee() {
 }
 
 void take_interrupts() {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     reschedule(lock, false);
 }
@@ -591,13 +588,13 @@ BOOL OSIsThreadTerminated(OSThread* thread) {
 BOOL OSIsThreadSuspended(OSThread* thread) { return thread->suspend > 0; }
 
 s32 OSDisableScheduler() {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::lock_guard<std::mutex> lock(scheduler);
     return scheduler_disabled++;
 }
 
 s32 OSEnableScheduler() {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     const int previous = scheduler_disabled;
     if (scheduler_disabled > 0) --scheduler_disabled;
@@ -607,7 +604,7 @@ s32 OSEnableScheduler() {
 
 void OSYieldThread() {
     require_guest("OSYieldThread");
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     reschedule(lock, true);
 }
@@ -638,7 +635,7 @@ BOOL OSCreateThread(OSThread* thread, OSThreadStartFunction func, void* param, v
     if (stack && stackSize >= sizeof(u32)) *thread->stackEnd = OS_THREAD_STACK_MAGIC;
     thread->error = 0;
     thread->specific[0] = thread->specific[1] = nullptr;
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::lock_guard<std::mutex> lock(scheduler);
     guests[thread] = g;
     start_fiber(g, stackSize);
@@ -647,7 +644,7 @@ BOOL OSCreateThread(OSThread* thread, OSThreadStartFunction func, void* param, v
 
 void OSExitThread(void* val) {
     require_guest("OSExitThread");
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     Guest* g = self;
     terminate(g, val);
@@ -655,7 +652,7 @@ void OSExitThread(void* val) {
 }
 
 void OSCancelThread(OSThread* thread) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     Guest* g = guest_of(thread);
     if (!g) return;
@@ -673,7 +670,7 @@ void OSCancelThread(OSThread* thread) {
 }
 
 void OSDetachThread(OSThread* thread) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::lock_guard<std::mutex> lock(scheduler);
     thread->attr |= OS_THREAD_ATTR_DETACH;
     if (thread->state == OS_THREAD_STATE_MORIBUND) {
@@ -684,7 +681,7 @@ void OSDetachThread(OSThread* thread) {
 }
 
 s32 OSResumeThread(OSThread* thread) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     const s32 previous = thread->suspend;
     if (previous > 0 && --thread->suspend == 0) {
@@ -696,7 +693,7 @@ s32 OSResumeThread(OSThread* thread) {
 }
 
 s32 OSSuspendThread(OSThread* thread) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     const s32 previous = thread->suspend++;
     if (previous == 0) {
@@ -713,13 +710,13 @@ s32 OSSuspendThread(OSThread* thread) {
 
 void OSSleepThread(OSThreadQueue* queue) {
     require_guest("OSSleepThread");
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     sleep_on(queue, lock);
 }
 
 void OSWakeupThread(OSThreadQueue* queue) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     wake_all(queue);
     reschedule(lock, false);
@@ -731,7 +728,7 @@ OSPriority OSGetThreadPriority(OSThread* thread) { return thread->base; }
 
 BOOL OSSetThreadPriority(OSThread* thread, OSPriority priority) {
     if (priority < OS_PRIORITY_MIN || priority > OS_PRIORITY_MAX) return FALSE;
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     Guest* g = guest_of(thread);
     const bool queued = g && g->queued;
@@ -747,7 +744,7 @@ BOOL OSSetThreadPriority(OSThread* thread, OSPriority priority) {
 }
 
 BOOL OSJoinThread(OSThread* thread, void** val) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     if (!(thread->attr & OS_THREAD_ATTR_DETACH) && thread->state != OS_THREAD_STATE_MORIBUND &&
         thread->state != OS_THREAD_STATE_NULL)
@@ -765,7 +762,7 @@ BOOL OSJoinThread(OSThread* thread, void** val) {
 }
 
 s32 OSCheckActiveThreads() {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::lock_guard<std::mutex> lock(scheduler);
     return static_cast<s32>(guests.size());
 }
@@ -825,7 +822,7 @@ static void disown_mutex(OSMutex* mutex) {
 
 void OSLockMutex(OSMutex* mutex) {
     require_guest("OSLockMutex");
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     OSThread* me = self->os;
     for (;;) {
@@ -844,7 +841,7 @@ void OSLockMutex(OSMutex* mutex) {
 }
 
 void OSUnlockMutex(OSMutex* mutex) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     if (!self || mutex->thread != self->os || --mutex->count > 0) return;
     disown_mutex(mutex);
@@ -853,7 +850,7 @@ void OSUnlockMutex(OSMutex* mutex) {
 }
 
 BOOL OSTryLockMutex(OSMutex* mutex) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::lock_guard<std::mutex> lock(scheduler);
     OSThread* me = self ? self->os : nullptr;
     if (!mutex->thread) {
@@ -871,7 +868,7 @@ void OSInitCond(OSCond* cond) { init_queue(&cond->queue); }
 
 void OSWaitCond(OSCond* cond, OSMutex* mutex) {
     require_guest("OSWaitCond");
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     OSThread* me = self->os;
     if (mutex->thread != me) return;
@@ -901,7 +898,7 @@ void OSInitMessageQueue(OSMessageQueue* queue, OSMessage* msgArray, s32 msgCount
 }
 
 BOOL OSSendMessage(OSMessageQueue* queue, OSMessage msg, s32 flags) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     while (queue->msgCount <= queue->usedCount) {
         if (!(flags & OS_MESSAGE_BLOCK)) return FALSE;
@@ -916,7 +913,7 @@ BOOL OSSendMessage(OSMessageQueue* queue, OSMessage msg, s32 flags) {
 }
 
 BOOL OSJamMessage(OSMessageQueue* queue, OSMessage msg, s32 flags) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     while (queue->msgCount <= queue->usedCount) {
         if (!(flags & OS_MESSAGE_BLOCK)) return FALSE;
@@ -932,7 +929,7 @@ BOOL OSJamMessage(OSMessageQueue* queue, OSMessage msg, s32 flags) {
 }
 
 BOOL OSReceiveMessage(OSMessageQueue* queue, OSMessage* msgPtr, s32 flags) {
-    host_allocation_scope host_;  // Scheduler containers must not take game memory.
+    host_allocation_scope host_;
     std::unique_lock<std::mutex> lock(scheduler);
     while (queue->usedCount == 0) {
         if (!(flags & OS_MESSAGE_BLOCK)) return FALSE;

@@ -1,5 +1,3 @@
-// The video interface: a 59.94 Hz retrace interrupt, the frame buffer the next retrace shows, and the
-// retrace callbacks.
 #include "gpu_internal.hpp"
 
 #include "starlet/gx/sync_stats.hpp"

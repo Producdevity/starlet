@@ -1,5 +1,3 @@
-// Dolphin OS services other than threads: arena, time, alarms, reports,
-// cache maintenance, console settings and reset.
 #include "starlet/os/os_core.hpp"
 
 #include "starlet/os/crash_report.hpp"

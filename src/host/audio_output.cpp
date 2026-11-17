@@ -77,7 +77,6 @@ struct AudioOutput::Impl {
         nonzero.fetch_add(audible, std::memory_order_relaxed);
     }
 
-    // The device's side of the ring: SDL's callback, or the silent clock.
     void consume(std::int16_t* out, std::size_t count) noexcept {
         if (!primed.load(std::memory_order_relaxed)) {
             if (ring.level() < start_level) {
@@ -164,7 +163,6 @@ struct AudioOutput::Impl {
         }
     }
 
-    // Without a device the frames still leave the ring at the playback rate.
     void silent_clock() noexcept {
         name_thread("starlet-silence");
         const std::size_t size = rate / 200;
@@ -179,7 +177,6 @@ struct AudioOutput::Impl {
         }
     }
 
-    // ring_capacity: at least the start level plus four slices.
     void start(Mode opened, unsigned sample_rate_hz, std::size_t ring_capacity) {
         const std::size_t slice = rate / 200;
         start_level = device_frames.load() + 4 * slice;

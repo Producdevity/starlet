@@ -1,8 +1,5 @@
 #pragma once
 
-// The Dolphin VI types and functions starlet::gx_fifo implements, with the console SDK's values and
-// layouts. Functions have C linkage, so the game's calls bind to them by name.
-
 #include "starlet/sdk/os.h"
 
 namespace starlet::sdk {
