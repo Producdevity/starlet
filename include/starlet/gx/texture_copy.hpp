@@ -24,6 +24,8 @@ struct TextureCopy {
     bool clamp_top = false, clamp_bottom = false;
     // The source lies wholly in the EFB rows below the frame; y still counts from the EFB top.
     bool strip = false;
+    // The source starts in the frame's rows and continues into the rows below it.
+    bool split = false;
     bool filtered() const { return filter[0] || filter[1] != 64 || filter[2]; }
     int destination_width() const { return half_scale ? width / 2 : width; }
     int destination_height() const { return half_scale ? height / 2 : height; }

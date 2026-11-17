@@ -276,7 +276,8 @@ struct GlesRenderer::Impl {
     // Internal shaders address EFB rows from the top, as GX does, through GX_EFB_TOP.
     GLuint link_efb_program(GlesDrawPipeline pipeline) const {
         const auto end = pipeline.fragment.find('\n') + 1;
-        pipeline.fragment.insert(end, "#define GX_EFB_TOP " + std::to_string(efb_height - 1) + "\n");
+        pipeline.fragment.insert(end, "#define GX_EFB_TOP " + std::to_string(efb_height - 1) + "\n#define GX_STRIP_TOP " +
+                                          std::to_string(efb_strip_height - 1) + "\n");
         return link_program(pipeline);
     }
     std::string efb_size_glsl() const {
@@ -1446,6 +1447,19 @@ void main(){
     // A copy whose clear rewrites a whole attachment the copy does not read leaves that
     // attachment's contents dead: invalidating it spares the GPU writing it back when the
     // copy ends the pass. Colour invalidation needs alpha cleared too (RGB8 keeps it opaque).
+    // Whether a copy's clear covers exactly its rectangle: in the frame's target, and for a copy
+    // across the frame's last row also in the strip's.
+    bool clear_matches(const TextureCopy& p) const {
+        const auto& c = *p.clear;
+        const auto same = [](const RasterRect& a, int x, int y, int width, int height) {
+            return a.x == x && a.y == y && a.width == width && a.height == height;
+        };
+        if (c.rgba6 != p.rgba6 || c.depth > 0xffffff) return false;
+        if (!p.split) return same(c.rectangle, p.x, efb_height - p.y - p.height, p.width, p.height) && !c.strip_rectangle.height;
+        const int below = p.y + p.height - efb_height;
+        return same(c.rectangle, p.x, 0, p.width, efb_height - p.y) &&
+               same(c.strip_rectangle, p.x, efb_strip_height - below, p.width, below);
+    }
     void invalidate_cleared(const TextureCopy& p) {
         const auto& c = *p.clear;
         if (p.strip || c.rectangle.x || c.rectangle.y || c.rectangle.width != efb_width || c.rectangle.height != efb_height) return;
@@ -1466,7 +1480,7 @@ void main(){
     std::uint32_t copy_mode(const TextureCopy& p) const {
         return std::uint32_t(p.format) | (std::uint32_t(p.half_scale) << 8) | (std::uint32_t(p.rgba6) << 9) |
                (std::uint32_t(p.luminance) << 10) | (std::uint32_t(p.depth) << 11) | (std::uint32_t(fast_copy(p)) << 12) |
-               (std::uint32_t(p.filtered()) << 13);
+               (std::uint32_t(p.filtered()) << 13) | (std::uint32_t(p.split) << 16);
     }
     // Resident copies queued while nothing else has reached the renderer: the EFB they read is
     // the same. Copies whose pass differs only in its target render in one pass (flush_copies).
@@ -1484,7 +1498,7 @@ void main(){
         if (pending_copies.empty() || pending_copies.size() == merged_targets) return false;
         const auto& q = pending_copies.front().plan;
         if (q.x != p.x || q.y != p.y || q.width != p.width || q.height != p.height || q.half_scale != p.half_scale ||
-            q.strip != p.strip || q.rgba6 != p.rgba6 || q.efb != p.efb || blit_copy(q) != blit_copy(p))
+            q.strip != p.strip || q.split != p.split || q.rgba6 != p.rgba6 || q.efb != p.efb || blit_copy(q) != blit_copy(p))
             return false;
         if (!blit_copy(p) && (copy_mode(q) != copy_mode(p) || (p.filtered() && (q.filter != p.filter || q.clamp_top != p.clamp_top ||
                                                                                   q.clamp_bottom != p.clamp_bottom))))
@@ -1520,6 +1534,8 @@ void main(){
         const bool fast = fast_copy(p);
         if (p.strip && !blit_copy(p))
             throw std::runtime_error("EFB copies below the displayed frame need the fast blit");
+        if (p.split && fast && !blit_copy(p))
+            throw std::runtime_error("fast EFB copies into the rows below the frame need the blit");
         if (count > 1) attach_merged(targets, count);
         const GLuint destination = count > 1 ? merge_framebuffer : targets[0].framebuffer;
         if (blit_copy(p)) {
@@ -1527,9 +1543,19 @@ void main(){
             const int top = p.strip ? EfbLayout::rows : efb_height;
             glBindFramebuffer(GL_READ_FRAMEBUFFER, p.strip ? strip_framebuffer : color_framebuffer ? color_framebuffer : framebuffer);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, destination);
-            glBlitFramebuffer(p.x, top - p.y - p.height, p.x + p.width, top - p.y,
-                              0, p.destination_height(), p.destination_width(), 0, GL_COLOR_BUFFER_BIT,
-                              p.half_scale ? GL_LINEAR : GL_NEAREST);
+            const GLenum filter = p.half_scale ? GL_LINEAR : GL_NEAREST;
+            if (p.split) {
+                // Rows from the frame's target, then the rest from the strip's; destination row r
+                // holds EFB row p.y + r (times two for half scale), as for one blit.
+                const int frame_rows = efb_height - p.y, below = p.height - frame_rows, scale = p.half_scale ? 2 : 1;
+                glBlitFramebuffer(p.x, 0, p.x + p.width, frame_rows, 0, frame_rows / scale, p.destination_width(), 0,
+                                  GL_COLOR_BUFFER_BIT, filter);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, strip_framebuffer);
+                glBlitFramebuffer(p.x, efb_strip_height - below, p.x + p.width, efb_strip_height, 0, p.destination_height(),
+                                  p.destination_width(), frame_rows / scale, GL_COLOR_BUFFER_BIT, filter);
+            } else
+                glBlitFramebuffer(p.x, top - p.y - p.height, p.x + p.width, top - p.y,
+                                  0, p.destination_height(), p.destination_width(), 0, GL_COLOR_BUFFER_BIT, filter);
             if (count > 1) detach_merged(count);
             glActiveTexture(GL_TEXTURE0);
             for (unsigned i = 0; i < count; ++i) set_copy_swizzle(plans[i], targets[i].texture);
@@ -1548,8 +1574,11 @@ void main(){
             else pipeline.fragment = "#version 310 es\nprecision highp float;\nprecision highp int;\n#define FORMAT " + std::to_string(int(p.format)) +
                 "\n#define HALF " + std::to_string(int(p.half_scale)) + "\n#define RGBA6 " + std::to_string(int(p.rgba6)) +
                 "\n#define LUMINANCE " + std::to_string(int(p.luminance)) + "\n#define DEPTH " + std::to_string(int(p.depth)) +
-                "\n#define FILTER " + std::to_string(int(p.filtered())) + R"GLSL(
+                "\n#define FILTER " + std::to_string(int(p.filtered())) + "\n#define SPLIT " + std::to_string(int(p.split)) + R"GLSL(
 uniform highp sampler2D uImage;
+#if SPLIT
+uniform highp sampler2D uStrip;
+#endif
 uniform ivec2 uRect;
 #if FILTER
 uniform ivec3 uFilter;
@@ -1557,7 +1586,11 @@ uniform ivec2 uRows;
 #endif
 layout(location=0) out vec4 color;
 ivec4 efb(int x,int y){
+#if SPLIT
+ vec4 t=y>GX_EFB_TOP?texelFetch(uStrip,ivec2(x,GX_STRIP_TOP+GX_EFB_TOP+1-y),0):texelFetch(uImage,ivec2(x,GX_EFB_TOP-y),0);
+#else
  vec4 t=texelFetch(uImage,ivec2(x,GX_EFB_TOP-y),0);
+#endif
 #if DEPTH
  uint z=uint(roundEven(t.r*16777215.0));return ivec4(int(z>>16u),int((z>>8u)&255u),int(z&255u),255);
 #else
@@ -1597,6 +1630,7 @@ void main(){
             ++stats.shader_compiles;
             glUseProgram(created.name);
             glUniform1i(glGetUniformLocation(created.name, "uImage"), 0);
+            if (p.split) glUniform1i(glGetUniformLocation(created.name, "uStrip"), 1);
             created.rect = glGetUniformLocation(created.name, "uRect");
             created.filter = glGetUniformLocation(created.name, "uFilter");
             created.rows = glGetUniformLocation(created.name, "uRows");
@@ -1613,6 +1647,12 @@ void main(){
             glBindTexture(GL_TEXTURE_2D, targets[i].texture);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_BLUE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
+        }
+        if (p.split) {
+            glActiveTexture(GL_TEXTURE1);
+            glBindSampler(1, 0);
+            glBindTexture(GL_TEXTURE_2D, p.depth ? strip_depth : strip_color);
+            glActiveTexture(GL_TEXTURE0);
         }
         glBindTexture(GL_TEXTURE_2D, p.depth ? depth : color);
         if (fast) {
@@ -1811,7 +1851,11 @@ void GlesRenderer::clear_efb(const EfbClear& operation) {
     if (r.x<0 || r.y<0 || r.width<0 || r.height<0 || r.x>g.efb_width || r.y>g.efb_height ||
         r.width>g.efb_width-r.x || r.height>g.efb_height-r.y || operation.depth>0xffffff)
         throw std::invalid_argument("invalid native GLES EFB clear rectangle");
-    if (!r.width || !r.height) return;
+    const auto& below = operation.strip_rectangle;
+    if (below.x<0 || below.y<0 || below.width<0 || below.height<0 || below.width>g.efb_width-below.x ||
+        below.height>g.efb_strip_height-below.y)
+        throw std::invalid_argument("invalid native GLES EFB clear rectangle below the frame");
+    if ((!r.width || !r.height) && (!below.width || !below.height)) return;
     sync_stats::Context ctx("gl: clear");
     g.execute([&g, operation] { g.clear_efb_gl(operation); }, false);
 }
@@ -2001,9 +2045,16 @@ void GlesRenderer::Impl::clear_efb_gl(const EfbClear& operation) {
         glColorMask(operation.color_write,operation.color_write,operation.color_write,operation.alpha_write || (format_change && !operation.rgba6));
         const bool constant = std::all_of(operation.tile.begin(),operation.tile.end(),
             [&](const auto& c){return c==operation.tile[0];});
+        const auto& s = operation.strip_rectangle;
+        if (s.width && s.height && !constant) throw std::runtime_error("patterned EFB clears below the frame are not implemented");
         if (constant) {
             const auto& c=operation.tile[0];glClearColor(c[0]/255.0f,c[1]/255.0f,c[2]/255.0f,c[3]/255.0f);
-            glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);gl_check("MainLoop constant EFB clear");g.rgba6=operation.rgba6;return;
+            glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+            if (s.width && s.height) {
+                glBindFramebuffer(GL_FRAMEBUFFER,g.strip_framebuffer); glScissor(s.x,s.y,s.width,s.height);
+                glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT); glBindFramebuffer(GL_FRAMEBUFFER,g.framebuffer);
+            }
+            gl_check("MainLoop constant EFB clear");g.rgba6=operation.rgba6;return;
         }
         if (!g.clear_program) {
             GlesDrawPipeline p;
@@ -2278,11 +2329,8 @@ void GlesRenderer::copy_texture(const TextureCopy& p, std::uint8_t* destination,
     const auto address = reinterpret_cast<std::uintptr_t>(destination);
     if (!destination || (address & 31) || capacity < required || capacity > UINTPTR_MAX-address)
         throw std::invalid_argument("invalid native texture-copy destination span");
-    if (p.clear && (p.clear->rgba6 != p.rgba6 || p.clear->depth > 0xffffff ||
-        p.clear->rectangle.x != p.x || p.clear->rectangle.y != g.efb_height-p.y-p.height ||
-        p.clear->rectangle.width != p.width || p.clear->rectangle.height != p.height))
-        throw std::invalid_argument("invalid texture-copy clear operation");
-    if (p.strip) throw std::runtime_error("EFB copies below the displayed frame need the direct renderer");
+    if (p.clear && !g.clear_matches(p)) throw std::invalid_argument("invalid texture-copy clear operation");
+    if (p.strip || p.split) throw std::runtime_error("EFB copies below the displayed frame need the direct renderer");
     std::vector<std::uint8_t> pixels(std::size_t(p.width)*p.height*4);
     try {
         const auto read = [&g, &p, &pixels] {
@@ -2351,10 +2399,7 @@ void GlesRenderer::copy_texture_known(const TextureCopy& p, std::uint8_t* destin
         } catch (...) { g.failed = true; throw; }
         return;
     }
-    if (p.clear && (p.clear->rgba6 != p.rgba6 || p.clear->depth > 0xffffff ||
-        p.clear->rectangle.x != p.x || p.clear->rectangle.y != g.efb_height-p.y-p.height ||
-        p.clear->rectangle.width != p.width || p.clear->rectangle.height != p.height))
-        throw std::invalid_argument("invalid texture-copy clear operation");
+    if (p.clear && !g.clear_matches(p)) throw std::invalid_argument("invalid texture-copy clear operation");
     try {
         if (!g.merges(p, token, required)) g.flush_copies();
         g.flush_direct();

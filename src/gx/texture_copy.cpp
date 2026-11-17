@@ -18,7 +18,7 @@ std::size_t texture_copy_bytes(const TextureCopy& p) {
     const auto tile_width = copy_tile_width(p.format);
     const auto width = p.destination_width(), height = p.destination_height();
     const int efb_width = EfbLayout::width;
-    const int first_row = p.strip ? p.efb.height : 0, end_row = p.strip ? EfbLayout::rows : p.efb.height;
+    const int first_row = p.strip ? p.efb.height : 0, end_row = p.strip || p.split ? EfbLayout::rows : p.efb.height;
     if (p.x < 0 || p.y < first_row || p.width <= 0 || p.height <= 0 || p.x > efb_width || p.y > end_row ||
         p.width > efb_width-p.x || p.height > end_row-p.y || width <= 0 || height <= 0 ||
         (p.strip && (p.depth || p.filtered() || p.clear)) ||
@@ -60,11 +60,13 @@ TextureCopy plan_texture_copy(const State& state, TextureCopyRegisters r, bool c
     p.clamp_top = r.command & 1;
     p.clamp_bottom = r.command & 2;
     p.strip = p.y >= p.efb.height;
-    // A rectangle reaching past the frame's right or bottom edge (or past the strip rows) is
-    // cut to it, as Dolphin does; the destination keeps only the rows the cut rectangle covers.
+    // A rectangle reaching from the frame's rows into the rows below it reads both targets.
+    p.split = !p.strip && p.y + p.height > p.efb.height && p.efb.height < EfbLayout::rows;
+    // A rectangle reaching past the EFB's right or bottom edge is cut to it, as Dolphin does;
+    // the destination keeps only the rows the cut rectangle covers.
     // Pikmin 2's ShadowCylinder2 passes its bottom-right corner as the size.
     {
-        const int end_row = p.strip ? EfbLayout::rows : p.efb.height;
+        const int end_row = p.strip || p.split ? EfbLayout::rows : p.efb.height;
         if (p.x < EfbLayout::width && p.x + p.width > EfbLayout::width) p.width = EfbLayout::width - p.x;
         if (p.y < end_row && p.y + p.height > end_row) p.height = end_row - p.y;
         if (p.half_scale) { p.width &= ~1; p.height &= ~1; }
@@ -74,12 +76,17 @@ TextureCopy plan_texture_copy(const State& state, TextureCopyRegisters r, bool c
     if (p.strip) p.filter = {{0, 64, 0}};
     if (p.strip && clear) throw std::runtime_error("EFB clears below the displayed frame are not implemented");
     texture_copy_bytes(p);
-    if (clear) p.clear = plan_copy_clear(state,{p.x,p.efb.height-p.y-p.height,p.width,p.height});
+    if (clear && p.split) {
+        const int below = p.y + p.height - p.efb.height;
+        p.clear = plan_copy_clear(state, {p.x, 0, p.width, p.efb.height - p.y});
+        p.clear->strip_rectangle = {p.x, p.efb.strip_height() - below, p.width, below};
+    } else if (clear)
+        p.clear = plan_copy_clear(state, {p.x, p.efb.height - p.y - p.height, p.width, p.height});
     return p;
 }
 std::pair<int, int> texture_copy_filter_rows(const TextureCopy& p) {
     return {p.clamp_top ? p.y : std::max(p.y - 1, 0),
-            p.clamp_bottom ? p.y + p.height - 1 : std::min(p.y + p.height, p.efb.height - 1)};
+            p.clamp_bottom ? p.y + p.height - 1 : std::min(p.y + p.height, (p.split ? EfbLayout::rows : p.efb.height) - 1)};
 }
 // Weighted rows are shifted down by six; the sum keeps nine bits, then saturates.
 std::vector<std::uint8_t> filter_texture_copy(const TextureCopy& p, ByteView rows, int first) {

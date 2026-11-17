@@ -2820,17 +2820,21 @@ struct GlesDirect::Impl {
     static bool same(const RasterRect& a, const RasterRect& b) {
         return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
     }
-    void apply_raster(const DrawStateView& s) {
+    // lower: the part of a split draw in the EFB rows below the frame.
+    void apply_raster(const DrawStateView& s, bool lower) {
         const auto& r = s.raster;
         const bool fresh = !gl.valid;
         gl.valid = true;
-        if (gl.strip != r.strip) {
-            if (r.strip && !target.strip_framebuffer) throw std::runtime_error("direct renderer has no EFB strip target");
-            glBindFramebuffer(GL_FRAMEBUFFER, r.strip ? target.strip_framebuffer : efb_framebuffer);
-            gl.strip = r.strip;
+        const bool strip = r.strip || lower;
+        if (gl.strip != strip) {
+            if (strip && !target.strip_framebuffer) throw std::runtime_error("direct renderer has no EFB strip target");
+            glBindFramebuffer(GL_FRAMEBUFFER, strip ? target.strip_framebuffer : efb_framebuffer);
+            gl.strip = strip;
         }
-        if (fresh || !same(gl.viewport, r.viewport)) { glViewport(r.viewport.x, r.viewport.y, r.viewport.width, r.viewport.height); gl.viewport = r.viewport; }
-        if (fresh || !same(gl.scissor, r.scissor)) { glScissor(r.scissor.x, r.scissor.y, r.scissor.width, r.scissor.height); gl.scissor = r.scissor; }
+        const auto& viewport = lower ? r.strip_viewport : r.viewport;
+        const auto& scissor = lower ? r.strip_scissor : r.scissor;
+        if (fresh || !same(gl.viewport, viewport)) { glViewport(viewport.x, viewport.y, viewport.width, viewport.height); gl.viewport = viewport; }
+        if (fresh || !same(gl.scissor, scissor)) { glScissor(scissor.x, scissor.y, scissor.width, scissor.height); gl.scissor = scissor; }
         if (fresh || gl.depth_range != r.depth_range) { glDepthRangef(r.depth_range[0], r.depth_range[1]); gl.depth_range = r.depth_range; }
         if (fresh || gl.depth_mask != r.depth_write) { glDepthMask(r.depth_write); gl.depth_mask = r.depth_write; }
         if (fresh || gl.depth_test != r.depth_test) { if (r.depth_test) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST); gl.depth_test = r.depth_test; }
@@ -3019,9 +3023,20 @@ struct GlesDirect::Impl {
         std::array<GLuint, 8> bound{}, bound_samplers{};
         std::array<std::uint32_t, 3> latches{{~0u, ~0u, ~0u}};
         bool fresh = true;
-        bool raster_current = false;
+        bool raster_current = false, lower_current = false;
         std::uint8_t texture_current = 0;
-        for (auto& r : records) {
+        // Draws in the EFB rows below the frame (the strip, a target of its own) run after the
+        // frame's: the two targets share no pixels, so the order between them is free, and one
+        // pass per target replaces a pass break at every switch.
+        const Record* last_issued = nullptr;
+        const auto issue = [&](const Record& r, bool lower) {
+            // Out of recording order, the deltas recorded against the previous draw do not apply.
+            if (last_issued && last_issued != &r - 1 && last_issued != &r) {
+                r.program->uniform_chain_valid = false;
+                texture_current = 0;
+            }
+            const bool in_order = last_issued == &r - 1 || last_issued == &r;
+            last_issued = &r;
             if (!r.program->plan->fast && target.format(r.program->plan->rgba6)) { fixed_state(depth); fresh = true; }
             if (fresh) {
                 program = nullptr; run = state = ~0u; bound_blocks = {no_block, no_block, no_block}; latches = {{~0u, ~0u, ~0u}};
@@ -3032,9 +3047,10 @@ struct GlesDirect::Impl {
                 texture_current = 0;
             }
             if (!r.program->name && !ready(*r.program)) {
-                ++unready_draws; r.program->uniform_chain_valid = false; raster_current = false;
+                if (!lower) ++unready_draws;
+                r.program->uniform_chain_valid = false; raster_current = false;
                 texture_current &= ~r.program->plan->maps;
-                continue;
+                return;
             }
             if (program != r.program) {
                 glUseProgram(r.program->name); program = r.program;
@@ -3062,8 +3078,8 @@ struct GlesDirect::Impl {
                                   static_cast<GLsizeiptr>(r.instances) * transform_instance_rows * 16);
             const auto& entry = states[r.state];
             const DrawStateView s(seg.raster_states[entry.raster], seg.texture_states[entry.textures], entry.tev);
-            if (!raster_current || (state != r.state && r.raster_changed)) apply_raster(s);
-            state = r.state; raster_current = true;
+            if (!raster_current || lower != lower_current || (state != r.state && (r.raster_changed || !in_order))) apply_raster(s, lower);
+            state = r.state; raster_current = true; lower_current = lower;
             apply_uniforms(*r.program, s, r.program->uniform_chain_valid ? r.uniform_changes : 0xffff);
             r.program->uniform_chain_valid = true;
             unsigned changed = r.texture_changes | (r.program->plan->maps & ~texture_current);
@@ -3092,6 +3108,30 @@ struct GlesDirect::Impl {
                                     reinterpret_cast<const void*>(std::uintptr_t{r.first} * 4));
             }
             ++stats.submissions;
+        };
+        const auto lower_part = [&](const Record& r) {
+            const auto& raster = seg.raster_states[states[r.state].raster].raster;
+            return raster.strip || raster.split;
+        };
+        // Programs that are not fast reinterpret the EFB format in draw order.
+        const bool defer = std::all_of(records.begin(), records.end(), [](const Record& r) { return r.program->plan->fast; });
+        bool any_lower = false;
+        for (auto& r : records) {
+            const auto& raster = seg.raster_states[states[r.state].raster].raster;
+            any_lower |= raster.strip || raster.split;
+            if (!defer || !raster.strip) issue(r, false);
+            // Uniform deltas are recorded against the program's previous draw.
+            else r.program->uniform_chain_valid = false;
+            if (!defer && raster.split) issue(r, true);
+        }
+        if (defer && any_lower) {
+            for (auto& r : records)
+                if (lower_part(r)) {
+                    r.program->uniform_chain_valid = false;
+                    issue(r, seg.raster_states[states[r.state].raster].raster.split);
+                }
+            // The next segment's deltas start from the last draw in recording order.
+            for (auto& r : records) r.program->uniform_chain_valid = false;
         }
         for (unsigned map = 0; map < 8; ++map) glBindSampler(map, 0);
         glBindVertexArray(0);

@@ -19,6 +19,10 @@ struct RasterSnapshot {
     RasterRect scissor; // Clipped to that target, GLES lower-left origin.
     // The scissor lies wholly in the EFB rows below the displayed frame.
     bool strip = false;
+    // The scissor crosses from the frame's rows into the rows below it: viewport and scissor
+    // cover the frame's part, strip_scissor (GLES lower-left origin in the strip) the rest.
+    bool split = false;
+    RasterRect strip_scissor;
     std::array<int, 2> quad_offset{};
     std::array<std::uint32_t, 2> scissor_words{};
     std::array<RasterScale, 8> coordinates{};
@@ -49,6 +53,9 @@ RasterCapture capture_raster(const State&);
 struct GlesRasterPlan {
     RasterRect viewport, scissor;
     bool strip = false; // Renders into the target for EFB rows below the frame.
+    // Also renders into that target, with strip_viewport and strip_scissor.
+    bool split = false;
+    RasterRect strip_viewport, strip_scissor;
     bool blend = false, color_write = false, depth_test = false, depth_write = false, early_depth = false;
     std::array<float,2> depth_range{{0,1}};
     std::uint8_t depth_compare = 7;

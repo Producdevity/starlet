@@ -147,6 +147,22 @@ void viewport_and_scissor() {
         check(!c && !c.snapshot && c.status.error == RasterError::invalid_viewport, "nonfinite fails atomically");
     }
 }
+// A 512x512 viewport over a 448-row frame draws into both targets; a full-EFB scissor alone does not.
+void split_rows() {
+    Fixture f(EfbLayout{448});
+    f.xf(0x101a, 256); f.xf(0x101b, -256); f.xf(0x101d, 598); f.xf(0x101e, 598);
+    f.bp(0x20, (342u << 12) | 342u); f.bp(0x21, (853u << 12) | 853u);
+    auto c = f.capture();
+    check(c && c.snapshot->split && !c.snapshot->strip, "viewport past the frame splits");
+    auto p = plan_gles_raster(*c.snapshot);
+    check(bool(p) && p.plan.split && !p.plan.strip, "split plan");
+    rect(p.plan.viewport, 0, -64, 512, 512); rect(p.plan.scissor, 0, 0, 512, 448);
+    rect(p.plan.strip_viewport, 0, 16, 512, 512); rect(p.plan.strip_scissor, 0, 16, 512, 64);
+    Fixture frame(EfbLayout{448});
+    frame.bp(0x21, (981u << 12) | (342u + 527u));
+    c = frame.capture();
+    check(c && !c.snapshot->split, "frame viewport with a full-EFB scissor stays in the frame");
+}
 void coverage_oracle() {
     Fixture f;
     std::uint32_t random = 0x572ac9;
@@ -320,6 +336,7 @@ void fractional_viewport() {
 int main() {
     try {
         frame_layouts();
+        split_rows();
         guard_band();
         fractional_viewport();
         baseline(); culling(); depth(); viewport_and_scissor(); coverage_oracle(); preserved_state_and_gates(); fast_fog();

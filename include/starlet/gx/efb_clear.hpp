@@ -7,6 +7,8 @@ namespace starlet::gx {
 struct EfbClear {
     EfbLayout efb;
     RasterRect rectangle;
+    // Rows of the clear below the frame, in the strip target (GLES lower-left origin); empty if none.
+    RasterRect strip_rectangle;
     std::array<std::array<std::uint8_t, 4>, 16> tile{};
     bool color_write = false, alpha_write = false, rgba6 = false;
     bool depth_write = true;

@@ -154,6 +154,12 @@ A resident texture copy whose clear covers the whole EFB and rewrites an attachm
 copy does not read (depth for colour copies; colour, alpha included, for depth copies)
 invalidates that attachment first, so the pass the copy ends does not write it back.
 
+A port whose frame is shorter than the EFB's 528 rows keeps the rows below it in the strip,
+a target of their own, so passes over the frame never load or store them. Draws whose viewport
+reaches past the frame's last row render into both targets, the strip's parts after the frame's
+in each segment. Copies across that row read both targets: two blits, or one copy program with a
+second sampler. Their clears clear both. Fast copies that are neither are refused.
+
 Offscreen passes (`begin_offscreen`/`end_offscreen`) swap both EFB attachments for
 an EFB-sized colour and depth pair cleared to transparent black and the far plane.
 Draws, clears and texture copies in between use the pair; ending reattaches the EFB

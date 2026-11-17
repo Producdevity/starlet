@@ -56,6 +56,14 @@ RasterCapture capture_raster(const State& state) {
     const int x0 = std::clamp(left, 0, EfbLayout::width), x1 = std::clamp(right, 0, EfbLayout::width);
     int y0 = std::clamp(top, 0, EfbLayout::rows), y1 = std::clamp(bottom, 0, EfbLayout::rows);
     r.strip = y0 >= r.efb.height && y1 > y0;
+    // GL draws nothing outside the viewport, so a draw reaches the strip only when its viewport does.
+    const double viewport_end = r.viewport.top + r.viewport.height;
+    r.split = y0 < r.efb.height && y1 > r.efb.height && r.viewport.height > 0 && viewport_end > r.efb.height &&
+              r.viewport.top < r.efb.height;
+    if (r.split) {
+        const int strip_rows = y1 - r.efb.height;
+        r.strip_scissor = {x0, r.efb.strip_height() - strip_rows, std::max(0, x1 - x0), strip_rows};
+    }
     int height = r.efb.height;
     if (r.strip) {
         y0 -= r.efb.height; y1 -= r.efb.height;
@@ -90,6 +98,24 @@ GlesRasterResult plan_gles_raster(const RasterSnapshot& r, bool rgba6_copy, Guar
     auto reject = [](const char* message) {
         return GlesRasterResult{{RasterError::unsupported_state, message}, {}};
     };
+    if (r.split) {
+        // Each target's part is planned as its own draw; GL state other than the viewport and
+        // scissor depends on neither.
+        auto frame = r;
+        frame.split = false;
+        auto planned = plan_gles_raster(frame, rgba6_copy, guard_band, fractional);
+        if (!planned) return planned;
+        auto below = frame;
+        below.strip = true;
+        below.viewport.top -= r.efb.height;
+        below.scissor = r.strip_scissor;
+        const auto lower = plan_gles_raster(below, rgba6_copy, guard_band, fractional);
+        if (!lower) return lower;
+        planned.plan.split = true;
+        planned.plan.strip_viewport = lower.plan.viewport;
+        planned.plan.strip_scissor = lower.plan.scissor;
+        return planned;
+    }
     const double gl_y = (r.strip ? r.efb.strip_height() : r.efb.height) - r.viewport.top - r.viewport.height;
     if (fractional == FractionalViewport::round &&
         !(integral_int(r.viewport.left) && integral_int(gl_y) && integral_int(r.viewport.width) &&

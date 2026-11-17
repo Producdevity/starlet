@@ -153,15 +153,27 @@ void z16_plan() {
     require(refused, "color copy under Z24 is refused");
 }
 // Pikmin 2's ShadowCylinder2 passes its bottom-right corner as the size: in the lower
-// split-screen view that is 608x448 from row 224. The rectangle is cut to the frame.
+// split-screen view that is 608x448 from row 224. The rectangle is cut to the EFB's last row
+// and reads the rows below the frame from the strip.
 void clipped_plan() {
     Memory memory; Sink sink; Decoder decoder(memory, sink);
     TextureCopyRegisters r{};
     r.source = 0x49000000u | (224u << 10); r.size = 0x4a000000u | (447u << 10) | 607u; r.stride = 0x4d000000u | 38u;
     r.command = 0x52010270u; // R8, half scale.
     const auto p = plan_texture_copy(decoder.state(), r, false);
-    require(p.y == 224 && p.width == 608 && p.height == p.efb.height - 224 && !p.strip, "rectangle cut to the frame's bottom");
-    require(p.destination_width() == 304 && p.destination_height() == (p.efb.height - 224) / 2, "destination keeps the covered rows");
+    require(p.y == 224 && p.width == 608 && p.height == EfbLayout::rows - 224 && !p.strip && p.split, "rectangle cut to the EFB's bottom");
+    require(p.destination_width() == 304 && p.destination_height() == (EfbLayout::rows - 224) / 2, "destination keeps the covered rows");
+    // A clearing copy across the frame's last row clears both targets' parts.
+    r.source = 0x49000000u; r.size = 0x4a000000u | (511u << 10) | 511u; r.stride = 0x4d000000u | 64u; r.command = 0x52010808u;
+    const auto goop = plan_texture_copy(decoder.state(), r, true);
+    const int below = 512 - goop.efb.height;
+    require(goop.split && goop.height == 512 && goop.clear && goop.clear->rectangle.y == 0 &&
+            goop.clear->rectangle.height == goop.efb.height && goop.clear->strip_rectangle.height == below &&
+            goop.clear->strip_rectangle.y == goop.efb.strip_height() - below && goop.clear->strip_rectangle.width == 512,
+            "split clear rectangles");
+    r.size = 0x4a000000u | (99u << 10) | 99u;
+    const auto inside = plan_texture_copy(decoder.state(), r, true);
+    require(!inside.split && inside.clear && !inside.clear->strip_rectangle.height, "copy inside the frame is not split");
     r.source = 0x49000000u | 400u; r.size = 0x4a000000u | (99u << 10) | 399u; r.command = 0x52010070u;
     const auto wide = plan_texture_copy(decoder.state(), r, false);
     require(wide.x == 400 && wide.width == EfbLayout::width - 400 && wide.height == 100, "rectangle cut to the frame's right edge");
