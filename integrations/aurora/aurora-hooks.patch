@@ -1,0 +1,218 @@
+diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
+index 032039c..ea1688b 100644
+--- a/cmake/aurora_gx.cmake
++++ b/cmake/aurora_gx.cmake
+@@ -45,6 +45,22 @@ add_library(aurora::gx ALIAS aurora_gx)
+ set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
+ 
+ target_link_libraries(aurora_gx PUBLIC aurora::core xxhash)
++
++# Starlet back end: draws the GX stream with Starlet when AURORA_RENDERER=starlet.
++set(AURORA_STARLET_DIR "" CACHE PATH "Starlet source tree")
++if (NOT EXISTS "${AURORA_STARLET_DIR}/CMakeLists.txt")
++    message(FATAL_ERROR "Set AURORA_STARLET_DIR to a Starlet checkout")
++endif ()
++set(STARLET_GLES ON)
++add_subdirectory("${AURORA_STARLET_DIR}" "${CMAKE_BINARY_DIR}/starlet" EXCLUDE_FROM_ALL)
++target_sources(aurora_gx PRIVATE
++        lib/starlet_backend/aurora_stream.cpp
++        lib/starlet_backend/backend.cpp
++        lib/starlet_backend/host_memory.cpp
++        lib/starlet_backend/issues.cpp
++        lib/starlet_backend/texture_convert.cpp
++)
++target_link_libraries(aurora_gx PRIVATE starlet::gx_gles)
+ target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 TracyClient PNG::PNG)
+ 
+ if (AURORA_ENABLE_RMLUI)
+diff --git a/lib/aurora.cpp b/lib/aurora.cpp
+index 86b5d16..d592512 100644
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -1,3 +1,4 @@
++#include "starlet_backend/backend.hpp"
+ #include <aurora/aurora.h>
+ 
+ #ifdef AURORA_ENABLE_GX
+@@ -174,6 +175,7 @@ void shutdown() noexcept {
+   rmlui::shutdown();
+ #endif
+   imgui::shutdown();
++  starlet_backend::shutdown();
+   gfx::shutdown();
+   webgpu::shutdown();
+ #endif
+@@ -218,6 +220,9 @@ void end_frame() noexcept {
+   ZoneScoped;
+ #ifdef AURORA_ENABLE_GX
+   gx::fifo::drain();
++  if (starlet_backend::enabled()) {
++    starlet_backend::end_frame();
++  }
+   // After the drain so this frame's binds are stamped/current; before gfx::end_frame so
+   // any evicted textures land in this frame's deferred-destroy snapshot.
+   gx::expire_texture_object_caches();
+@@ -257,7 +262,10 @@ void end_frame() noexcept {
+       auto frame = webgpu::sdl2shim_present::acquire();
+       if (frame) {
+         const uint32_t targetFbo = frame->fbo;
+-        webgpu::present_frame(targetFbo);
++        if (!starlet_backend::enabled() ||
++            !starlet_backend::present(targetFbo, webgpu::present_surface_width(), webgpu::present_surface_height())) {
++          webgpu::present_frame(targetFbo);
++        }
+         if (rmlTexture.id != 0) {
+           webgpu::composite_ui_overlay(rmlTexture, rmlSampler, rmlOverlay, targetFbo);
+         }
+@@ -278,7 +286,10 @@ void end_frame() noexcept {
+       }
+     } else {
+       // Desktop: composite into the window's default framebuffer and swap from the worker.
+-      webgpu::present_frame();
++      if (!starlet_backend::enabled() ||
++          !starlet_backend::present(0, webgpu::present_surface_width(), webgpu::present_surface_height())) {
++        webgpu::present_frame();
++      }
+       if (rmlTexture.id != 0) {
+         webgpu::composite_ui_overlay(rmlTexture, rmlSampler, rmlOverlay);
+       }
+diff --git a/lib/dolphin/gx/GXDispList.cpp b/lib/dolphin/gx/GXDispList.cpp
+index 326bba5..33c0d1f 100644
+--- a/lib/dolphin/gx/GXDispList.cpp
++++ b/lib/dolphin/gx/GXDispList.cpp
+@@ -2,6 +2,7 @@
+ #include "__gx.h"
+ 
+ #include "../../gx/fifo.hpp"
++#include "../../starlet_backend/backend.hpp"
+ 
+ #include <cstring>
+ 
+@@ -57,6 +58,10 @@ void GXCallDisplayList(const void* data, u32 nbytes) {
+     __GXSendFlushPrim();
+   }
+ 
++  if (!aurora::gx::fifo::in_display_list()) {
++    aurora::starlet_backend::note_display_list(data, nbytes);
++  }
++
+   // Write display list contents to the FIFO
+   aurora::gx::fifo::write_data(data, nbytes);
+ 
+diff --git a/lib/dolphin/gx/GXFrameBuffer.cpp b/lib/dolphin/gx/GXFrameBuffer.cpp
+index eaabadb..82d6a21 100644
+--- a/lib/dolphin/gx/GXFrameBuffer.cpp
++++ b/lib/dolphin/gx/GXFrameBuffer.cpp
+@@ -203,7 +203,32 @@ void GXSetCopyClear(GXColor color, u32 depth) {
+   __gx->bpSent = 1;
+ }
+ 
+-void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {}
++void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {
++  // BP 0x01-0x04: three sample locations each (x, y in 4 bits); 6 is the pixel centre.
++  for (u32 reg = 0; reg < 4; ++reg) {
++    u32 value = 0;
++    for (u32 i = 0; i < 3; ++i) {
++      const u32 x = aa ? sample_pattern[reg * 3 + i][0] : 6;
++      const u32 y = aa ? sample_pattern[reg * 3 + i][1] : 6;
++      SET_REG_FIELD(0, value, 4, i * 8, x);
++      SET_REG_FIELD(0, value, 4, i * 8 + 4, y);
++    }
++    SET_REG_FIELD(0, value, 8, 24, 0x01 + reg);
++    GX_WRITE_RAS_REG(value);
++  }
++  // BP 0x53/0x54: seven 6-bit vertical filter coefficients; without vf the hardware
++  // filter is 0,0,21,22,21,0,0, which leaves every row unchanged.
++  static constexpr u8 passthrough[7] = {0, 0, 21, 22, 21, 0, 0};
++  const u8* coefficients = vf ? vfilter : passthrough;
++  u32 coeff0 = 0, coeff1 = 0;
++  for (u32 i = 0; i < 4; ++i) SET_REG_FIELD(0, coeff0, 6, i * 6, coefficients[i]);
++  for (u32 i = 0; i < 3; ++i) SET_REG_FIELD(0, coeff1, 6, i * 6, coefficients[4 + i]);
++  SET_REG_FIELD(0, coeff0, 8, 24, 0x53);
++  SET_REG_FIELD(0, coeff1, 8, 24, 0x54);
++  GX_WRITE_RAS_REG(coeff0);
++  GX_WRITE_RAS_REG(coeff1);
++  __gx->bpSent = 1;
++}
+ 
+ void GXSetDispCopyGamma(GXGamma gamma) {}
+ 
+diff --git a/lib/dolphin/gx/GXTexture.cpp b/lib/dolphin/gx/GXTexture.cpp
+index 04f97f5..20c56d4 100644
+--- a/lib/dolphin/gx/GXTexture.cpp
++++ b/lib/dolphin/gx/GXTexture.cpp
+@@ -1,3 +1,4 @@
++#include "../../starlet_backend/backend.hpp"
+ #include "gx.hpp"
+ #include "__gx.h"
+ 
+@@ -78,9 +79,14 @@ void init_texobj_common(GXTexObj_& obj, const void* data, u16 width, u16 height,
+ }
+ 
+ void emit_loaded_texobj_metadata(const GXTexObj_& obj, GXTexMapID id) {
++  const void* data = obj.data;
++  if (aurora::starlet_backend::enabled()) {
++    data = aurora::starlet_backend::texture_data(
++        data, GXGetTexBufferSize(static_cast<u16>(obj.width()), static_cast<u16>(obj.height()), obj.format(), obj.has_mips(), 11));
++  }
+   GX_WRITE_AURORA(GX_AURORA_LOAD_TEXOBJ);
+   GX_WRITE_U8(static_cast<u8>(id));
+-  GX_WRITE_U64(reinterpret_cast<u64>(obj.data));
++  GX_WRITE_U64(reinterpret_cast<u64>(data));
+   GX_WRITE_U32(obj.width());
+   GX_WRITE_U32(obj.height());
+   GX_WRITE_U32(obj.format());
+diff --git a/lib/dolphin/gx/GXTransform.cpp b/lib/dolphin/gx/GXTransform.cpp
+index 5f97ad8..3c6d2ba 100644
+--- a/lib/dolphin/gx/GXTransform.cpp
++++ b/lib/dolphin/gx/GXTransform.cpp
+@@ -132,8 +132,8 @@ void GXSetViewportJitter(float left, float top, float width, float height, float
+ 
+   sx = width / 2.0f;
+   sy = -height / 2.0f;
+-  ox = 340.0f + (left + width / 2.0f);
+-  oy = 340.0f + (top + height / 2.0f);
++  ox = 342.0f + (left + width / 2.0f);
++  oy = 342.0f + (top + height / 2.0f);
+   zmin = 1.6777215e7f * nearZ;
+   zmax = 1.6777215e7f * farZ;
+   sz = zmax - zmin;
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index e8c71d5..78641fe 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -1440,8 +1440,8 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
+           f32 width = sx * 2.0f;
+           f32 height = -sy * 2.0f;
+           set_logical_viewport({
+-              .left = ox - 340.0f - width / 2.0f,
+-              .top = oy - 340.0f - height / 2.0f,
++              .left = ox - 342.0f - width / 2.0f,
++              .top = oy - 342.0f - height / 2.0f,
+               .width = width,
+               .height = height,
+               .znear = (oz - sz) / 1.6777215e7f,
+diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
+index 1e986e9..e279b22 100644
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -1,5 +1,6 @@
+ #include "fifo.hpp"
+ #include "command_processor.hpp"
++#include "../starlet_backend/backend.hpp"
+ #include "../internal.hpp"
+ 
+ #include <cstdlib>
+@@ -72,7 +73,11 @@ void drain() {
+   if (detail::sBufferSize == 0) {
+     return;
+   }
+-  process(detail::sBufferData, detail::sBufferSize, true);
++  if (starlet_backend::enabled()) {
++    starlet_backend::process(detail::sBufferData, detail::sBufferSize);
++  } else {
++    process(detail::sBufferData, detail::sBufferSize, true);
++  }
+   detail::sBufferSize = 0;
+ }
+ 
