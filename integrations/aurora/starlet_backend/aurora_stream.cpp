@@ -524,7 +524,8 @@ void AuroraStream::load_tlut(const std::uint8_t* payload) {
   const std::uint8_t name = payload[0];
   const auto format = be32(payload + 9);
   const std::size_t bytes = std::size_t{be16(payload + 13)} * 2;
-  const auto address = memory_.address(host_pointer(be64(payload + 1)), bytes, true);
+  const void* pointer = host_pointer(be64(payload + 1));
+  const auto address = memory_.address(pointer, bytes, true);
   if (!address || (address & 31) || name >= tlut_formats_.size()) {
     issues::report("TLUT not loaded: palette textures keep the previous palette", nullptr,
                    fmt::format("tlut {} format {} bytes {} address {:x}", name, format, bytes, address));
@@ -532,8 +533,25 @@ void AuroraStream::load_tlut(const std::uint8_t* payload) {
     return;
   }
   tlut_formats_[name] = static_cast<std::uint8_t>(format & 3);
+  const auto control = static_cast<std::uint32_t>((bytes + 31) / 32) << 10 | tlut_line(name);
+  // BP 0x64 holds 21 bits of 32-byte units; palettes the address space places above 64 MiB
+  // (window ranges, or a large arena's upper part) load from their bytes instead.
+  if (address >> 5 >= 1u << 21) {
+    const auto* palette = static_cast<const std::uint8_t*>(pointer);
+    const std::size_t loaded = (bytes + 31) / 32 * 32;
+    if (loaded != bytes) {
+      tlut_bytes_.assign(palette, palette + bytes);
+      tlut_bytes_.resize(loaded);
+      palette = tlut_bytes_.data();
+    }
+    const auto status = decoder_.load_tlut(control, {palette, loaded});
+    if (!status) {
+      fail("decoder: " + status.message);
+    }
+    return;
+  }
   write_bp(0x64000000u | address >> 5);
-  write_bp(0x65000000u | static_cast<std::uint32_t>((bytes + 31) / 32) << 10 | tlut_line(name));
+  write_bp(0x65000000u | control);
 }
 
 void AuroraStream::set_copy_destination_format(std::uint32_t width, std::uint32_t height, std::uint32_t format,

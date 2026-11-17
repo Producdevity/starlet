@@ -294,6 +294,28 @@ void palettes_snapshot_and_reload() {
             "TLUT source ignores register bits 21-23");
 }
 
+void host_palette_loads() {
+    Memory memory; Sink sink; Decoder d(memory, sink); position_xy_u8(d);
+    memory.regions[0x2000] = std::vector<std::uint8_t>(64, 0x11);
+    bp(d, 0x64, 0x100); bp(d, 0x65, 0x0401);
+    point(d);
+    std::vector<std::uint8_t> palette(64, 0x3c), bytes(64);
+    palette[0] = 0x80;
+    std::uint64_t before = 0, after = 0;
+    require(d.state().palette_generation(512, 32, before), "memory palette generation");
+    ok(d.load_tlut(0x0801, {palette.data(), palette.size()}));
+    point(d);
+    require(d.state().palette_generation(512, 64, after) && after > before, "host palette load advances generation");
+    require(d.state().read_palette(512, bytes.data(), 64) && bytes == palette, "host palette bytes replace TMEM");
+    require(d.state().bp(0x65) == 0x0801 && d.state().bp(0x64) == 0x100, "host load records its control word only");
+    require(sink.draws[0].state.read_palette(512, bytes.data(), 32) && bytes[0] == 0x11, "earlier draw keeps its palette");
+    require(sink.draws[1].state.read_palette(512, bytes.data(), 32) && bytes[0] == 0x80, "later draw sees the host palette");
+    memory.regions[0x2000].assign(64, 0x22);
+    bp(d, 0x65, 0x0401);
+    require(d.state().read_palette(512, bytes.data(), 32) && bytes[0] == 0x22, "register loads read memory again afterwards");
+    require(d.load_tlut(0x0c01, {palette.data(), 64}).error == Error::invalid_input, "host palette shorter than its load is rejected");
+}
+
 void lists_mutation_and_shared_state() {
     Memory memory; Sink sink; Decoder d(memory, sink);
     memory.regions[0x3000] = {0x08,0x50,0,0,2,0, 0x08,0x70,0,0,0,0,
@@ -833,7 +855,7 @@ void sdk_state_write_cache() {
 int main() {
     try {
         bp_mask_and_order(); tev_register_banks(); texgen_fields(); layouts_and_streaming(); layout_revision_ignores_arrays(); indexed_xf_and_bounds(); indexed_xf_reader_hook();
-        palettes_snapshot_and_reload(); lists_mutation_and_shared_state(); rejected_inputs_and_limits(); failed_memory_is_not_applied(); immutable_list_during_execution();
+        palettes_snapshot_and_reload(); host_palette_loads(); lists_mutation_and_shared_state(); rejected_inputs_and_limits(); failed_memory_is_not_applied(); immutable_list_during_execution();
         callback_reentry_is_rejected(); processing_exceptions_latch(); merged_primitives(); every_split_boundary();
         host_commands_and_filtered_bp(); tev_banks_in_fed_writes(); list_fast_path_matches_general_path(); selective_bp_notifications(); sdk_state_write_cache(); indexed_list_state_footprint(); xf_numeric_transfers();
         std::cout << "GX core: 20 test groups passed\n";

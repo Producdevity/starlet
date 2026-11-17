@@ -179,7 +179,7 @@ Other GPUs and other Aurora games are untested.
 |---|---|
 | BP, CP, XF, draws, inlined display lists | Decoded directly |
 | `LOAD_ARRAYBASE` | Mapped to a 32-bit address; honours the little-endian flag |
-| `LOAD_TEXOBJ`, `LOAD_TLUT`, `SET_TEX_IMG_PTR` | Mapped; textures over 1024 texels supported |
+| `LOAD_TEXOBJ`, `LOAD_TLUT`, `SET_TEX_IMG_PTR` | Mapped; textures over 1024 texels supported. A palette above 64 MiB of GX address space, which BP `0x64` cannot hold, loads through `Decoder::load_tlut` |
 | `LOAD_COPY_SRC`, `LOAD_COPY_DST`, `LOAD_COPY_DEST`, `LOAD_DISP_COPY_SRC` | EFB copy to a GPU texture keyed by the destination pointer; BP `0x52` with bit 14 is a display copy |
 | `CLEAR` | Planned as a GX clear of the given rectangle |
 | `BEGIN_OFFSCREEN`, `END_OFFSCREEN` | Offscreen pass |

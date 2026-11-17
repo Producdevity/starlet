@@ -113,6 +113,7 @@ private:
   };
   std::array<TextureSlot, 8> texture_slots_{};
   std::array<std::vector<std::uint8_t>, 8> linear_tiles_; // Tiled GX copies of PC-format loads per map.
+  std::vector<std::uint8_t> tlut_bytes_; // A host-loaded palette padded to whole 32-byte units.
   std::vector<std::uint8_t> scratch_;
   // The last array each CP array slot was given, valid while the memory epoch is unchanged.
   struct ArraySlot {

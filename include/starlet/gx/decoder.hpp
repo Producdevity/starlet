@@ -172,6 +172,10 @@ public:
     // Host extension: see TextureExtent. Up to 8192 texels per side; {} clears it. Counts
     // as a BP change, as the image register it widens is one.
     void set_texture_extent(std::uint8_t map, TextureExtent extent);
+    // Host extension: a TLUT load (BP 0x65 control word) that reads its palette from palette
+    // instead of the address in BP 0x64, whose 21 bits reach only 64 MiB. Same position rules
+    // as inject; palette must hold at least the load's size.
+    Status load_tlut(std::uint32_t control, ByteView palette);
 
 private:
     struct Budget { std::size_t commands = 0; std::size_t bytes = 0; };
@@ -206,6 +210,7 @@ private:
     bool feeding_ = false;
     bool injecting_ = false;
     bool host_callback_ = false; // Inside host_command or filter_bp, where inject may run.
+    const ByteView* palette_source_ = nullptr; // Set only inside load_tlut.
     // The feed loop and display lists apply NOP runs, these BP and CP writes and XF
     // writes themselves (fast_command).
     enum class Fast { none, applied, failed };

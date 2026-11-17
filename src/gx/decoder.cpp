@@ -87,7 +87,11 @@ bool Decoder::load_palette(std::uint32_t control) {
     }
     std::vector<std::uint8_t> bytes(size);
     // The source is 21 bits of 32-byte units; the console ignores register bits 21-23.
-    if (size && !read_memory((state_.bp_[0x64] & 0x1fffff) << 5, bytes.data(), size)) {
+    if (palette_source_) {
+        if (palette_source_->size < size || (size && !palette_source_->data))
+            return fail(Error::invalid_input, "host TLUT is smaller than its load");
+        std::copy_n(palette_source_->data, size, bytes.data());
+    } else if (size && !read_memory((state_.bp_[0x64] & 0x1fffff) << 5, bytes.data(), size)) {
         return false;
     }
     const auto generation = ++state_.palette_generation_;
@@ -715,6 +719,17 @@ Status Decoder::inject(ByteView bytes) try {
 } catch (...) {
     latch_exception();
     throw;
+}
+
+Status Decoder::load_tlut(std::uint32_t control, ByteView palette) {
+    const std::uint8_t command[5] = {0x61, 0x65, static_cast<std::uint8_t>(control >> 16), static_cast<std::uint8_t>(control >> 8),
+                                     static_cast<std::uint8_t>(control)};
+    struct Guard {
+        const ByteView*& source;
+        ~Guard() { source = nullptr; }
+    } guard{palette_source_};
+    palette_source_ = &palette;
+    return inject({command, sizeof command});
 }
 
 bool Decoder::extend_pending(ByteView bytes) {
