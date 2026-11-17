@@ -104,7 +104,7 @@ DrawStatus plan_direct_state(const State&, const DirectProgram&, TextureCmprMode
 // discarding them without changing the EFB: blending adds the source times its alpha to the
 // destination times one or one minus source alpha, and neither depth (GL writes it only while
 // testing) nor alpha is written.
-// Such a fragment then blends to exactly the destination (direct.md).
+// Such a fragment then blends to exactly the destination.
 bool batched_zero_alpha_exact(const DirectProgram&, const DirectRasterState&);
 
 } // namespace starlet::gx

@@ -174,7 +174,6 @@ void State::rebuild_registers() const {
 }
 
 void State::sync_dirty() const {
-    // Registers that no key covers are dropped here, in four mask operations.
     static constexpr auto covered = [] {
         std::array<std::uint64_t, 4> bits{};
         for (unsigned a = 0; a < 256; ++a)

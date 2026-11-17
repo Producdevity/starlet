@@ -28,13 +28,12 @@ struct GlesStats {
     std::uint64_t draws = 0, submissions = 0, shader_compiles = 0, texture_uploads = 0;
     std::size_t texture_bytes = 0;
     std::uint64_t display_copies = 0, texture_copies = 0, presentations = 0, format_conversions = 0, late_depth_snapshots = 0, blooms = 0;
-    // EFB peeks, those against the live EFB or waiting for a snapshot (both wait for
-    // queued GL work), and snapshot requests refused for want of a slot. Region misses:
-    // peeks outside a snapshot's read-back region, read from the retained snapshot.
+    // live_peeks and peek_waits wait for queued GL work. region_misses: peeks outside a
+    // snapshot's read-back region, read from the retained snapshot.
     std::uint64_t peeks = 0, live_peeks = 0, peek_waits = 0, refused_snapshots = 0, region_misses = 0;
-    // EFB attachments invalidated before a copy whose clear rewrites them (see renderer.md).
+    // EFB attachments invalidated before a copy whose clear rewrites them.
     std::uint64_t invalidations = 0;
-    // Resident texture copies rendered in the pass of the copy before them (see renderer.md).
+    // Resident texture copies rendered in the pass of the copy before them.
     std::uint64_t merged_copies = 0;
     // Resident copies into write_back ranges: written to memory, dropped (released, materialized
     // or overwritten by the game first), and landings that waited for their readback.
@@ -42,22 +41,16 @@ struct GlesStats {
     // Time for them: issuing the packing pass and readback on the GL thread, and copying the
     // mapped readback out on the owner thread (microseconds).
     std::uint64_t write_back_issue_us = 0, write_back_copy_us = 0;
-    // Resident copies whose memory bytes the caller supplied (copy_texture_known).
     std::uint64_t known_copies = 0;
     TextureCacheStats capture_cache;
     VertexCacheStats geometry_cache;
     GlesDirectStats direct;
 };
-// Requires a current GLES3.1 context owned by the constructing thread, kept
-// alive through destruction. SDL window/events/swap belong to the frontend.
-// Owns a640x456 EFB; present copies it to the requested drawable. This initial
-// draw sink admits plan_gles_draw's explicit domain. Native MainLoop clears
-// use a separate validated operation. Native display copies and VI presentation
-// admit the explicit domains documented in display_copy.md and texture_copy.md.
-// This does not establish original-GX numerical precision. Transfer state and
-// sampler bindings are set explicitly. A failure after GL mutation latches:
-// only stats and destruction remain available, since driver state cannot be
-// rolled back reliably. Unsupported packet validation precedes GL mutation.
+// Requires a current GLES 3.1 context owned by the constructing thread, kept alive through
+// destruction. SDL window, events and swap belong to the frontend. Original-GX numerical
+// precision is not established. A failure after GL mutation latches: only stats and
+// destruction remain available, since driver state cannot be rolled back. Validation
+// failures before mutation are recoverable.
 class GlesRenderer : public GpuCompletionBackend, public EfbClearBackend, public DisplayCopyBackend, public TextureCopyBackend, public EfbPeekBackend,
                      public EfbBloomBackend {
 public:
@@ -72,9 +65,9 @@ public:
     void draw_batch(const DrawPacket*, std::size_t count);
     // Captures one single-primitive draw into a packet; merged draws are rejected.
     void draw(const State&, const Draw&, MemoryReader&, TextureCmprModel = TextureCmprModel::reject_unverified);
-    // Direct path (gles_direct.hpp): reads all draw inputs before returning and defers
-    // GL submission until the next EFB access, presentation or idle boundary. The only
-    // entry that accepts merged draws (Limits::merge_primitives).
+    // Direct path: reads all draw inputs before returning and defers GL submission until the
+    // next EFB access, presentation or idle boundary. The only entry that accepts merged draws
+    // (Limits::merge_primitives).
     void draw_direct(const State&, const Draw&, MemoryReader&, TextureCmprModel = TextureCmprModel::reject_unverified);
     void clear_efb(const EfbClear&) override;
     std::uint32_t peek_depth(int x, int y) override;
@@ -133,11 +126,9 @@ public:
     void present(int drawable_width, int drawable_height);
     void copy_display(const DisplayCopy&, std::uint8_t*, std::size_t) override;
     void copy_texture(const TextureCopy&, std::uint8_t*, std::size_t) override;
-    // With the direct path active, copies stay GPU-resident (gles_direct.hpp),
-    // display copies are presented from the GPU without writing XFB memory, and
-    // wait_until_idle only submits pending draws: no CPU-visible GX result is
-    // pending, and presentation waits for the previous frame. Consecutive resident copies that
-    // differ only in their target render in one pass (renderer.md).
+    // With the direct path active, copies stay GPU-resident, display copies are presented from
+    // the GPU without writing XFB memory, and wait_until_idle only submits pending draws.
+    // Consecutive resident copies that differ only in their target render in one pass.
     void copy_texture_resident(const TextureCopy&, std::uint8_t*, std::size_t, std::uint32_t token) override;
     // Direct path: a copy whose encoded bytes the caller computed. Earlier write-backs into its
     // memory land first, then memory takes contents at once; nothing is read back. A copy that
@@ -156,7 +147,7 @@ public:
     void before_dma_write(const void* data, std::size_t bytes);
     // Direct path, owner thread: resident copies into [token, token + bytes) also reach memory,
     // for a game whose CPU reads them (a console copy writes main memory). Each one is read back
-    // without waiting (one-byte-per-texel copies issued together in one readback; see direct.md);
+    // without waiting (one-byte-per-texel copies issued together in one readback);
     // land_write_backs writes its bytes as materializing would. A copy into memory whose earlier
     // copy has not landed lands that one first, waiting for its readback if needed. on = false
     // drops the range. write_backs_issued counts the copies issued into such ranges;
@@ -168,9 +159,9 @@ public:
     // Any thread: whether resident copies may hold bytes of [data, data + bytes); the
     // calls above change nothing otherwise.
     bool resident_in(const void* data, std::size_t bytes) const;
-    // With the direct path active, XFBs change only through display copies, so a
-    // retrace showing the same XFB and extent as the last presentation returns false
-    // without presenting or swapping; the previous image stays on screen.
+    // With the direct path active, XFBs change only through display copies, so a retrace showing
+    // the same XFB and extent as the last presentation returns false without presenting or
+    // swapping; the previous image stays on screen.
     bool present_framebuffer(const FramebufferView&, int drawable_width, int drawable_height, bool black = false);
     void wait_until_idle() override;
     // Swaps the EFB colour for a cleared spare and back, so only the 160x114 and
@@ -185,13 +176,12 @@ public:
     // instead of in an EFB corner it saves and restores. Not nestable.
     void begin_offscreen();
     void end_offscreen();
-    // RGBA8 rows from the lower-left, for bounded development validation.
+    // RGBA8 rows from the lower-left.
     std::vector<std::uint8_t> readback();
     GlesStats stats() const;
     // A GL failure made the renderer unusable; draws rejected before submission do not.
     bool failed() const;
-    // Direct path: see GlesDirect::program_builder and build_programs_in_background. Owner
-    // thread; starts the direct path, and so its program builder, if no draw has yet.
+    // Owner thread; starts the direct path, and so its program builder, if no draw has yet.
     GlesProgramBuilderStats program_builder();
     void build_programs_in_background();
 private:

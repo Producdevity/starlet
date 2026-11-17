@@ -897,7 +897,7 @@ struct GlesDirect::Impl {
     void textures_changed() { last_textures.valid = false; batch.valid = false; }
     GLuint vao = 0, vbo = 0, ibo = 0, ubo = 0, dynamic_vbo = 0;
     GLint uniform_alignment = 256;
-    // GL-thread vertex arrays for resident geometry, by buffer and stream format.
+    // GL thread.
     std::unordered_map<std::uint64_t, GLuint> geometry_vaos;
 
     Impl(GlesDirectLimits l, FramebufferFetch f, Target t) : limits(l), fetch(f), target(std::move(t)) {
@@ -1418,7 +1418,6 @@ struct GlesDirect::Impl {
         evict_textures();
         return entry->name;
     }
-    // Overlapping resident copies within [begin, end), in token order.
     std::vector<std::map<std::uint32_t, GlesResidentCopy>::iterator> overlapping(std::uint32_t begin, std::size_t bytes) {
         std::vector<std::map<std::uint32_t, GlesResidentCopy>::iterator> found;
         auto it = copies.upper_bound(begin);
@@ -1427,7 +1426,6 @@ struct GlesDirect::Impl {
             if (std::uint64_t{it->first} + it->second.bytes > begin) found.push_back(it);
         return found;
     }
-    // Whether a shadowed copy still owns a byte of [begin, begin + bytes).
     static bool owns_any(const GlesResidentCopy& c, std::uint32_t begin, std::size_t bytes) {
         const auto from = std::max<std::uint64_t>(begin, c.token), to = std::min<std::uint64_t>(std::uint64_t{begin} + bytes, std::uint64_t{c.token} + c.bytes);
         return from < to && !c.covers(std::size_t(from - c.token), std::size_t(to - c.token));
@@ -2031,8 +2029,6 @@ struct GlesDirect::Impl {
         }
         g.buffer = 0; g.arena = -1;
     }
-    // Packs loose entries inserted before this frame into one new arena. The arena is
-    // written once before any draw uses it, so no submitted buffer is modified.
     static std::uint32_t format_key(const StreamFormat& f) {
         return std::uint32_t{f.normal_vectors} | (std::uint32_t{f.colors} << 2) | (std::uint32_t{f.texcoords} << 4) |
                (std::uint32_t{f.matrices} << 12) | (std::uint32_t{f.registers} << 13);
@@ -2409,8 +2405,6 @@ struct GlesDirect::Impl {
         }
         return false;
     }
-    // Small draws stream eye-space positions with their TEV registers so that
-    // consecutive ones differing only in those merge into a single GL draw.
     static bool line_point(const Draw& draw) { return draw.primitive == 0xa8 || draw.primitive == 0xb0 || draw.primitive == 0xb8; }
     // The setup unit's size and texture offsets for a line or point draw. An offset is
     // applied to the input coordinate through the inverse of an affine texgen.

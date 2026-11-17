@@ -31,7 +31,7 @@ struct ZTextureProgram {
 // GLSL of z_texture_depth, empty for op 0. globals declares uniform highp uint uGxZBias.
 // reference goes at the start of main(), before any discard: it declares gxZReference with add.
 // depth declares highp uint gxZ from texel, a highp uvec4 expression with 0..255 lanes, and
-// with ZTextureProgram::depth writes gl_FragDepth = gxZ / 2^24, the encoding of depth.md.
+// with ZTextureProgram::depth writes gl_FragDepth = gxZ / 2^24.
 struct ZTextureGlsl { std::string globals, reference, depth; };
 ZTextureGlsl z_texture_glsl(const ZTextureProgram&, const std::string& texel);
 

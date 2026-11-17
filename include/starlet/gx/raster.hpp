@@ -87,7 +87,7 @@ struct GlesRasterResult {
     GlesRasterPlan plan;
     explicit operator bool() const { return static_cast<bool>(status); }
 };
-// Explicit initial GLES domain: integral viewport, RGB8, smooth
+// Exact GLES domain: integral viewport, RGB8, smooth
 // triangles, GX face culling and linear depth, no field/fog/logic/dither/constant-alpha effects. RGB8 EFB
 // alpha is kept opaque and cannot be used as a blend factor in this domain.
 // rgba6_copy selects shader pixel arithmetic: blending, masks, forced alpha and

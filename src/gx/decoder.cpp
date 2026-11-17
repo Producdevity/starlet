@@ -327,7 +327,6 @@ void Decoder::apply_xf(std::size_t address, const std::uint8_t* words, std::size
 bool Decoder::parse_list(ByteView bytes, unsigned depth, Budget& budget) {
     std::size_t offset = 0;
     while (offset < bytes.size) {
-        // Material and shape lists are mostly the same plain writes as the stream.
         std::size_t fast = 0;
         const auto applied = fast_command(bytes.data + offset, bytes.size - offset, depth, budget, fast);
         if (applied == Fast::failed) return false;
@@ -579,7 +578,6 @@ Decoder::Parse Decoder::command(ByteView input, std::size_t& consumed, unsigned 
             draw.runs = runs_.data();
             draw.run_count = static_cast<std::uint16_t>(runs_.size());
         }
-        // The n-th vertex (from 1) across all runs.
         const auto vertex_at = [&](std::size_t n) {
             if (draw.runs) {
                 for (std::size_t r = 0; r < draw.run_count; ++r) {
@@ -640,8 +638,6 @@ Status Decoder::feed(ByteView bytes) try {
             pending_.insert(pending_.end(), bytes.data + offset, bytes.data + bytes.size);
             break;
         }
-        // NOP runs, plain BP and CP writes and XF matrix-memory writes are most of a frame's
-        // commands; fast_command applies them with the general path's effects.
         if (pending_.empty()) {
             std::size_t fast = 0;
             const auto applied = fast_command(bytes.data + offset, bytes.size - offset, 0, budget, fast);

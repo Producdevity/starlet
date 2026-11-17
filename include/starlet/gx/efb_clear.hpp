@@ -16,7 +16,7 @@ struct EfbClear {
 };
 // The primary MainLoop clear is an ALWAYS-pass quad replacing Z with 0xffffff.
 // Tile entries are RGBA8 storage values in EFB x-right/y-down order. RGBA6 uses
-// the existing candidate_v1 alpha reduction and MSB replication convention.
+// the candidate_v1 alpha reduction and MSB replication.
 EfbClear plan_efb_clear(const State&, int x, int y, int width, int height,
                        std::array<std::uint8_t, 4> color);
 EfbClear plan_copy_clear(const State&, RasterRect);

@@ -604,7 +604,7 @@ void fast_program_rebuilds() {
     latched_normal_program_rebuild();
 }
 // The default fixture's stage reads TEXC from map 3; with its lookup disabled the draw binds and
-// samples no texture and reads the constant (draw.md).
+// samples no texture and reads the constant.
 void disabled_lookup_draws() {
     for (const bool texgens : {true, false}) {
         Fixture f; f.bp(0x28, 0x0b);

@@ -85,7 +85,7 @@ TransformStatus validate(const TransformPipeline& p) {
             if ((row == 3 || row == 4) && p.normal_components != 9)
                 return fail(TransformError::missing_input, "binormal/tangent texgen requires NBT");
             if (row >= 5 && row <= 12) {
-                // An absent ST attribute reads (0, 0, 1, 1); see draw.md.
+                // An absent ST attribute reads (0, 0, 1, 1), following Dolphin; hardware unverified.
                 if (t.input_abc1) return fail(TransformError::unsupported_state, "ST texgen cannot supply ABC input");
             } else if (row != 0 && row != 1 && row != 3 && row != 4) {
                 return fail(TransformError::unsupported_state, "reserved regular texgen source row");

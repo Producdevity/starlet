@@ -70,7 +70,7 @@ struct TevPipeline {
     // The last stage's lookup is the Z texel and is unavailable as a TEV input (GX manual 9.12).
     std::uint8_t z_texture_op = 0, z_texture_type = 0;
     // Every component of a texture input whose stage has its lookup disabled: 255, or 0 when BP
-    // genMode enables no texture coordinates (draw.md).
+    // genMode enables no texture coordinates; Dolphin is the reference, the latter case unverified there.
     std::uint8_t disabled_texture = 255;
 };
 // Whether stage i's texture lookup is consumed: by its TEV inputs, or as the Z texel.
@@ -114,7 +114,7 @@ TevUniforms capture_tev_uniforms(const State& state);
 
 // Explicit provisional model, NOT proof of original-GX precision. The fixed8
 // policy (coefficient, quantization, clamp and final conversion) is centralized
-// in gx_tev.cpp. CPU/GPU agreement establishes only this model's consistency.
+// in tev.cpp. CPU/GPU agreement establishes only this model's consistency.
 enum class TevArithmeticModel : std::uint8_t { fixed8_candidate_v1 = 1 };
 
 struct TevInputs {

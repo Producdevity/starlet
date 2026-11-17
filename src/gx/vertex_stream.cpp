@@ -472,7 +472,6 @@ StreamResult append_stream_vertices(const State& state, const Draw& draw, Memory
             return fail(VertexError::partial_primitive, "GX draw has an incomplete primitive");
         index_count += count;
     }
-    // A merged draw's runs are converted as one contiguous draw.
     Draw flat = draw;
     thread_local std::vector<std::uint8_t> gathered;
     if (draw.merged()) {

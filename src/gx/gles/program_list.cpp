@@ -6,7 +6,7 @@
 namespace starlet::gx {
 namespace {
 constexpr char header[] = "# starlet program list 1\n";
-// Lists recorded before the format took Starlet's name; identical otherwise.
+// Header of lists written under the format's former name; the layout is the same.
 constexpr char earlier_header[] = "# galaxy program list 1\n";
 
 std::uint64_t key(const std::vector<std::uint32_t>& words) {

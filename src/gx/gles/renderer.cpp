@@ -1254,7 +1254,7 @@ texels[uOffset+p.y*uSource.w+p.x]=packUnorm4x8(texelFetch(uImage,uSource.xy+p,0)
     }
     void reinterpret_format(bool target_rgba6) {
         if (rgba6 == target_rgba6) return;
-        // Fast direct shading keeps RGBA6 as plain RGBA8 values (direct.md): copies and
+        // Fast direct shading keeps RGBA6 as plain RGBA8 values: copies and
         // clears after a format change must not reinterpret what fast programs drew.
         if (direct && limits.direct.shading == DirectShading::fast) { rgba6 = target_rgba6; return; }
         ++stats.format_conversions;

@@ -59,7 +59,7 @@ struct GlesDirectLimits {
     // intact. A game that reuses the memory breaks a stamp, and its bytes then stay.
     bool stamp_resident_copies = false;
     // Fast shading: batched draws whose vertices share one eye depth compute fog per vertex
-    // (batched_vertex_fog); see direct.md. Off keeps every fog per fragment.
+    // (batched_vertex_fog). Off keeps every fog per fragment.
     bool vertex_fog = false;
 };
 // An EFB texture copy held only on the GPU: texture holds the texels the copy's
@@ -128,7 +128,7 @@ struct GlesDirectStats {
     // thread linked itself after unready_link_ms, and its longest such link.
     std::array<std::uint64_t, 5> program_waits{};
     std::uint64_t program_wait_max_ms = 0, fallback_links = 0, fallback_link_max_ms = 0;
-    // Draws added as instances to the previous resident draw; see the instancing notes in direct.md.
+    // Draws added as instances to the previous resident draw.
     std::uint64_t instanced_draws = 0;
     // Batched draws whose alpha test keeps failing fragments with alpha 0 (batched_zero_alpha).
     std::uint64_t zero_alpha_draws = 0;
@@ -181,7 +181,7 @@ public:
     void invalidate(const void* data, std::size_t size);
     // Registers the copy at token as GPU-resident and returns its destination-sized
     // RGBA8 texture and a framebuffer with it attached, for the caller to render into. Overlapped resident copies are
-    // replaced; partly overlapped ones keep their other bytes on the GPU (see direct.md). Call after flush(),
+    // replaced; partly overlapped ones keep their other bytes on the GPU. Call after flush(),
     // and flush() again before rendering into the target: its creation is queued.
     struct ResidentTarget { unsigned texture = 0, framebuffer = 0; };
     // write_back: nonzero for a copy that will also reach memory (GlesRenderer::write_back), its
@@ -200,7 +200,7 @@ public:
     // resident copies holding bytes there are materialized first.
     void before_read(const void* data, std::size_t size);
     // A host transfer is about to write [data, data + size): resident copies there are
-    // dropped without materializing; partly covered ones keep their other bytes (direct.md).
+    // dropped without materializing; partly covered ones keep their other bytes.
     void before_write(const void* data, std::size_t size);
     // Any thread: whether a resident copy may hold bytes of [data, data + size).
     bool resident_in(const void* data, std::size_t size) const;

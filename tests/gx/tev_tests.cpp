@@ -341,7 +341,7 @@ void emit_cases(const std::filesystem::path& directory) {
     manifest<<"]}\n";require(static_cast<bool>(manifest),"write fixture manifest");
 }
 // A stage reading its texture with the lookup disabled reads a constant: 255 with texture
-// coordinates enabled in BP genMode, 0 without (draw.md).
+// coordinates enabled in BP genMode, 0 without.
 void disabled_lookup_constant() {
     Memory memory; Sink sink; Decoder d(memory, sink);
     bp(d, 0x00, 1); // One texgen, one stage.
