@@ -1,7 +1,7 @@
 From 17e47c90e232ed187df2c66be117f6192ba947a4 Mon Sep 17 00:00:00 2001
 From: Producdevity <y.gherbi.dev@gmail.com>
 Date: Tue, 17 Nov 2026 14:52:49 +0100
-Subject: [PATCH] Add an AURORA_RENDERER=starlet path without Dawn
+Subject: [PATCH 1/2] Add an AURORA_RENDERER=starlet path without Dawn
 
 With AURORA_STARLET_DIR set, AURORA_RENDERER=starlet makes Aurora create
 its SDL3 window with SDL_WINDOW_OPENGL and OpenGL ES 3.1 attributes,
@@ -404,6 +404,85 @@ index f0674e1..bca3a31 100644
        "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, SDL_GetError());
    g_window = SDL_CreateWindowWithProperties(props);
    if (g_window == nullptr) {
+-- 
+2.56.0
+
+
+From 44af844c4349653dce789fc037090300f54d7840 Mon Sep 17 00:00:00 2001
+From: Producdevity <y.gherbi.dev@gmail.com>
+Date: Tue, 17 Nov 2026 21:24:53 +0100
+Subject: [PATCH 2/2] Offer SDL events to the Starlet overlay and build it when
+ STARLET_OVERLAY_DIR is set
+
+---
+ cmake/aurora_gx.cmake                        | 12 +++++++++++-
+ lib/starlet_stub/starlet_backend/backend.hpp |  3 +++
+ lib/window.cpp                               |  3 +++
+ 3 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
+index 6ea1245..417b48f 100644
+--- a/cmake/aurora_gx.cmake
++++ b/cmake/aurora_gx.cmake
+@@ -69,7 +69,7 @@ if (AURORA_STARLET_DIR)
+     set(STARLET_GLES ON)
+     add_subdirectory("${AURORA_STARLET_DIR}" "${CMAKE_BINARY_DIR}/starlet" EXCLUDE_FROM_ALL)
+     set(_starlet_bridge_sources)
+-    foreach (_name aurora_stream backend host_memory issues texture_convert)
++    foreach (_name aurora_stream backend host_memory issues overlay texture_convert)
+         list(APPEND _starlet_bridge_sources "${AURORA_STARLET_BRIDGE_DIR}/starlet_backend/${_name}.cpp")
+     endforeach ()
+     target_sources(aurora_gx PRIVATE ${_starlet_bridge_sources})
+@@ -77,6 +77,16 @@ if (AURORA_STARLET_DIR)
+     set_source_files_properties(${_starlet_bridge_sources} PROPERTIES
+             INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/lib")
+     target_link_libraries(aurora_gx PRIVATE starlet::gx_gles)
++    # Optional performance overlay (sbc-port-overlay): a settings menu and FPS, load and memory readout.
++    set(STARLET_OVERLAY_DIR "" CACHE PATH "sbc-port-overlay source tree")
++    if (STARLET_OVERLAY_DIR)
++        set(SPO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
++        enable_language(C)
++        add_subdirectory("${STARLET_OVERLAY_DIR}" "${CMAKE_BINARY_DIR}/spo" EXCLUDE_FROM_ALL)
++        target_link_libraries(aurora_gx PRIVATE spo::static)
++        set_property(SOURCE "${AURORA_STARLET_BRIDGE_DIR}/starlet_backend/overlay.cpp" APPEND PROPERTY
++                COMPILE_DEFINITIONS STARLET_WITH_OVERLAY=1)
++    endif ()
+ else ()
+     set(AURORA_STARLET_BRIDGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/starlet_stub")
+ endif ()
+diff --git a/lib/starlet_stub/starlet_backend/backend.hpp b/lib/starlet_stub/starlet_backend/backend.hpp
+index e7ffa84..af0ff30 100644
+--- a/lib/starlet_stub/starlet_backend/backend.hpp
++++ b/lib/starlet_stub/starlet_backend/backend.hpp
+@@ -3,6 +3,8 @@
+ #include <cstddef>
+ #include <cstdint>
+ 
++union SDL_Event;
++
+ // Stand-in for the Starlet bridge when AURORA_STARLET_DIR is not set: every hook is inert.
+ namespace aurora::starlet_backend {
+ constexpr bool enabled() noexcept { return false; }
+@@ -13,4 +15,5 @@ inline bool initialize() { return false; }
+ inline void shutdown() {}
+ inline const void* texture_data(const void* data, std::size_t) { return data; }
+ inline void note_display_list(const void*, std::size_t) {}
++inline bool overlay_event(const union SDL_Event&) { return false; }
+ } // namespace aurora::starlet_backend
+diff --git a/lib/window.cpp b/lib/window.cpp
+index bca3a31..b3774bd 100644
+--- a/lib/window.cpp
++++ b/lib/window.cpp
+@@ -211,6 +211,9 @@ void sync_paused() {
+ }
+ 
+ void process_event(SDL_Event& event) {
++  if (starlet_backend::overlay_event(event)) {
++    return;
++  }
+   const bool primaryWindow = targets_primary_window(&event);
+   const bool routed = primaryWindow && input::sdl::is_routed_event(event);
+   if (primaryWindow && !routed) {
 -- 
 2.56.0
 

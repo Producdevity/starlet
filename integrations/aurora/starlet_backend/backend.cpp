@@ -3,6 +3,7 @@
 #include "aurora_stream.hpp"
 #include "host_memory.hpp"
 #include "issues.hpp"
+#include "overlay.hpp"
 
 #include "aurora_host.hpp"
 
@@ -10,6 +11,7 @@
 
 #if STARLET_AURORA_UPSTREAM
 #include <GLES3/gl31.h>
+#include <SDL3/SDL_events.h>
 #include <SDL3/SDL_video.h>
 #endif
 
@@ -624,7 +626,7 @@ static void present_frame(Backend& b) {
     g.idle.wait(lock, [&] { return g.presents_pending < 2; });
     ++g.presents_pending;
   }
-  g.thread.post([&b, &g, left, bottom, width, height] {
+  g.thread.post([&b, &g, left, bottom, width, height, surface_width, surface_height] {
     try {
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
       glDisable(GL_SCISSOR_TEST);
@@ -632,6 +634,7 @@ static void present_frame(Backend& b) {
       glClearColor(0.f, 0.f, 0.f, 1.f);
       glClear(GL_COLOR_BUFFER_BIT);
       b.renderer->present_into(0, b.frame_width, b.efb.height, left, bottom, width, height);
+      overlay::frame(surface_width, surface_height);
       if (!SDL_GL_SwapWindow(g.window)) {
         static bool reported = false;
         if (!std::exchange(reported, true)) {
@@ -719,6 +722,7 @@ void shutdown() {
     // GL objects die on the thread that owns the context.
     g.thread.run([b] {
       b->renderer->adopt_thread();
+      overlay::shutdown();
       delete b;
     });
   }
@@ -743,6 +747,10 @@ void shutdown() {
   gfx::render_worker::synchronize();
 #endif
 }
+
+#if STARLET_AURORA_UPSTREAM
+bool overlay_event(const SDL_Event& event) { return overlay::event(event); }
+#endif
 
 void note_write(const void* pointer, std::size_t size) {
   if (!enabled() || !pointer || !size) {

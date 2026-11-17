@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+union SDL_Event;
+
 // Draws Aurora's GX command stream with Starlet's OpenGL ES renderer instead of Aurora's
 // own, when the environment sets AURORA_RENDERER=starlet.
 //
@@ -30,6 +32,9 @@ void set_gl_attributes();
 bool initialize();
 // Stops the GL work and releases the renderer and context; before the window is destroyed.
 void shutdown();
+// Upstream tree, main thread, from Aurora's SDL event loop: offers an event to the optional
+// performance overlay. True when the overlay used it, so the game must not see it.
+bool overlay_event(const union SDL_Event& event);
 // Any thread: the game stored, flushed or invalidated a range of its data cache, which it
 // does around CPU writes and DMA into memory the GPU reads.
 void note_write(const void* pointer, std::size_t size);

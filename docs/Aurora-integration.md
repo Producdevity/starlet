@@ -133,6 +133,20 @@ otherwise a game that waits for its audio driver never starts drawing. Dump fram
 `LD_PRELOAD` wrapper on `SDL_GL_SwapWindow` and `glReadPixels`. A stripped binary hides crashes:
 keep an unstripped build and use gdb.
 
+### Overlay (upstream trees)
+
+[sbc-port-overlay](https://github.com/Producdevity/sbc-port-overlay) adds a settings menu and an
+FPS, load and memory readout. Build with `-DSTARLET_OVERLAY_DIR=<sbc-port-overlay checkout>`;
+without it the hooks do nothing.
+
+- `STARLET_OVERLAY_NAME` names the port in the menu. Settings live in `conf/overlay.ini`, relative
+  to the working directory.
+- The bridge draws the overlay on its GL thread after the frame and before `SDL_GL_SwapWindow`.
+- Aurora's event loop offers each gamepad event to the overlay first. While its menu is open, the
+  game does not see the event.
+- Before `spo_frame` the bridge rebinds framebuffer 0, `GL_BACK` and texture unit 0, because the
+  overlay expects the window's default state and Starlet's last pass leaves other bindings.
+
 ## Performance
 
 Dusklight on an RG35XX H (H700, Mali-G31, muOS), 608x448, two lockstep runs each:

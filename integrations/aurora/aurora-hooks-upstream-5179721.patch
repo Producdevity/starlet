@@ -1,7 +1,7 @@
-From 7294a6951fe2a02bcbd80802c98e447df0f8f6d3 Mon Sep 17 00:00:00 2001
+From 1a10548156b0b94b487bf80c0922a368ad77781d Mon Sep 17 00:00:00 2001
 From: Producdevity <y.gherbi.dev@gmail.com>
 Date: Tue, 17 Nov 2026 14:52:49 +0100
-Subject: [PATCH] Add an AURORA_RENDERER=starlet path without Dawn
+Subject: [PATCH 1/2] Add an AURORA_RENDERER=starlet path without Dawn
 
 With AURORA_STARLET_DIR set, AURORA_RENDERER=starlet makes Aurora create
 its SDL3 window with SDL_WINDOW_OPENGL and OpenGL ES 3.1 attributes,
@@ -21,9 +21,10 @@ under Starlet. RmlUi and ImGui are not available under Starlet.
  lib/dolphin/gx/GXTexture.cpp                 | 10 +++-
  lib/dolphin/gx/GXTransform.cpp               |  7 ++-
  lib/gx/fifo.cpp                              | 11 +++-
+ lib/imgui.cpp                                |  4 ++
  lib/starlet_stub/starlet_backend/backend.hpp | 16 ++++++
  lib/window.cpp                               | 30 ++++++++++-
- 9 files changed, 163 insertions(+), 21 deletions(-)
+ 10 files changed, 167 insertions(+), 21 deletions(-)
  create mode 100644 lib/starlet_stub/starlet_backend/backend.hpp
 
 diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
@@ -345,6 +346,21 @@ index bcaba60..1261581 100644
      }
      AURORA_ASSERT(result.bytesProcessed > 0 && result.bytesProcessed <= target - processed,
                    "FIFO processor made invalid progress: processed {} of {} remaining bytes", result.bytesProcessed,
+diff --git a/lib/imgui.cpp b/lib/imgui.cpp
+index 77f65fd..7e569c0 100644
+--- a/lib/imgui.cpp
++++ b/lib/imgui.cpp
+@@ -185,6 +185,10 @@ void set_cursor_managed(bool managed) noexcept {
+ }
+ 
+ void process_event(const SDL_Event& event) noexcept {
++  // No context exists when another renderer owns presentation (AURORA_RENDERER=starlet).
++  if (ImGui::GetCurrentContext() == nullptr) {
++    return;
++  }
+   auto renderEvent = event;
+   if (g_useSdlRenderer) {
+     if (SDL_Renderer* renderer = window::get_sdl_renderer()) {
 diff --git a/lib/starlet_stub/starlet_backend/backend.hpp b/lib/starlet_stub/starlet_backend/backend.hpp
 new file mode 100644
 index 0000000..e7ffa84
@@ -422,20 +438,85 @@ index cf84de3..b509d22 100644
        "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, SDL_GetError());
    g_window = SDL_CreateWindowWithProperties(props);
    if (g_window == nullptr) {
-diff --git a/lib/imgui.cpp b/lib/imgui.cpp
---- a/lib/imgui.cpp
-+++ b/lib/imgui.cpp
-@@ -185,6 +185,10 @@ void set_cursor_managed(bool managed) noexcept {
+-- 
+2.56.0
+
+
+From 11699416e485a7dcff16621292239f68ede2b0ab Mon Sep 17 00:00:00 2001
+From: Producdevity <y.gherbi.dev@gmail.com>
+Date: Tue, 17 Nov 2026 21:24:53 +0100
+Subject: [PATCH 2/2] Offer SDL events to the Starlet overlay and build it when
+ STARLET_OVERLAY_DIR is set
+
+---
+ cmake/aurora_gx.cmake                        | 12 +++++++++++-
+ lib/starlet_stub/starlet_backend/backend.hpp |  3 +++
+ lib/window.cpp                               |  3 +++
+ 3 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
+index cec887b..5bd3ee6 100644
+--- a/cmake/aurora_gx.cmake
++++ b/cmake/aurora_gx.cmake
+@@ -66,7 +66,7 @@ if (AURORA_STARLET_DIR)
+     set(STARLET_GLES ON)
+     add_subdirectory("${AURORA_STARLET_DIR}" "${CMAKE_BINARY_DIR}/starlet" EXCLUDE_FROM_ALL)
+     set(_starlet_bridge_sources)
+-    foreach (_name aurora_stream backend host_memory issues texture_convert)
++    foreach (_name aurora_stream backend host_memory issues overlay texture_convert)
+         list(APPEND _starlet_bridge_sources "${AURORA_STARLET_BRIDGE_DIR}/starlet_backend/${_name}.cpp")
+     endforeach ()
+     target_sources(aurora_gx PRIVATE ${_starlet_bridge_sources})
+@@ -74,6 +74,16 @@ if (AURORA_STARLET_DIR)
+     set_source_files_properties(${_starlet_bridge_sources} PROPERTIES
+             INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/lib")
+     target_link_libraries(aurora_gx PRIVATE starlet::gx_gles)
++    # Optional performance overlay (sbc-port-overlay): a settings menu and FPS, load and memory readout.
++    set(STARLET_OVERLAY_DIR "" CACHE PATH "sbc-port-overlay source tree")
++    if (STARLET_OVERLAY_DIR)
++        set(SPO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
++        enable_language(C)
++        add_subdirectory("${STARLET_OVERLAY_DIR}" "${CMAKE_BINARY_DIR}/spo" EXCLUDE_FROM_ALL)
++        target_link_libraries(aurora_gx PRIVATE spo::static)
++        set_property(SOURCE "${AURORA_STARLET_BRIDGE_DIR}/starlet_backend/overlay.cpp" APPEND PROPERTY
++                COMPILE_DEFINITIONS STARLET_WITH_OVERLAY=1)
++    endif ()
+ else ()
+     set(AURORA_STARLET_BRIDGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/starlet_stub")
+ endif ()
+diff --git a/lib/starlet_stub/starlet_backend/backend.hpp b/lib/starlet_stub/starlet_backend/backend.hpp
+index e7ffa84..af0ff30 100644
+--- a/lib/starlet_stub/starlet_backend/backend.hpp
++++ b/lib/starlet_stub/starlet_backend/backend.hpp
+@@ -3,6 +3,8 @@
+ #include <cstddef>
+ #include <cstdint>
+ 
++union SDL_Event;
++
+ // Stand-in for the Starlet bridge when AURORA_STARLET_DIR is not set: every hook is inert.
+ namespace aurora::starlet_backend {
+ constexpr bool enabled() noexcept { return false; }
+@@ -13,4 +15,5 @@ inline bool initialize() { return false; }
+ inline void shutdown() {}
+ inline const void* texture_data(const void* data, std::size_t) { return data; }
+ inline void note_display_list(const void*, std::size_t) {}
++inline bool overlay_event(const union SDL_Event&) { return false; }
+ } // namespace aurora::starlet_backend
+diff --git a/lib/window.cpp b/lib/window.cpp
+index b509d22..6f56926 100644
+--- a/lib/window.cpp
++++ b/lib/window.cpp
+@@ -183,6 +183,9 @@ void sync_paused() {
  }
  
- void process_event(const SDL_Event& event) noexcept {
-+  // No context exists when another renderer owns presentation (AURORA_RENDERER=starlet).
-+  if (ImGui::GetCurrentContext() == nullptr) {
+ void process_event(SDL_Event& event) {
++  if (starlet_backend::overlay_event(event)) {
 +    return;
 +  }
-   auto renderEvent = event;
-   if (g_useSdlRenderer) {
-     if (SDL_Renderer* renderer = window::get_sdl_renderer()) {
+   const bool primaryWindow = targets_primary_window(&event);
+   const bool routed = primaryWindow && input::sdl::is_routed_event(event);
+   if (primaryWindow && !routed) {
 -- 
 2.56.0
 
