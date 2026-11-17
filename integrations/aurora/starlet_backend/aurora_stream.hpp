@@ -3,6 +3,7 @@
 #include "host_memory.hpp"
 
 #include "starlet/gx/decoder.hpp"
+#include "starlet/gx/efb_clear.hpp"
 #include "starlet/gx/texture_copy.hpp"
 
 #include <array>
@@ -31,11 +32,13 @@ public:
   // cleared target, and the EFB is left as it was.
   virtual void begin_offscreen() = 0;
   virtual void end_offscreen() = 0;
+  // GXClear: clears the EFB (or a rectangle of it) in order with the draws.
+  virtual void clear(const starlet::gx::EfbClear&) = 0;
 };
 
 struct StreamStats {
   std::uint64_t aurora_commands = 0, copies = 0, expanded_draws = 0, decoder_feeds = 0, drains = 0;
-  std::uint64_t ignored = 0, unmapped = 0, repaired = 0, failed_copies = 0, resized_copies = 0;
+  std::uint64_t ignored = 0, unmapped = 0, repaired = 0, failed_copies = 0, resized_copies = 0, clears = 0;
 };
 
 // Translates Aurora's GX command stream into the hardware stream Starlet decodes.
@@ -70,6 +73,8 @@ private:
   void set_array(unsigned slot_index, const void* pointer, std::uint32_t size, bool host_order);
   void load_texture(const std::uint8_t* payload);
   void load_tlut(const std::uint8_t* payload);
+  void set_texture_image_pointer(const std::uint8_t* payload);
+  void clear_efb(const std::uint8_t* payload);
   void set_copy_destination_format(std::uint32_t width, std::uint32_t height, std::uint32_t format, bool mipmap);
   void copy_texture(std::uint32_t command);
   bool draw_sized(const std::uint8_t* payload, std::size_t available, std::size_t& consumed);

@@ -1,72 +1,99 @@
 # Aurora integration
 
-Starlet can replace the renderer of an Aurora GLES port. Aurora keeps the window, input, UI
-and audio. Starlet decodes the GX FIFO and draws it with OpenGL ES 3.1.
-`AURORA_RENDERER=starlet` selects it at run time.
+Starlet can replace the renderer of an Aurora port. Aurora keeps the window, input and audio.
+Starlet decodes the GX FIFO and draws it with OpenGL ES 3.1. `AURORA_RENDERER=starlet` selects it
+at run time.
 
 Code: [`integrations/aurora/`](https://github.com/Producdevity/starlet/tree/master/integrations/aurora).
-It has the bridge (`starlet_backend/`) and the Aurora changes (`aurora-hooks.patch`).
+It has the bridge (`starlet_backend/`) and one Aurora patch per tree.
+
+## Aurora trees
+
+| Aurora | Patch | Overlays under Starlet |
+|---|---|---|
+| encounter/aurora `5794daa` (upstream, WebGPU) | `aurora-hooks-upstream.patch` | none |
+| encounter/aurora `5179721` (upstream, older) | `aurora-hooks-upstream-5179721.patch` | none |
+| bmdhacks/aurora `3fbacee` (OpenGL ES fork, Dusklight) | `aurora-hooks-gles-fork.patch` | RmlUi and ImGui keep working |
+
+Other upstream revisions need the patch applied by hand; the changes are listed below.
+
+The bridge detects the tree from `GXAurora.h`. `aurora_commands.hpp` has every command id and
+payload size and `static_assert`s the ids against the header, so a renumbered command fails the
+build. A stream command the bridge does not know stops decoding for the run.
 
 ## Requirements
 
 | | |
 |---|---|
-| Aurora | bmdhacks/aurora `3fbacee` (GLES backend). Upstream encounter/aurora renders through WebGPU and is not supported. |
-| Starlet | `85f9836` or later, with `integrations/aurora/` |
-| GL | OpenGL ES 3.1 context current on Aurora's render worker |
+| Starlet | the revision that has `integrations/aurora/` for your tree |
+| GL | OpenGL ES 3.1 |
 | Frame | EFB at most 640x528, even height |
 | Build | CMake 3.21, C++17, `GLES3/gl31.h` and `libGLESv2` in the sysroot |
 
-## Performance
-
-Dusklight on an RG35XX H (H700, Mali-G31, muOS), 608x448, two lockstep runs each:
-
-| | Aurora GLES | Starlet |
-|---|---|---|
-| Attract cutscene, ms/frame | 42.2 | 38.2 |
-| Heaviest cutscene section, ms/frame | 53-58 | 38-41 |
-| 95 s free run, mean fps | 23.7 | 26.3 |
-| 95 s free run, worst 5 s, fps | 17.2 | 21.3 |
-| Title scene, ms/frame | 44.5 | 46 |
-
-The title scene is bound by the game's shadow code on the CPU. A 13.7 min play session
-averaged 29.8 fps; the game caps at 30. Other GPUs and other Aurora games are untested.
-
-## Build
+## Build: upstream Aurora
 
 ```sh
 git submodule add https://github.com/Producdevity/starlet extern/starlet
 git -C extern/starlet checkout <commit>
 git submodule update --init --recursive extern/starlet
-cp -r extern/starlet/integrations/aurora/starlet_backend extern/aurora/lib/starlet_backend
-git -C extern/aurora apply "$PWD/extern/starlet/integrations/aurora/aurora-hooks.patch"
+git -C extern/aurora am "$PWD/extern/starlet/integrations/aurora/aurora-hooks-upstream.patch"
 cmake -S . -B build -DAURORA_STARLET_DIR="$PWD/extern/starlet" -DSTARLET_HOST=OFF
 ```
 
-- `aurora_gx` then requires Starlet and links `starlet::gx_gles`.
+- Without `AURORA_STARLET_DIR` the hooks compile to inert stubs and Aurora builds as before.
 - Starlet's `third_party/zstd` submodule must be checked out.
 - The bridge calls Starlet's renderer API, so update both together.
+- Dawn stays linked but is never initialised. A target with a libstdc++ older than the one Dawn's
+  prebuilt library uses needs Dawn built from source.
+- Shared game modules: do not link the executable with `-Wl,--exclude-libs,ALL`. It hides Aurora's
+  symbols from the modules, and each module then carries its own copy of Aurora.
 
-## Aurora hooks
+### Aurora hooks (upstream)
 
-`aurora-hooks.patch` contains these changes. All of them are gated by
-`starlet_backend::enabled()`. On another Aurora revision, apply them by hand.
+All of them are gated by `starlet_backend::enabled()`.
 
 | Location | Change |
 |---|---|
-| `cmake/aurora_gx.cmake` | Adds Starlet, the bridge sources and `starlet::gx_gles` |
-| `lib/gx/fifo.cpp`, `drain()` | `starlet_backend::process()` replaces Aurora's command processor |
-| `lib/aurora.cpp`, `end_frame()` | `starlet_backend::end_frame()` after the last drain |
-| Render worker, end-of-frame callback | `starlet_backend::present(fbo, w, h)`; `webgpu::present_frame` runs only if it returns false. RmlUi and ImGui draw on top. |
-| `aurora::shutdown()` | `starlet_backend::shutdown()` before `gfx::shutdown()` |
+| `cmake/aurora_gx.cmake` | Adds the bridge sources and `starlet::gx_gles`, or the stubs in `lib/starlet_stub` |
+| `lib/window.cpp` | Window with `SDL_WINDOW_OPENGL` and ES 3.1 attributes; no WebGPU surface |
+| `lib/aurora.cpp`, init | Skips Dawn, `gfx::initialize`, the render worker, ImGui and RmlUi |
+| `lib/gx/fifo.cpp`, `drain()` | `starlet_backend::process()` replaces Aurora's command processor; FIFO in drain mode |
+| `lib/aurora.cpp`, `end_frame()` | Drain, `starlet_backend::end_frame()`, present, return |
+| `lib/aurora.cpp`, shutdown | `starlet_backend::shutdown()` before the rest |
+| `lib/imgui.cpp`, `process_event` | Returns when no ImGui context exists (`5179721`) |
 | `GXTexture.cpp`, `emit_loaded_texobj_metadata` | `texture_data()` snapshots texture pages the game wrote this frame |
 | `GXDispList.cpp`, `GXCallDisplayList` | `note_display_list()` lets Starlet skip hashing unchanged lists |
 | `GXFrameBuffer.cpp`, `GXSetCopyFilter` | Emits BP `0x01`-`0x04` and `0x53`/`0x54` like the SDK. Aurora's version is empty, and zero filter coefficients black out copies. |
-| `GXTransform.cpp`, `command_processor.cpp` | Viewport origin bias 342 (hardware and SDK) instead of 340 |
+| `GXTransform.cpp` | Viewport origin bias 342 (hardware and SDK) instead of 340 |
+
+The SDL window belongs to Aurora. The bridge creates the GL context on the main thread, then a
+bridge thread owns it, runs the renderer and swaps. `AURORA_STARLET_VSYNC=1` sets swap interval 1;
+the default is 0.
+
+Aurora's `GXSetScissorBoxOffset` writes BP `0x59` with the wrong sign: field 853 where the console
+writes 171. The bridge rewrites it. Without that, every draw falls outside the scissor and only the
+frame-start clear colour reaches the screen.
+
+Under Starlet the port has no launcher, ESC menu or overlays, and no texture replacement. A port that
+requires RmlUi or ImGui at startup needs a change to start without them; pass the disc image on the
+command line.
+
+## Build: GLES fork
+
+```sh
+cp -r extern/starlet/integrations/aurora/starlet_backend extern/aurora/lib/starlet_backend
+git -C extern/aurora apply "$PWD/extern/starlet/integrations/aurora/aurora-hooks-gles-fork.patch"
+cmake -S . -B build -DAURORA_STARLET_DIR="$PWD/extern/starlet" -DSTARLET_HOST=OFF
+```
+
+`aurora_gx` then requires Starlet and links `starlet::gx_gles`. The patch hooks `fifo.cpp`,
+`end_frame()`, the render worker's end-of-frame callback (`present(fbo, w, h)`), shutdown, and the
+texture, display list, copy filter and viewport hooks above. Aurora's render worker owns the GL
+context.
 
 ## Game changes
 
-These are not in the patch.
+These are not in the patches.
 
 Report CPU writes to memory the GPU reads. Without them, textures and vertex arrays the game
 rewrites in place render stale:
@@ -78,8 +105,9 @@ void DCStoreRange(void* addr, u32 nBytes) { aurora_starlet_note_write(addr, nByt
 // Same for DCFlushRange, DCFlushRangeNoSync, DCInvalidateRange, DCStoreRangeNoSync.
 ```
 
-Skip `aurora::gx::dl::optimize` when `AURORA_RENDERER=starlet`, because Starlet decodes the
-original display lists. Dusklight does this in the `J3DShapeDraw` constructor.
+If the game calls `aurora::gx::dl::optimize`, skip it when `AURORA_RENDERER=starlet`, because
+Starlet decodes the original display lists. Dusklight does this in the `J3DShapeDraw` constructor.
+A code search found no call in Animal Crossing or Mario Party 4.
 
 ## Running
 
@@ -94,6 +122,42 @@ AURORA_RENDERER=starlet ./game
   `rejected`, `failed_copies` and `unmapped` are 0 in a clean run.
 - Shader cache: `<AuroraConfig::cachePath>/starlet/`. Missing programs build in the
   background, and their draws are skipped until they are ready. Keep the cache between runs.
+- Upstream Aurora's Dawn path has no surface on KMS/DRM or the muOS SDL shim, so ports built on it
+  have no non-Starlet renderer on those handhelds.
+
+### Testing on a host
+
+A Linux container with Mesa's llvmpipe (GLES 3.2), SDL2, Xvfb and gdb runs an aarch64 build. Use a
+640x480 X window; a larger window changes the frame size. Give the container a null ALSA device,
+otherwise a game that waits for its audio driver never starts drawing. Dump frames with an
+`LD_PRELOAD` wrapper on `SDL_GL_SwapWindow` and `glReadPixels`. A stripped binary hides crashes:
+keep an unstripped build and use gdb.
+
+## Performance
+
+Dusklight on an RG35XX H (H700, Mali-G31, muOS), 608x448, two lockstep runs each:
+
+| | Aurora GLES | Starlet |
+|---|---|---|
+| Attract cutscene, ms/frame | 42.2 | 38.2 |
+| Heaviest cutscene section, ms/frame | 53-58 | 38-41 |
+| 95 s free run, mean fps | 23.7 | 26.3 |
+| 95 s free run, worst 5 s, fps | 17.2 | 21.3 |
+| Title scene, ms/frame | 44.5 | 46 |
+
+The title scene is bound by the game's shadow code on the CPU. A 13.7 min play session
+averaged 29.8 fps; the game caps at 30.
+
+Upstream Aurora ports on an RG35XX SP (H700, Mali-G31, muOS 2601.0), 640x480, Starlet only:
+
+| Game | Scene | fps |
+|---|---|---|
+| Animal Crossing (Nookery) | title and K.K. intro, cold shader cache | 60 (min 58.2); `gl_ms` about 16 |
+| Mario Party 4 (partyboard) | logo scene | 40-41 |
+| Mario Party 4 (partyboard) | file select | 60 |
+| Mario Party 4 (partyboard) | title after returning, about 1300 draws per frame | 31.6; `gl_ms` about 19 |
+
+Other GPUs and other Aurora games are untested.
 
 ## Stream coverage
 
@@ -101,13 +165,15 @@ AURORA_RENDERER=starlet ./game
 |---|---|
 | BP, CP, XF, draws, inlined display lists | Decoded directly |
 | `LOAD_ARRAYBASE` | Mapped to a 32-bit address; honours the little-endian flag |
-| `LOAD_TEXOBJ`, `LOAD_TLUT` | Mapped; textures over 1024 texels supported |
-| `LOAD_COPY_SRC`, `LOAD_COPY_DST`, `LOAD_COPY_DEST` | EFB copy to a GPU texture keyed by the destination pointer |
+| `LOAD_TEXOBJ`, `LOAD_TLUT`, `SET_TEX_IMG_PTR` | Mapped; textures over 1024 texels supported |
+| `LOAD_COPY_SRC`, `LOAD_COPY_DST`, `LOAD_COPY_DEST`, `LOAD_DISP_COPY_SRC` | EFB copy to a GPU texture keyed by the destination pointer; BP `0x52` with bit 14 is a display copy |
+| `CLEAR` | Planned as a GX clear of the given rectangle |
 | `BEGIN_OFFSCREEN`, `END_OFFSCREEN` | Offscreen pass |
 | `DRAW_SIZED`, `DRAW_INDEXED` | Expanded to hardware vertex data |
-| `DEBUG_GROUP_*`, `DESTROY_*` | Consumed |
+| `SET_DRAWS_BLOCKING`, `DEBUG_GROUP_*`, `DESTROY_*` | Consumed |
 | `LOAD_VIEWPORT_RENDER`, `LOAD_SCISSOR_RENDER`, `LOAD_PROJECTION_FULL` | Ignored; the hardware registers drive the draw |
-| `REQUEST_DEPTH_SNAPSHOT` | Ignored and logged; depth readback effects see stale values |
+| `REQUEST_DEPTH_SNAPSHOT` (fork) | Ignored and logged; depth readback effects see stale values |
+| Readback commands | Not supported. Logged; the game sees no data |
 | `GX2_SET_POLYGON_OFFSET` | Ignored and logged; coplanar decals can z-fight |
 | Display list call with a host pointer | Ignored |
 | Anything else | Logged once, then Starlet stops decoding for the run |
@@ -137,6 +203,7 @@ up. Each readback costs about 1 ms of GL thread time on Mali.
   - rejected draws;
   - unmapped textures, TLUTs or vertex arrays;
   - refused copies;
+  - unsupported readbacks;
   - ignored depth snapshots and polygon offsets.
 
   The first line of each kind includes the BP, CP and XF state. Limits: at most 40 lines
@@ -144,7 +211,9 @@ up. Each readback costs about 1 ms of GL thread time on Mali.
 - `AURORA_STARLET_TRACE=1` adds detail for rejected draws and texture loads.
 - `STARLET_MERGE=0` disables draw merging.
 - Draws that Starlet accepts but renders wrong are not logged. Compare them with
-  `AURORA_RENDERER` unset.
+  `AURORA_RENDERER` unset where a second renderer exists; a flat or single-colour frame with
+  counters at 0 means the draws fall outside a scissor or viewport register, so dump the BP state
+  at draw time.
 
 Report issues at https://github.com/Producdevity/starlet/issues. Include:
 
@@ -152,7 +221,7 @@ Report issues at https://github.com/Producdevity/starlet/issues. Include:
 - the Starlet, Aurora and game revisions;
 - the device, driver, and GL strings;
 - a timestamped screenshot;
-- the same scene without Starlet.
+- the same scene without Starlet, if the tree has another renderer.
 
 ## License
 

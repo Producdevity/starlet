@@ -4,16 +4,14 @@
 #include "host_memory.hpp"
 #include "issues.hpp"
 
-#include "../dolphin/os/internal.hpp"
-#include "../gfx/render_worker.hpp"
-#include "../gl/gl_core.hpp"
-#include "../gl/state.hpp"
-#include "../internal.hpp"
-#include "../gx/gx.hpp"
-#include "../gx/fifo.hpp"
-#include "../webgpu/gpu.hpp"
+#include "aurora_host.hpp"
 
 #include <dolphin/gx/GXCommandList.h>
+
+#if STARLET_AURORA_UPSTREAM
+#include <GLES3/gl31.h>
+#include <SDL3/SDL_video.h>
+#endif
 
 #include "starlet/gx/efb_clear.hpp"
 #include "starlet/gx/gles/renderer.hpp"
@@ -21,22 +19,29 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <filesystem>
+#include <future>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
 namespace aurora::starlet_backend {
 namespace {
 Module Log("aurora::starlet");
+#if !STARLET_AURORA_UPSTREAM
 // Aurora's non-stencil UI passes can leave an invalid cached stencil enum pending.
 // Check at ownership boundaries so Starlet still diagnoses only its own GL calls.
 void clear_aurora_errors() {
@@ -49,8 +54,9 @@ void clear_aurora_errors() {
     }
   }
 }
+#endif
 
-// Microseconds the render worker spent in Starlet's GL tasks.
+// Microseconds the GL thread spent in Starlet's GL tasks.
 std::atomic<std::uint64_t> gl_task_us{0};
 
 // Counts failures by message, so a frame of rejected draws logs once per kind.
@@ -168,6 +174,14 @@ public:
   void end_offscreen() override {
     try {
       renderer_.end_offscreen();
+    } catch (const std::exception& e) {
+      failures_.note(e.what());
+    }
+  }
+
+  void clear(const starlet::gx::EfbClear& plan) override {
+    try {
+      renderer_.clear_efb(plan);
     } catch (const std::exception& e) {
       failures_.note(e.what());
     }
@@ -345,6 +359,117 @@ struct Backend {
 std::atomic<Backend*> instance{nullptr};
 std::once_flag created;
 
+#if STARLET_AURORA_UPSTREAM
+// The thread that owns the GL context from initialize() on. SDL creates the context on the
+// main thread; the renderer, its submission work and the swap all run here, so Aurora's main
+// thread never issues a GL call.
+class GlThread {
+public:
+  bool start(SDL_Window* window, SDL_GLContext context) {
+    std::promise<bool> ready;
+    auto result = ready.get_future();
+    thread_ = std::thread([this, window, context, &ready] {
+      const bool bound = SDL_GL_MakeCurrent(window, context);
+      if (!bound) {
+        Log.error("Starlet could not bind the OpenGL ES context to its thread: {}", SDL_GetError());
+      }
+      ready.set_value(bound);
+      if (!bound) {
+        return;
+      }
+      loop();
+      SDL_GL_MakeCurrent(window, nullptr);
+    });
+    if (!result.get()) {
+      thread_.join();
+      return false;
+    }
+    return true;
+  }
+
+  // Runs task on the GL thread after the tasks posted before it.
+  void post(std::function<void()> task) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      tasks_.push_back(std::move(task));
+    }
+    ready_.notify_one();
+  }
+
+  // post, and wait for it.
+  void run(std::function<void()> task) {
+    std::promise<void> done;
+    post([&] {
+      task();
+      done.set_value();
+    });
+    done.get_future().get();
+  }
+
+  void stop() {
+    if (!thread_.joinable()) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    ready_.notify_one();
+    thread_.join();
+  }
+
+private:
+  void loop() {
+    for (;;) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
+        if (tasks_.empty()) {
+          return;
+        }
+        task = std::move(tasks_.front());
+        tasks_.pop_front();
+      }
+      try {
+        task();
+      } catch (const std::exception& e) {
+        Log.error("Starlet GL task failed: {}", e.what());
+      }
+    }
+  }
+
+  std::thread thread_;
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::deque<std::function<void()>> tasks_;
+  bool stopping_ = false;
+};
+
+struct GlContext {
+  SDL_Window* window = nullptr;
+  SDL_GLContext context = nullptr;
+  GlThread thread;
+  std::mutex mutex;
+  std::condition_variable idle;
+  unsigned presents_pending = 0; // Frames posted to the GL thread and not yet swapped.
+};
+
+GlContext& gl_context() {
+  static GlContext context;
+  return context;
+}
+
+void post_on_gl(std::function<void()> task) { gl_context().thread.post(std::move(task)); }
+void run_on_gl(std::function<void()> task) { gl_context().thread.run(std::move(task)); }
+#else
+void post_on_gl(std::function<void()> task) { gfx::render_worker::enqueue_work(std::move(task)); }
+void run_on_gl(std::function<void()> task) {
+  gfx::render_worker::enqueue_work(std::move(task));
+  gfx::render_worker::synchronize();
+}
+#endif
+
 Backend* backend() {
   std::call_once(created, [] {
     const auto size = gx::logical_fb_size();
@@ -363,12 +488,14 @@ Backend* backend() {
     limits.direct.program_lists = {limits.direct.program_cache + "/programs.list"};
     std::unique_ptr<starlet::gx::GlesRenderer> renderer;
     std::string error;
-    gfx::render_worker::enqueue_work([&] {
+    run_on_gl([&] {
       try {
         renderer = std::make_unique<starlet::gx::GlesRenderer>(limits);
         renderer->start_submission_on([](std::function<void()> task) {
-          gfx::render_worker::enqueue_work([task = std::move(task)] {
+          post_on_gl([task = std::move(task)] {
+#if !STARLET_AURORA_UPSTREAM
             clear_aurora_errors();
+#endif
             const auto start = std::chrono::steady_clock::now();
             task();
             gl_task_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
@@ -379,14 +506,15 @@ Backend* backend() {
         renderer.reset();
       }
     });
-    gfx::render_worker::synchronize();
     if (!renderer) {
       Log.error("Starlet renderer failed to start: {}", error);
       return;
     }
     renderer->adopt_thread();
     instance.store(new Backend(layout, static_cast<int>(size.x), std::move(renderer)));
-    Log.info("Starlet draws the GX stream: frame {}x{}", size.x, layout.height);
+    Log.info("Starlet draws the GX stream: frame {}x{}, game memory {} at {} bytes", size.x, layout.height,
+             static_cast<const void*>(MEM1Start),
+             static_cast<std::size_t>(static_cast<std::uint8_t*>(MEM1End) - static_cast<std::uint8_t*>(MEM1Start)));
   });
   return instance.load();
 }
@@ -419,6 +547,109 @@ void process(const std::uint8_t* data, std::size_t size) {
   }
 }
 
+#if STARLET_AURORA_UPSTREAM
+void set_gl_attributes() {
+  // SDL needs these before the window exists. The EFB is the only depth and colour Starlet
+  // renders; the window's framebuffer only receives the presented frame.
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+  SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+  SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+  SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+  SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+  SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+}
+
+bool initialize() {
+  auto& g = gl_context();
+  g.window = window::get_sdl_window();
+  if (!g.window) {
+    Log.error("Starlet needs an SDL window to draw into");
+    return false;
+  }
+  g.context = SDL_GL_CreateContext(g.window);
+  if (!g.context) {
+    Log.error("Starlet could not create an OpenGL ES 3.1 context: {}", SDL_GetError());
+    return false;
+  }
+  // The game paces its own frames; the swap should not wait for the display unless asked to.
+  int interval = 0;
+  if (const char* value = std::getenv("AURORA_STARLET_VSYNC"); value && *value) {
+    interval = std::atoi(value);
+  }
+  if (!SDL_GL_SetSwapInterval(interval)) {
+    Log.warn("Starlet could not set swap interval {}: {}", interval, SDL_GetError());
+  }
+  // One thread owns the context at a time: the GL thread takes it from here.
+  if (!SDL_GL_MakeCurrent(g.window, nullptr)) {
+    Log.warn("Starlet could not release the OpenGL ES context: {}", SDL_GetError());
+  }
+  if (!g.thread.start(g.window, g.context)) {
+    SDL_GL_DestroyContext(g.context);
+    g.context = nullptr;
+    return false;
+  }
+  g.thread.run([] {
+    const auto text = [](GLenum name) {
+      const auto* value = glGetString(name);
+      return value ? reinterpret_cast<const char*>(value) : "?";
+    };
+    Log.info("OpenGL ES: {} | {} | {}", text(GL_VENDOR), text(GL_RENDERER), text(GL_VERSION));
+  });
+  return true;
+}
+
+// Main thread: hands the finished frame to the GL thread, which draws it into the window's
+// framebuffer at 4:3 and swaps. At most two frames wait there, so the game cannot run ahead.
+static void present_frame(Backend& b) {
+  auto& g = gl_context();
+  if (!b.drawn) {
+    return;
+  }
+  int surface_width = 0, surface_height = 0;
+  if (!SDL_GetWindowSizeInPixels(g.window, &surface_width, &surface_height) || surface_width <= 0 || surface_height <= 0) {
+    return;
+  }
+  const double content_width = b.frame_width, content_height = b.efb.height;
+  int width = surface_width;
+  int height = std::min(surface_height, std::max(1, static_cast<int>(std::lround(width * content_height / content_width))));
+  if (height == surface_height) {
+    width = std::min(surface_width, std::max(1, static_cast<int>(std::lround(height * content_width / content_height))));
+  }
+  const int left = (surface_width - width) / 2, bottom = (surface_height - height) / 2;
+  {
+    std::unique_lock<std::mutex> lock(g.mutex);
+    g.idle.wait(lock, [&] { return g.presents_pending < 2; });
+    ++g.presents_pending;
+  }
+  g.thread.post([&b, &g, left, bottom, width, height] {
+    try {
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      glDisable(GL_SCISSOR_TEST);
+      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+      glClearColor(0.f, 0.f, 0.f, 1.f);
+      glClear(GL_COLOR_BUFFER_BIT);
+      b.renderer->present_into(0, b.frame_width, b.efb.height, left, bottom, width, height);
+      if (!SDL_GL_SwapWindow(g.window)) {
+        static bool reported = false;
+        if (!std::exchange(reported, true)) {
+          Log.error("Starlet could not swap the window: {}", SDL_GetError());
+        }
+      }
+    } catch (const std::exception& e) {
+      b.failures.note(e.what());
+    }
+    {
+      std::lock_guard<std::mutex> lock(g.mutex);
+      --g.presents_pending;
+    }
+    g.idle.notify_all();
+  });
+}
+#endif
+
 void end_frame() {
   auto* b = instance.load();
   if (!b) {
@@ -430,12 +661,16 @@ void end_frame() {
   } catch (const std::exception& e) {
     b->failures.note(e.what());
   }
+#if STARLET_AURORA_UPSTREAM
+  present_frame(*b);
+#else
   // Aurora's own passes this frame (UI, overlays) run after Starlet's work on the same
   // context and must not trust their state shadow.
   gfx::render_worker::enqueue_work([] {
     gl::reset_state_cache();
     gl::invalidate_texture_bindings();
   });
+#endif
   texture_writes().end_frame();
   b->frame_started = false;
   ++b->frames;
@@ -443,6 +678,7 @@ void end_frame() {
   b->report();
 }
 
+#if !STARLET_AURORA_UPSTREAM
 bool present(std::uint32_t target, std::uint32_t surface_width, std::uint32_t surface_height) {
   auto* b = instance.load();
   if (!b || !b->drawn) {
@@ -469,9 +705,29 @@ bool present(std::uint32_t target, std::uint32_t surface_width, std::uint32_t su
   gl::invalidate_texture_bindings();
   return true;
 }
+#endif
 
 void shutdown() {
   auto* b = instance.exchange(nullptr);
+#if STARLET_AURORA_UPSTREAM
+  auto& g = gl_context();
+  if (b) {
+    try {
+      b->renderer->stop_submission();
+    } catch (const std::exception&) {
+    }
+    // GL objects die on the thread that owns the context.
+    g.thread.run([b] {
+      b->renderer->adopt_thread();
+      delete b;
+    });
+  }
+  g.thread.stop();
+  if (g.context) {
+    SDL_GL_DestroyContext(g.context);
+    g.context = nullptr;
+  }
+#else
   if (!b) {
     return;
   }
@@ -485,6 +741,7 @@ void shutdown() {
     delete b;
   });
   gfx::render_worker::synchronize();
+#endif
 }
 
 void note_write(const void* pointer, std::size_t size) {

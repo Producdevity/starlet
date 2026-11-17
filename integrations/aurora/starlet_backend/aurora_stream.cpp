@@ -1,4 +1,5 @@
 #include "aurora_stream.hpp"
+#include "aurora_commands.hpp"
 #include "issues.hpp"
 #include "texture_convert.hpp"
 
@@ -157,6 +158,9 @@ void AuroraStream::configure(starlet::gx::Limits& limits) {
     limits.host_opcodes.set(op);
   }
   limits.filtered_bp.set(0x52);
+  if (commands::upstream) {
+    limits.filtered_bp.set(0x59);
+  }
   // TLUT loads replay with the palette's address when LOAD_TLUT arrives. Image and TLUT
   // addresses come from LOAD_TEXOBJ, as in Aurora's own renderer; J3D's display lists still
   // write console TMEM offsets and truncated pointers there.
@@ -178,8 +182,9 @@ void AuroraStream::feed(const std::uint8_t* data, std::size_t size) {
   }
   if (!initialized_) {
     initialized_ = true;
-    // GXInit's GXSetScissorBoxOffset(0, 0): Aurora leaves it out and never writes BP 0x59, whose
-    // offset of 342 (stored halved) matches the one GXSetScissor and GXSetViewport add.
+    // The GLES fork has no GXSetScissorBoxOffset, so nothing writes BP 0x59 there; the console's
+    // field for offset 0 is 171 (342 halved), matching what GXSetScissor and GXSetViewport add.
+    // Upstream trees write it themselves (see filter_bp) and replace this value.
     write_bp(0x59000000u | 171u << 10 | 171u);
   }
   ++stats_.drains;
@@ -222,8 +227,24 @@ bool AuroraStream::host_command(starlet::gx::ByteView input, std::size_t& consum
 }
 
 bool AuroraStream::filter_bp(std::uint8_t address, std::uint32_t& value) {
+  if (address == 0x59) {
+    // Upstream Aurora's GXSetScissorBoxOffset (GXInit and the game's own calls) encodes each half
+    // as (offset - 342) >> 1 in ten bits; the console's field, which Starlet decodes, is
+    // (offset + 342) >> 1. Rebuild the console field from the signed offset the write carries.
+    // The GLES fork has no GXSetScissorBoxOffset and keeps the initial write in feed().
+    const auto console_field = [](std::uint32_t field) {
+      const int half = static_cast<int>(field & 0x3ff);
+      return static_cast<std::uint32_t>((half >= 512 ? half - 1024 : half) + 342) & 0x3ff;
+    };
+    value = (value & ~0xfffffu) | console_field(value) | console_field(value >> 10) << 10;
+    return true;
+  }
   if (address == 0x52) {
-    copy_texture(value);
+    // Bit 14 selects a display copy, which GXCopyDisp writes with no destination of its own: the
+    // frame is presented from the EFB, so only texture copies are planned.
+    if (!(value & 0x4000)) {
+      copy_texture(value);
+    }
     return false;
   }
   if ((value >> 17) == 0x7f) {
@@ -244,23 +265,19 @@ bool AuroraStream::aurora_command(std::size_t& pos) {
   const std::uint16_t sub = be16(command + 1);
   const std::uint8_t* payload = command + 3;
   const std::size_t available = size_ - pos - 3;
-  // Fixed-size payloads are checked before they are read.
-  auto fits = [&](std::size_t bytes) {
-    if (bytes <= available) {
-      return true;
-    }
+  auto truncated = [&] {
     fail("truncated Aurora command " + std::to_string(sub));
     return false;
   };
   std::size_t length = 0;
-  if (sub >= GX_AURORA_LOAD_ARRAYBASE && sub <= (GX_AURORA_LOAD_ARRAYBASE | 0x0f)) {
-    if (!fits(length = 13)) {
-      return false;
+  if (sub >= commands::arraybase && sub <= (commands::arraybase | 0x0f)) {
+    if (available < (length = commands::arraybase_payload)) {
+      return truncated();
     }
     const auto size = be32(payload + 8);
     const void* pointer = host_pointer(be64(payload));
     const bool host_order = payload[12] == 1;
-    const unsigned slot_index = sub - GX_AURORA_LOAD_ARRAYBASE;
+    const unsigned slot_index = sub - commands::arraybase;
     if (slot_index >= 12) {
       // Matrix arrays are read only by indexed XF loads, which J3D sets far more often than
       // it uses: the base resolves when a load needs it.
@@ -269,79 +286,110 @@ bool AuroraStream::aurora_command(std::size_t& pos) {
       set_array(slot_index, pointer, size, host_order);
     }
   } else {
-    static constexpr std::pair<std::uint16_t, std::size_t> fixed[] = {
-        {GX_AURORA_LOAD_VIEWPORT_RENDER, 24}, {GX_AURORA_LOAD_SCISSOR_RENDER, 16},
-        {GX_AURORA_LOAD_PROJECTION_FULL, 64}, {GX_AURORA_LOAD_TEXOBJ, 34}, {GX_AURORA_LOAD_TLUT, 23},
-        {GX_AURORA_DESTROY_TEXOBJ, 4}, {GX_AURORA_DESTROY_TLUT, 4}, {GX_AURORA_DESTROY_COPY_TEX, 8},
-        {GX_AURORA_LOAD_COPY_SRC, 16}, {GX_AURORA_LOAD_COPY_DST, 13}, {GX_AURORA_LOAD_COPY_DEST, 8},
-        {GX_AURORA_BEGIN_OFFSCREEN, 8}, {GX2_SET_POLYGON_OFFSET, 20}, {GX_AURORA_DEBUG_GROUP_PUSH, 2},
-        {GX_AURORA_DEBUG_MARKER_INSERT, 2}, {GX_AURORA_DRAW_SIZED, 5}, {GX_AURORA_DRAW_INDEXED, 7},
-        {list_source_command, 20}};
-    for (const auto& [code, bytes] : fixed) {
-      if (code == sub && !fits(bytes)) {
-        return false;
-      }
+    // Fixed-size payloads are checked before they are read.
+    if (commands::find_fixed(sub, length) && available < length) {
+      return truncated();
     }
     switch (sub) {
-    case GX_AURORA_LOAD_VIEWPORT_RENDER: length = 24; ++stats_.ignored; break;
-    case GX_AURORA_LOAD_SCISSOR_RENDER: length = 16; ++stats_.ignored; break;
-    case GX_AURORA_LOAD_PROJECTION_FULL: length = 64; ++stats_.ignored; break;
-    case GX_AURORA_DEBUG_GROUP_PUSH:
-    case GX_AURORA_DEBUG_MARKER_INSERT: length = 2 + std::size_t{be16(payload)}; break;
-    case GX_AURORA_DEBUG_GROUP_POP: length = 0; break;
-    case GX_AURORA_LOAD_TEXOBJ: length = 34; load_texture(payload); break;
-    case GX_AURORA_LOAD_TLUT: length = 23; load_tlut(payload); break;
-    case GX_AURORA_DESTROY_TEXOBJ:
-    case GX_AURORA_DESTROY_TLUT: length = 4; break;
-    case GX_AURORA_DESTROY_COPY_TEX: length = 8; break;
-    case GX_AURORA_LOAD_COPY_SRC: {
-      length = 16;
+    case commands::viewport_render:
+    case commands::scissor_render:
+    case commands::projection_full: ++stats_.ignored; break;
+    case commands::debug_group_push:
+    case commands::debug_marker_insert:
+      if (available < 2) {
+        return truncated();
+      }
+      length = 2 + std::size_t{be16(payload)};
+      break;
+    case commands::debug_group_pop: break;
+    case commands::load_texobj: load_texture(payload); break;
+    case commands::load_tlut: load_tlut(payload); break;
+    case commands::destroy_texobj:
+    case commands::destroy_tlut:
+    case commands::destroy_copy_tex: break;
+    case commands::load_copy_src: {
       const auto left = be32(payload), top = be32(payload + 4), width = be32(payload + 8), height = be32(payload + 12);
       copy_source_ = 0x49000000u | (top & 1023) << 10 | (left & 1023);
       copy_size_ = 0x4a000000u | ((height - 1) & 1023) << 10 | ((width - 1) & 1023);
       break;
     }
-    case GX_AURORA_LOAD_COPY_DST:
-      length = 13;
+    case commands::load_copy_dst:
       set_copy_destination_format(be32(payload), be32(payload + 4), be32(payload + 8), payload[12] != 0);
       break;
-    case GX_AURORA_LOAD_COPY_DEST: length = 8; copy_destination_ = host_pointer(be64(payload)); break;
-    case GX_AURORA_REQUEST_DEPTH_SNAPSHOT:
-      length = 0;
-      ++stats_.ignored;
-      issues::report("depth snapshot not produced: effects that read depth back see stale values");
-      break;
-    case GX_AURORA_BEGIN_OFFSCREEN: length = 8; begin_offscreen(be32(payload), be32(payload + 4)); break;
-    case GX_AURORA_END_OFFSCREEN: length = 0; end_offscreen(); break;
-    case GX_AURORA_DRAW_SIZED:
+    case commands::load_copy_dest: copy_destination_ = host_pointer(be64(payload)); break;
+    case commands::begin_offscreen: begin_offscreen(be32(payload), be32(payload + 4)); break;
+    case commands::end_offscreen: end_offscreen(); break;
+    case commands::draw_sized:
       if (!draw_sized(payload, available, length)) {
         return false;
       }
       break;
-    case GX_AURORA_DRAW_INDEXED:
+    case commands::draw_indexed:
       if (!draw_indexed(payload, available, length)) {
         return false;
       }
       break;
     case list_source_command: {
       length = 20;
+      if (available < length) {
+        return truncated();
+      }
       const auto bytes = be32(payload + 8);
       if (bytes <= available - 20) {
         memory_.note_fifo_source(payload + 20, bytes, host_pointer(be64(payload)), be64(payload + 12));
       }
       break;
     }
-    case GX2_SET_POLYGON_OFFSET:
-      length = 20;
+    case commands::polygon_offset:
       ++stats_.ignored;
       issues::report("polygon offset not applied: coplanar decals may z-fight");
       break;
+#ifdef GX_AURORA_SET_TEX_IMG_PTR
+    case commands::set_tex_img_ptr: set_texture_image_pointer(payload); break;
+#endif
+#ifdef GX_AURORA_LOAD_DISP_COPY_SRC
+    // Display copies present the EFB itself; the source rectangle only matters to Aurora's XFB.
+    case commands::load_disp_copy_src: ++stats_.ignored; break;
+#endif
+#ifdef GX_AURORA_SET_DRAWS_BLOCKING
+    case commands::set_draws_blocking: ++stats_.ignored; break;
+#endif
+#ifdef GX_AURORA_READBACK_CAPTURE_PEEKS
+    case commands::readback_peeks:
+#endif
+#ifdef GX_AURORA_READBACK_CAPTURE_COPIES
+    case commands::readback_copies:
+#endif
+#if defined(GX_AURORA_READBACK_CAPTURE_PEEKS) || defined(GX_AURORA_READBACK_CAPTURE_COPIES)
+      if (available < commands::readback_header) {
+        return truncated();
+      }
+      // Starlet's copies are GPU-resident and its EFB peeks are the game's own; Aurora's
+      // asynchronous readback streams are not implemented, and nothing answers them.
+      length = commands::readback_header;
+      if (sub == commands::readback_copies) {
+        length += std::size_t{be32(payload + 16)} * commands::readback_copy_entry;
+      } else {
+        length += 1 + std::size_t{be32(payload + 16)} * commands::readback_peek_entry;
+      }
+      ++stats_.ignored;
+      issues::report("Aurora readback capture not supported: AuroraReadbackGet never receives these results");
+      break;
+#endif
+#ifdef GX_AURORA_CLEAR
+    case commands::clear: clear_efb(payload); break;
+#endif
+#ifdef GX_AURORA_REQUEST_DEPTH_SNAPSHOT
+    case commands::request_depth_snapshot:
+      ++stats_.ignored;
+      issues::report("depth snapshot not produced: effects that read depth back see stale values");
+      break;
+#endif
     default: fail("unknown Aurora command " + std::to_string(sub)); return false;
     }
   }
   if (length > available) {
-    fail("truncated Aurora command " + std::to_string(sub));
-    return false;
+    return truncated();
   }
   pos += 3 + length;
   return failure_.empty();
@@ -544,6 +592,71 @@ void AuroraStream::copy_texture(std::uint32_t command) {
   }
   efb_.copy_texture(plan, target.storage, bytes, target.address);
   ++stats_.copies;
+}
+
+// GDSetTexImgPtr: the image address of a map whose size and format the stream wrote as registers.
+void AuroraStream::set_texture_image_pointer(const std::uint8_t* payload) {
+  const std::uint8_t map = payload[0];
+  const void* pointer = host_pointer(be64(payload + 1));
+  if (map >= 8) {
+    fail("texture image pointer for map " + std::to_string(map));
+    return;
+  }
+  const auto& state = decoder_.state();
+  const auto image = state.bp(texture_register(0x88, 0xa8, map));
+  const auto mode = state.bp(texture_register(0x80, 0xa0, map));
+  const auto width = (image & 1023) + 1, height = ((image >> 10) & 1023) + 1, format = (image >> 20) & 15;
+  const bool mips = ((mode >> 5) & 3) != 0;
+  const auto size = GXGetTexBufferSize(static_cast<u16>(width), static_cast<u16>(height), format, mips, 11);
+  texture_slots_[map].valid = false;
+  const auto address = memory_.address(pointer, size, true);
+  if (!address || (address & 31)) {
+    issues::report("texture image pointer not mapped: draws on this map sample the previous texture", &decoder_.state(),
+                   fmt::format("map {} format {} {}x{} size {} address {:x}", map, format, width, height, size, address));
+    ++stats_.unmapped;
+    return;
+  }
+  write_bp(std::uint32_t{texture_register(0x94, 0xb4, map)} << 24 | address >> 5);
+  memory_.note_texture(pointer, size, 0);
+}
+
+// GXClear and GXClearSubrect: a clear of the EFB that is not tied to a copy.
+void AuroraStream::clear_efb(const std::uint8_t* payload) {
+  const auto flags = payload[0];
+  const auto& state = decoder_.state();
+  const int height = state.efb().height, width = starlet::gx::EfbLayout::width;
+  int x = 0, y = 0, w = width, h = height;
+  if (!(flags & 0x08)) {
+    // Rectangle in EFB coordinates (y down); a clear is not scissored.
+    const auto left = be32(payload + 1), top = be32(payload + 5), cw = be32(payload + 9), ch = be32(payload + 13);
+    x = static_cast<int>(std::min<std::uint32_t>(left, width));
+    y = static_cast<int>(std::min<std::uint32_t>(top, height));
+    w = static_cast<int>(std::min<std::uint32_t>(cw, width - x));
+    h = static_cast<int>(std::min<std::uint32_t>(ch, height - y));
+    if (w <= 0 || h <= 0) {
+      return;
+    }
+  }
+  starlet::gx::EfbClear plan;
+  plan.efb = state.efb();
+  plan.rectangle = {x, height - y - h, w, h};
+  plan.rgba6 = (state.bp(0x43) & 7) == 1;
+  plan.color_write = flags & 0x01;
+  plan.alpha_write = plan.rgba6 && (flags & 0x02);
+  plan.depth_write = flags & 0x04;
+  plan.depth = be32(payload + 21) & 0xffffff;
+  std::array<std::uint8_t, 4> color{payload[17], payload[18], payload[19], payload[20]};
+  if (plan.rgba6) {
+    for (auto& channel : color) {
+      const unsigned code = channel >> 2;
+      channel = static_cast<std::uint8_t>(code << 2 | code >> 4);
+    }
+  } else {
+    color[3] = 255;
+  }
+  plan.tile.fill(color);
+  efb_.clear(plan);
+  ++stats_.clears;
 }
 
 bool AuroraStream::draw_sized(const std::uint8_t* payload, std::size_t available, std::size_t& consumed) {

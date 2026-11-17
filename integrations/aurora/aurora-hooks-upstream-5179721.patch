@@ -1,0 +1,441 @@
+From 7294a6951fe2a02bcbd80802c98e447df0f8f6d3 Mon Sep 17 00:00:00 2001
+From: Producdevity <y.gherbi.dev@gmail.com>
+Date: Tue, 17 Nov 2026 14:52:49 +0100
+Subject: [PATCH] Add an AURORA_RENDERER=starlet path without Dawn
+
+With AURORA_STARLET_DIR set, AURORA_RENDERER=starlet makes Aurora create
+its SDL3 window with SDL_WINDOW_OPENGL and OpenGL ES 3.1 attributes,
+skip Dawn/WebGPU, gfx::initialize and the render worker, and drain the
+GX FIFO on the calling thread into Starlet's bridge, which draws with
+OpenGL ES and swaps the window. Without the variable Aurora behaves as
+before. Without AURORA_STARLET_DIR the hooks compile to inert stubs.
+
+Hooks for Starlet: texture data snapshots, display list sources, the
+GXSetCopyFilter registers and the 342 viewport origin, each active only
+under Starlet. RmlUi and ImGui are not available under Starlet.
+---
+ cmake/aurora_gx.cmake                        | 25 +++++++++
+ lib/aurora.cpp                               | 53 ++++++++++++++------
+ lib/dolphin/gx/GXDispList.cpp                |  5 ++
+ lib/dolphin/gx/GXFrameBuffer.cpp             | 27 +++++++++-
+ lib/dolphin/gx/GXTexture.cpp                 | 10 +++-
+ lib/dolphin/gx/GXTransform.cpp               |  7 ++-
+ lib/gx/fifo.cpp                              | 11 +++-
+ lib/starlet_stub/starlet_backend/backend.hpp | 16 ++++++
+ lib/window.cpp                               | 30 ++++++++++-
+ 9 files changed, 163 insertions(+), 21 deletions(-)
+ create mode 100644 lib/starlet_stub/starlet_backend/backend.hpp
+
+diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
+index 20511ec..cec887b 100644
+--- a/cmake/aurora_gx.cmake
++++ b/cmake/aurora_gx.cmake
+@@ -54,6 +54,31 @@ add_library(aurora::gx ALIAS aurora_gx)
+ set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
+ 
+ target_link_libraries(aurora_gx PUBLIC aurora::core dawn::webgpu_dawn xxHash::xxhash)
++
++# Starlet back end: draws the GX stream with Starlet when AURORA_RENDERER=starlet.
++# Without AURORA_STARLET_DIR the hooks compile to nothing (lib/starlet_stub).
++set(AURORA_STARLET_DIR "" CACHE PATH "Starlet source tree")
++if (AURORA_STARLET_DIR)
++    set(AURORA_STARLET_BRIDGE_DIR "${AURORA_STARLET_DIR}/integrations/aurora")
++    if (NOT EXISTS "${AURORA_STARLET_BRIDGE_DIR}/starlet_backend/backend.cpp")
++        message(FATAL_ERROR "AURORA_STARLET_DIR is not a Starlet checkout: ${AURORA_STARLET_DIR}")
++    endif ()
++    set(STARLET_GLES ON)
++    add_subdirectory("${AURORA_STARLET_DIR}" "${CMAKE_BINARY_DIR}/starlet" EXCLUDE_FROM_ALL)
++    set(_starlet_bridge_sources)
++    foreach (_name aurora_stream backend host_memory issues texture_convert)
++        list(APPEND _starlet_bridge_sources "${AURORA_STARLET_BRIDGE_DIR}/starlet_backend/${_name}.cpp")
++    endforeach ()
++    target_sources(aurora_gx PRIVATE ${_starlet_bridge_sources})
++    # The bridge reaches Aurora's internal headers through lib/.
++    set_source_files_properties(${_starlet_bridge_sources} PROPERTIES
++            INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/lib")
++    target_link_libraries(aurora_gx PRIVATE starlet::gx_gles)
++else ()
++    set(AURORA_STARLET_BRIDGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/starlet_stub")
++endif ()
++target_include_directories(aurora_gx PRIVATE "${AURORA_STARLET_BRIDGE_DIR}")
++target_include_directories(aurora_core PRIVATE "${AURORA_STARLET_BRIDGE_DIR}")
+ target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 Tracy::TracyClient PNG::PNG)
+ target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
+ 
+diff --git a/lib/aurora.cpp b/lib/aurora.cpp
+index 3df2b4a..cb4dc39 100644
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -13,6 +13,7 @@
+ #include "imgui.hpp"
+ #include "webgpu/gpu.hpp"
+ #include "webgpu/gpu_prof.hpp"
++#include <starlet_backend/backend.hpp>
+ #include <webgpu/webgpu_cpp.h>
+ #endif
+ 
+@@ -136,7 +137,11 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
+   /* Attempt to create a window using the calling application's desired backend */
+   AuroraBackend selectedBackend = config.desiredBackend;
+   bool windowCreated = false;
+-  if (selectedBackend != BACKEND_AUTO && window::create_window(selectedBackend)) {
++  if (starlet_backend::enabled()) {
++    // AURORA_RENDERER=starlet: an SDL-owned OpenGL ES context replaces Dawn.
++    selectedBackend = BACKEND_OPENGLES;
++    windowCreated = window::create_window(selectedBackend) && starlet_backend::initialize();
++  } else if (selectedBackend != BACKEND_AUTO && window::create_window(selectedBackend)) {
+     if (webgpu::initialize(selectedBackend, config.allowCpuAdapter)) {
+       windowCreated = true;
+     } else {
+@@ -144,7 +149,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
+     }
+   }
+ 
+-  if (!windowCreated) {
++  if (!windowCreated && !starlet_backend::enabled()) {
+     for (const auto backendType : PreferredBackendOrder) {
+       selectedBackend = backendType;
+       if (!window::create_window(selectedBackend)) {
+@@ -162,7 +167,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
+   AURORA_ASSERT(windowCreated, "Error creating window: {}", SDL_GetError());
+ 
+   // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
+-  if (webgpu::g_backendType == wgpu::BackendType::Null) {
++  if (!starlet_backend::enabled() && webgpu::g_backendType == wgpu::BackendType::Null) {
+     AURORA_ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
+   }
+ #else
+@@ -178,21 +183,29 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
+   });
+ 
+ #ifdef AURORA_ENABLE_GX
+-  gfx::initialize();
++  if (!starlet_backend::enabled()) {
++    gfx::initialize();
++  }
+   gx::fifo::init();
+-  imgui::create_context();
++  if (!starlet_backend::enabled()) {
++    imgui::create_context();
++  }
+ #endif
+   const auto size = window::get_window_size();
+   Log.info("Using framebuffer size {}x{} scale {}", size.fb_width, size.fb_height, size.scale);
+ #ifdef AURORA_ENABLE_GX
+-  if (g_config.imGuiInitCallback != nullptr) {
+-    g_config.imGuiInitCallback(&size);
++  if (!starlet_backend::enabled()) {
++    if (g_config.imGuiInitCallback != nullptr) {
++      g_config.imGuiInitCallback(&size);
++    }
++    imgui::initialize();
+   }
+-  imgui::initialize();
+ #endif
+ 
+ #ifdef AURORA_ENABLE_RMLUI
+-  rmlui::initialize(size);
++  if (!starlet_backend::enabled()) {
++    rmlui::initialize(size);
++  }
+ #endif
+ 
+   g_initialFrame = true;
+@@ -209,13 +222,17 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
+ void shutdown() noexcept {
+ #ifdef AURORA_ENABLE_GX
+   gx::fifo::shutdown();
+-  gfx::render_worker::synchronize();
++  if (starlet_backend::enabled()) {
++    starlet_backend::shutdown();
++  } else {
++    gfx::render_worker::synchronize();
+ #ifdef AURORA_ENABLE_RMLUI
+-  rmlui::shutdown();
++    rmlui::shutdown();
+ #endif
+-  imgui::shutdown();
+-  gfx::shutdown();
+-  webgpu::shutdown();
++    imgui::shutdown();
++    gfx::shutdown();
++    webgpu::shutdown();
++  }
+ #endif
+   gamepad::shutdown();
+   window::shutdown();
+@@ -236,6 +253,10 @@ const AuroraEvent* update() noexcept {
+ bool begin_frame() noexcept {
+   ZoneScoped;
+ #ifdef AURORA_ENABLE_GX
++  if (starlet_backend::enabled()) {
++    gx::fifo::begin_frame();
++    return true;
++  }
+   {
+     if (!window::is_presentable()) {
+       webgpu::release_surface();
+@@ -266,6 +287,10 @@ void end_frame() noexcept {
+ #ifdef AURORA_ENABLE_GX
+   gx::fifo::drain();
+   gx::fifo::end_frame();
++  if (starlet_backend::enabled()) {
++    starlet_backend::end_frame();
++    return;
++  }
+   gx::texture::end_frame();
+   gfx::finish();
+   auto imguiDrawData = imgui::freeze();
+diff --git a/lib/dolphin/gx/GXDispList.cpp b/lib/dolphin/gx/GXDispList.cpp
+index 5bf9460..72416d3 100644
+--- a/lib/dolphin/gx/GXDispList.cpp
++++ b/lib/dolphin/gx/GXDispList.cpp
+@@ -2,6 +2,7 @@
+ #include "__gx.h"
+ 
+ #include "../../gx/fifo.hpp"
++#include <starlet_backend/backend.hpp>
+ 
+ #include <cstring>
+ 
+@@ -57,6 +58,10 @@ void GXCallDisplayList(const void* data, u32 nbytes) {
+     __GXSendFlushPrim();
+   }
+ 
++  if (aurora::starlet_backend::enabled() && !aurora::gx::fifo::in_display_list()) {
++    aurora::starlet_backend::note_display_list(data, nbytes);
++  }
++
+   // Write display list contents to the FIFO
+   aurora::gx::fifo::write_data(data, nbytes);
+   aurora::gx::fifo::publish();
+diff --git a/lib/dolphin/gx/GXFrameBuffer.cpp b/lib/dolphin/gx/GXFrameBuffer.cpp
+index 3e92bd9..8be1ba3 100644
+--- a/lib/dolphin/gx/GXFrameBuffer.cpp
++++ b/lib/dolphin/gx/GXFrameBuffer.cpp
+@@ -6,6 +6,7 @@
+ #include "../../window.hpp"
+ #include "../../webgpu/gpu.hpp"
+ #include "../../gx/texture.hpp"
++#include <starlet_backend/backend.hpp>
+ #include "../vi/vi_internal.hpp"
+ 
+ #include <algorithm>
+@@ -187,7 +188,31 @@ void GXSetCopyClear(GXColor color, u32 depth) {
+   __gx->bpSent = 1;
+ }
+ 
+-void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {}
++void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {
++  if (!aurora::starlet_backend::enabled()) {
++    return;
++  }
++  // Starlet reads the hardware registers: BP 0x01-0x04 hold three sample locations each (x, y in
++  // 4 bits; 6 is the pixel centre), BP 0x53/0x54 seven 6-bit vertical filter coefficients.
++  for (u32 reg = 0; reg < 4; ++reg) {
++    u32 value = (0x01 + reg) << 24;
++    for (u32 i = 0; i < 3; ++i) {
++      const u32 x = aa ? sample_pattern[reg * 3 + i][0] : 6;
++      const u32 y = aa ? sample_pattern[reg * 3 + i][1] : 6;
++      value |= (x & 0xf) << (i * 8) | (y & 0xf) << (i * 8 + 4);
++    }
++    GX_WRITE_RAS_REG(value);
++  }
++  // Without the filter the hardware coefficients are 0, 0, 21, 22, 21, 0, 0, which leave rows unchanged.
++  static constexpr u8 passthrough[7] = {0, 0, 21, 22, 21, 0, 0};
++  const u8* coefficients = vf ? vfilter : passthrough;
++  u32 coeff0 = 0x53u << 24, coeff1 = 0x54u << 24;
++  for (u32 i = 0; i < 4; ++i) coeff0 |= (coefficients[i] & 0x3fu) << (i * 6);
++  for (u32 i = 0; i < 3; ++i) coeff1 |= (coefficients[4 + i] & 0x3fu) << (i * 6);
++  GX_WRITE_RAS_REG(coeff0);
++  GX_WRITE_RAS_REG(coeff1);
++  __gx->bpSent = 1;
++}
+ 
+ void GXSetDispCopyGamma(GXGamma gamma) {}
+ 
+diff --git a/lib/dolphin/gx/GXTexture.cpp b/lib/dolphin/gx/GXTexture.cpp
+index 04f97f5..58d4081 100644
+--- a/lib/dolphin/gx/GXTexture.cpp
++++ b/lib/dolphin/gx/GXTexture.cpp
+@@ -2,6 +2,7 @@
+ #include "__gx.h"
+ 
+ #include "../../gfx/texture.hpp"
++#include <starlet_backend/backend.hpp>
+ #include "dolphin/gx/GXAurora.h"
+ 
+ #include <algorithm>
+@@ -78,9 +79,16 @@ void init_texobj_common(GXTexObj_& obj, const void* data, u16 width, u16 height,
+ }
+ 
+ void emit_loaded_texobj_metadata(const GXTexObj_& obj, GXTexMapID id) {
++  const void* data = obj.data;
++  if (aurora::starlet_backend::enabled()) {
++    // Starlet decodes the stream only when the frame drains; keep a copy of pages the game rewrote.
++    data = aurora::starlet_backend::texture_data(
++        data, GXGetTexBufferSize(static_cast<u16>(obj.width()), static_cast<u16>(obj.height()), obj.format(),
++                                 obj.has_mips(), 11));
++  }
+   GX_WRITE_AURORA(GX_AURORA_LOAD_TEXOBJ);
+   GX_WRITE_U8(static_cast<u8>(id));
+-  GX_WRITE_U64(reinterpret_cast<u64>(obj.data));
++  GX_WRITE_U64(reinterpret_cast<u64>(data));
+   GX_WRITE_U32(obj.width());
+   GX_WRITE_U32(obj.height());
+   GX_WRITE_U32(obj.format());
+diff --git a/lib/dolphin/gx/GXTransform.cpp b/lib/dolphin/gx/GXTransform.cpp
+index 7c1c80c..652ae7f 100644
+--- a/lib/dolphin/gx/GXTransform.cpp
++++ b/lib/dolphin/gx/GXTransform.cpp
+@@ -1,6 +1,7 @@
+ #include "gx.hpp"
+ #include "__gx.h"
+ #include "dolphin/mtx/GeoTypes.h"
++#include <starlet_backend/backend.hpp>
+ 
+ static inline void CacheProjectionVector(const f32* ptr, GXProjectionType type) {
+   __gx->projType = type;
+@@ -140,8 +141,10 @@ void GXSetViewportJitter(float left, float top, float width, float height, float
+ 
+   sx = width / 2.0f;
+   sy = -height / 2.0f;
+-  ox = 340.0f + (left + width / 2.0f);
+-  oy = 340.0f + (top + height / 2.0f);
++  // Starlet decodes the hardware origin, which is 342 (the SDK's value).
++  const float bias = aurora::starlet_backend::enabled() ? 342.0f : 340.0f;
++  ox = bias + (left + width / 2.0f);
++  oy = bias + (top + height / 2.0f);
+   zmin = 1.6777215e7f * nearZ;
+   zmax = 1.6777215e7f * farZ;
+   sz = zmax - zmin;
+diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
+index bcaba60..1261581 100644
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "../thread.hpp"
+ #include "command_processor.hpp"
++#include <starlet_backend/backend.hpp>
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -24,7 +25,8 @@ uint32_t sDlWritePos = 0;
+ 
+ namespace {
+ constexpr Module Log{"aurora::gx::fifo"};
+-constexpr auto kProcessingMode = ProcessingMode::Thread;
++// Starlet decodes the FIFO on the thread that drains it.
++const auto kProcessingMode = starlet_backend::enabled() ? ProcessingMode::Drain : ProcessingMode::Thread;
+ constexpr uint32_t kDrawBatchSize = 1;
+ 
+ bool sFrameActive = false;
+@@ -59,7 +61,12 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
+                     sStreamBase + detail::sBufferSize);
+       const auto start = static_cast<uint32_t>(processed - sStreamBase);
+       const auto size = static_cast<uint32_t>(target - processed);
+-      result = process(detail::sBufferData + start, size);
++      if (starlet_backend::enabled()) {
++        starlet_backend::process(detail::sBufferData + start, size);
++        result = {size, false};
++      } else {
++        result = process(detail::sBufferData + start, size);
++      }
+     }
+     AURORA_ASSERT(result.bytesProcessed > 0 && result.bytesProcessed <= target - processed,
+                   "FIFO processor made invalid progress: processed {} of {} remaining bytes", result.bytesProcessed,
+diff --git a/lib/starlet_stub/starlet_backend/backend.hpp b/lib/starlet_stub/starlet_backend/backend.hpp
+new file mode 100644
+index 0000000..e7ffa84
+--- /dev/null
++++ b/lib/starlet_stub/starlet_backend/backend.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++// Stand-in for the Starlet bridge when AURORA_STARLET_DIR is not set: every hook is inert.
++namespace aurora::starlet_backend {
++constexpr bool enabled() noexcept { return false; }
++inline void process(const std::uint8_t*, std::size_t) {}
++inline void end_frame() {}
++inline void set_gl_attributes() {}
++inline bool initialize() { return false; }
++inline void shutdown() {}
++inline const void* texture_data(const void* data, std::size_t) { return data; }
++inline void note_display_list(const void*, std::size_t) {}
++} // namespace aurora::starlet_backend
+diff --git a/lib/window.cpp b/lib/window.cpp
+index cf84de3..b509d22 100644
+--- a/lib/window.cpp
++++ b/lib/window.cpp
+@@ -8,6 +8,9 @@
+ #include "input/router.hpp"
+ #include "input/sdl_input.hpp"
+ #include "internal.hpp"
++#ifdef AURORA_ENABLE_GX
++#include <starlet_backend/backend.hpp>
++#endif
+ 
+ #include <aurora/aurora.h>
+ #include <aurora/event.h>
+@@ -352,6 +355,29 @@ bool create_window(AuroraBackend backend) {
+     width = 1280;
+     height = 960;
+   }
++#ifdef AURORA_ENABLE_GX
++  const bool starlet = starlet_backend::enabled();
++  if (starlet) {
++    // SDL cannot add OpenGL to a window later, so the flag and the context attributes come first.
++    flags |= SDL_WINDOW_OPENGL;
++    starlet_backend::set_gl_attributes();
++    // The sdl3shim "sdl2" driver wraps a firmware SDL2 that has no compositor: the window must be
++    // the panel's size, without high-DPI scaling.
++    const char* videoDriver = SDL_GetCurrentVideoDriver();
++    if (videoDriver != nullptr && SDL_strcmp(videoDriver, "sdl2") == 0) {
++      flags &= ~SDL_WINDOW_HIGH_PIXEL_DENSITY;
++      const SDL_DisplayID display = SDL_GetPrimaryDisplay();
++      const SDL_DisplayMode* mode = display != 0 ? SDL_GetDesktopDisplayMode(display) : nullptr;
++      if (mode != nullptr && mode->w > 0 && mode->h > 0) {
++        width = mode->w;
++        height = mode->h;
++        Log.info("Panel mode is {}x{}; sizing the window to fill it", width, height);
++      }
++    }
++  }
++#else
++  constexpr bool starlet = false;
++#endif
+   if (width < 640) {
+     width = 640;
+   }
+@@ -379,7 +405,9 @@ bool create_window(AuroraBackend backend) {
+       SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, SDL_GetError());
+   TRY(SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, flags), "Failed to set {}: {}",
+       SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, SDL_GetError());
+-  TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, backend != BACKEND_NULL),
++  // An external graphics context makes SDL_GL_CreateContext refuse the window, so Starlet's is SDL-owned.
++  TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN,
++                             backend != BACKEND_NULL && !starlet),
+       "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, SDL_GetError());
+   g_window = SDL_CreateWindowWithProperties(props);
+   if (g_window == nullptr) {
+diff --git a/lib/imgui.cpp b/lib/imgui.cpp
+--- a/lib/imgui.cpp
++++ b/lib/imgui.cpp
+@@ -185,6 +185,10 @@ void set_cursor_managed(bool managed) noexcept {
+ }
+ 
+ void process_event(const SDL_Event& event) noexcept {
++  // No context exists when another renderer owns presentation (AURORA_RENDERER=starlet).
++  if (ImGui::GetCurrentContext() == nullptr) {
++    return;
++  }
+   auto renderEvent = event;
+   if (g_useSdlRenderer) {
+     if (SDL_Renderer* renderer = window::get_sdl_renderer()) {
+-- 
+2.56.0
+

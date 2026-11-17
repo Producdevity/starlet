@@ -1,6 +1,6 @@
 #include "issues.hpp"
 
-#include "../logging.hpp"
+#include "aurora_host.hpp"
 
 #include "starlet/gx/state.hpp"
 

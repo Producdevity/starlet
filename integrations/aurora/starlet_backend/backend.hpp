@@ -4,18 +4,31 @@
 #include <cstdint>
 
 // Draws Aurora's GX command stream with Starlet's OpenGL ES renderer instead of Aurora's
-// own, when the environment sets AURORA_RENDERER=starlet. Aurora keeps its window, UI and
-// presentation; Starlet's GL work runs on Aurora's render worker, which owns the context.
+// own, when the environment sets AURORA_RENDERER=starlet.
+//
+// Two Aurora trees use this bridge, and each calls the part of it that fits:
+//   upstream encounter/aurora: no Dawn, WebGPU or render worker. Aurora creates an OpenGL ES window
+//     (set_gl_attributes, initialize), decodes the FIFO on the calling thread (process), and
+//     end_frame submits the frame and presents it from a GL thread the bridge owns.
+//   GLES fork bmdhacks/aurora: Aurora's render worker owns the context and calls present.
 namespace aurora::starlet_backend {
 
 bool enabled() noexcept;
 // Main thread, from gx::fifo::drain: decodes and records one drained FIFO buffer.
 void process(const std::uint8_t* data, std::size_t size);
-// Main thread, after the frame's last drain: submits the frame's GL work.
+// Main thread, after the frame's last drain: submits the frame's GL work. Upstream tree: also
+// presents the frame (letterboxed 4:3 into the window) and swaps.
 void end_frame();
-// Render worker, in the frame's end callback: draws the frame into the present target and
-// leaves Aurora's GL state shadow invalid. False when nothing was drawn yet.
+// GLES fork, render worker, in the frame's end callback: draws the frame into the present target
+// and leaves Aurora's GL state shadow invalid. False when nothing was drawn yet.
 bool present(std::uint32_t target_framebuffer, std::uint32_t surface_width, std::uint32_t surface_height);
+// Upstream tree, main thread, before the window is created: the SDL_GL attributes of an OpenGL ES
+// 3.1 context. The window needs SDL_WINDOW_OPENGL as well.
+void set_gl_attributes();
+// Upstream tree, main thread, after the window exists: creates the context, starts the GL thread.
+// False (and logged) when no context can be made.
+bool initialize();
+// Stops the GL work and releases the renderer and context; before the window is destroyed.
 void shutdown();
 // Any thread: the game stored, flushed or invalidated a range of its data cache, which it
 // does around CPU writes and DMA into memory the GPU reads.
