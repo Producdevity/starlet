@@ -18,6 +18,8 @@ public:
     void copy_display(const gx::DisplayCopy& copy, std::uint8_t* destination, std::size_t bytes) override;
     void copy_texture(const gx::TextureCopy& copy, std::uint8_t* destination, std::size_t bytes,
                       std::uint32_t address) override;
+    void copy_texture_with_contents(const gx::TextureCopy& copy, std::uint8_t* destination, std::size_t bytes,
+                                    std::uint32_t address, const std::uint8_t* contents) override;
     std::uint32_t peek_depth(int x, int y) override;
     std::uint32_t peek_color(int x, int y) override;
     bool resident_in(const void* data, std::size_t bytes) const override;

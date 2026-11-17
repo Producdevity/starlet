@@ -42,6 +42,8 @@ struct GlesStats {
     // Time for them: issuing the packing pass and readback on the GL thread, and copying the
     // mapped readback out on the owner thread (microseconds).
     std::uint64_t write_back_issue_us = 0, write_back_copy_us = 0;
+    // Resident copies whose memory bytes the caller supplied (copy_texture_known).
+    std::uint64_t known_copies = 0;
     TextureCacheStats capture_cache;
     VertexCacheStats geometry_cache;
     GlesDirectStats direct;
@@ -137,6 +139,10 @@ public:
     // pending, and presentation waits for the previous frame. Consecutive resident copies that
     // differ only in their target render in one pass (renderer.md).
     void copy_texture_resident(const TextureCopy&, std::uint8_t*, std::size_t, std::uint32_t token) override;
+    // Direct path: copy_texture_resident into a write_back range whose encoded bytes the caller
+    // computed. Memory takes contents at once, as a landed write-back; nothing is read back.
+    // Earlier write-backs into the range land first. Without the direct path, a plain copy.
+    void copy_texture_known(const TextureCopy&, std::uint8_t*, std::size_t, std::uint32_t token, const std::uint8_t* contents);
     void release_resident(std::uint32_t token, std::size_t bytes) override;
     // Direct path, for host transfers on the game's behalf (DMA engines, card and disc
     // files; starlet::os::before_dma_read and before_dma_write), on the owner thread

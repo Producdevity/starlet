@@ -2321,6 +2321,10 @@ void GlesRenderer::copy_texture(const TextureCopy& p, std::uint8_t* destination,
     } catch (...) { g.failed = true; throw; }
 }
 void GlesRenderer::copy_texture_resident(const TextureCopy& p, std::uint8_t* destination, std::size_t capacity, std::uint32_t token) {
+    copy_texture_known(p, destination, capacity, token, nullptr);
+}
+void GlesRenderer::copy_texture_known(const TextureCopy& p, std::uint8_t* destination, std::size_t capacity, std::uint32_t token,
+                                      const std::uint8_t* contents) {
     ++impl_->efb_writes;
     auto& g = *impl_; g.check_owner();
     if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
@@ -2338,13 +2342,18 @@ void GlesRenderer::copy_texture_resident(const TextureCopy& p, std::uint8_t* des
         if (!g.merges(p, token, required)) g.flush_copies();
         g.flush_direct();
         std::shared_ptr<Impl::WriteBack> write_back;
-        if (g.writes_back(token, required)) {
+        if (contents || g.writes_back(token, required)) {
             // Copies reach memory in issue order, as on the console: an earlier one into this
             // memory lands first. Made about a frame earlier, it is usually read back by now.
             std::uint64_t earlier = 0;
             for (const auto& w : g.issued_write_backs)
                 if (w->token < std::uint64_t{token} + required && token < std::uint64_t{w->token} + w->bytes) earlier = w->sequence;
             if (earlier) land_write_backs(earlier, true);
+        }
+        if (contents) {
+            std::memcpy(destination, contents, required);
+            ++g.stats.known_copies;
+        } else if (g.writes_back(token, required)) {
             write_back = std::make_shared<Impl::WriteBack>();
             write_back->sequence = ++g.write_back_sequence;
             write_back->token = token;
@@ -2356,7 +2365,8 @@ void GlesRenderer::copy_texture_resident(const TextureCopy& p, std::uint8_t* des
             write_back->width = p.destination_width();
             write_back->height = write_back->packed ? p.destination_height() / 4 : p.destination_height();
         }
-        const auto target = g.direct->resident_copy(p, token, destination, capacity, write_back ? write_back->sequence : 0);
+        const auto target = g.direct->resident_copy(p, token, destination, capacity, write_back ? write_back->sequence : 0,
+                                                    contents != nullptr);
         g.direct->flush();
         g.pending_copies.push_back({p, target, token, required});
         if (write_back) {

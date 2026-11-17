@@ -1017,6 +1017,36 @@ void written_back_copies() {
           "a packed copy is read back after a quiet 2 ms");
     fake::map_pattern=false;
 }
+// Copies whose bytes the caller computed (GlesRenderer::copy_texture_known): memory takes them at
+// once and nothing is read back, the copy is still sampled on the GPU, and a written-back copy into
+// the same memory before it lands first.
+void known_copies() {
+    GlesRenderer renderer; Fixture f; f.memory.bytes.resize(64,0xa5); f.bp(0x8b,0x100c0f);
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    TextureCopy p; p.width=16; p.height=4; p.format=8; p.stride=64;
+    alignas(32) std::array<std::uint8_t,64> bytes{}; bytes.fill(0x11);
+    alignas(32) std::array<std::uint8_t,64> contents{}; contents.fill(0x5a);
+    fake::map_pattern=true;
+    renderer.write_back(0x8000,64,true);
+    const auto reads=fake::read_pixels;
+    renderer.copy_texture_known(p,bytes.data(),bytes.size(),0x8000,contents.data());
+    check(bytes==contents && renderer.write_backs_issued()==0 && renderer.stats().known_copies==1 &&
+          renderer.land_write_backs(0,true) && fake::read_pixels==reads,
+          "a copy with known bytes stores them at once and reads nothing back");
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    auto s=renderer.stats().direct;
+    check(s.resident_hits==1 && s.materialized==0 && fake::read_pixels==reads,"the known copy is still sampled on the GPU");
+    renderer.copy_texture_resident(p,bytes.data(),bytes.size(),0x8000);
+    check(bytes==contents && renderer.write_backs_issued()==1,"a written-back copy after it waits to be read back");
+    contents.fill(0x6b);
+    renderer.copy_texture_known(p,bytes.data(),bytes.size(),0x8000,contents.data());
+    check(renderer.stats().write_backs==1 && bytes==contents && renderer.stats().known_copies==2 &&
+          renderer.write_backs_issued()==1,"a known copy lands the earlier written-back copy first, then stores its own bytes");
+    renderer.draw_direct(f.decoder.state(),f.command(),f.memory); renderer.wait_until_idle();
+    s=renderer.stats().direct;
+    check(s.resident_hits==2 && s.materialized==0,"the newer known copy is sampled on the GPU");
+    fake::map_pattern=false;
+}
 // JFWDisplay::clearEfb on every draw path: the Z texel becomes the fragment depth, the depth
 // test runs ALWAYS with writes, and the bias is a uniform of the program.
 void z_texture_clear() {
@@ -2481,7 +2511,7 @@ int main() {
         rejected_program_skips_draws();
         unready_program_policy();
         program_reuse_across_tev_colours();
-        resident_copies(); resident_copy_crops(); resident_copy_extension(); resident_copy_chain(); dma_over_resident_copies(); stamped_resident_copies(); written_back_copies();
+        resident_copies(); resident_copy_crops(); resident_copy_extension(); resident_copy_chain(); dma_over_resident_copies(); stamped_resident_copies(); written_back_copies(); known_copies();
         z_texture_clear();
         direct_geometry_cache();
         direct_instancing();

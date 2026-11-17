@@ -185,9 +185,10 @@ public:
     // and flush() again before rendering into the target: its creation is queued.
     struct ResidentTarget { unsigned texture = 0, framebuffer = 0; };
     // write_back: nonzero for a copy that will also reach memory (GlesRenderer::write_back), its
-    // sequence number; it is not stamped, and land_write_back writes its bytes.
+    // sequence number; it is not stamped, and land_write_back writes its bytes. landed: memory
+    // already holds the copy's bytes (GlesRenderer::copy_texture_known); it is not stamped either.
     ResidentTarget resident_copy(const TextureCopy&, std::uint32_t token, std::uint8_t* destination, std::size_t capacity,
-                                 std::uint64_t write_back = 0);
+                                 std::uint64_t write_back = 0, bool landed = false);
     // The written-back copy write_back at token, read back as RGBA8 texels (encoded: as its own
     // bytes): its bytes are stored outside its covered ranges as materializing would. False when
     // it is gone (replaced, released, materialized) or the game changed its memory first; nothing

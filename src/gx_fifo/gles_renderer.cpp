@@ -17,6 +17,10 @@ void GlesBackend::copy_display(const gx::DisplayCopy& copy, std::uint8_t* destin
 void GlesBackend::copy_texture(const gx::TextureCopy& copy, std::uint8_t* destination, std::size_t bytes, std::uint32_t address) {
     renderer_.copy_texture_resident(copy, destination, bytes, address);
 }
+void GlesBackend::copy_texture_with_contents(const gx::TextureCopy& copy, std::uint8_t* destination, std::size_t bytes,
+                                             std::uint32_t address, const std::uint8_t* contents) {
+    renderer_.copy_texture_known(copy, destination, bytes, address, contents);
+}
 
 std::uint32_t GlesBackend::peek_depth(int x, int y) { return renderer_.peek_depth(x, y); }
 std::uint32_t GlesBackend::peek_color(int x, int y) { return renderer_.peek_color(x, y); }
@@ -62,7 +66,7 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 "presentations %llu, programs %llu, decoded %llu bytes; direct draws %llu zero-area %llu culled %llu unready %llu "
                 "submissions %llu batched %llu instanced %llu skipped %u; program waits %llu/%llu/%llu/%llu/%llu "
                 "(33/67/133/267 ms/longer) max %llu ms, GL-thread links %llu max %llu ms; resident copies %llu hits %llu "
-                "crops %llu materialized %llu written back %llu dropped %llu waited %llu (GL %llu + %llu ms) overwritten by DMA %llu settled DMA %llu; batched with zero alpha %llu, vertex fog %llu; uniform blocks %llu shared %llu bytes %llu; "
+                "crops %llu materialized %llu written back %llu dropped %llu waited %llu (GL %llu + %llu ms) known %llu overwritten by DMA %llu settled DMA %llu; batched with zero alpha %llu, vertex fog %llu; uniform blocks %llu shared %llu bytes %llu; "
                 "peeks %llu live %llu waited %llu snapshots refused %llu region misses %llu late %llu; stream reused %llu updated %llu verified %llu; state hits %llu misses %llu; state reused %llu raster hits %llu texture plan hits %llu; state snapshots %llu/%llu bytes %llu; program hits %llu misses %llu; vertex bytes %llu\n",
                 gpu.retraces, gpu.presented, gpu.frame_buffer, gpu.known_frame_buffer, (unsigned long long)s.draws,
                 (unsigned long long)s.display_copies, (unsigned long long)s.texture_copies, (unsigned long long)s.merged_copies,
@@ -78,7 +82,7 @@ void GlesBackend::print_stats(const GpuCounters& gpu) {
                 (unsigned long long)s.direct.resident_copies, (unsigned long long)s.direct.resident_hits,
                 (unsigned long long)s.direct.resident_crops, (unsigned long long)s.direct.materialized,
                 (unsigned long long)s.write_backs, (unsigned long long)s.write_backs_dropped, (unsigned long long)s.write_back_waits,
-                (unsigned long long)(s.write_back_issue_us / 1000), (unsigned long long)(s.write_back_copy_us / 1000),
+                (unsigned long long)(s.write_back_issue_us / 1000), (unsigned long long)(s.write_back_copy_us / 1000), (unsigned long long)s.known_copies,
                 (unsigned long long)s.direct.dma_overwritten, (unsigned long long)s.direct.dma_settled,
                 (unsigned long long)s.direct.zero_alpha_draws,
                 (unsigned long long)s.direct.vertex_fog_draws, (unsigned long long)s.direct.uniform_blocks,

@@ -1718,7 +1718,7 @@ struct GlesDirect::Impl {
         retire_target(int(c.plan.destination_width()), int(c.plan.destination_height()), c.texture, c.framebuffer);
     }
     GlesDirect::ResidentTarget resident_copy(const TextureCopy& p, std::uint32_t token, std::uint8_t* destination, std::size_t capacity,
-                                             std::uint64_t write_back) {
+                                             std::uint64_t write_back, bool landed) {
         const auto bytes = texture_copy_bytes(p);
         // Overlapped copies keep the bytes outside this one on the GPU until a lookup needs them.
         for (auto it : overlapping(token, bytes)) {
@@ -1737,10 +1737,11 @@ struct GlesDirect::Impl {
         const auto t = target_of(p.destination_width(), p.destination_height());
         auto& entry = copies[token];
         entry = {token, bytes, t.texture, t.framebuffer, p, destination, capacity};
-        if (write_back) {
+        if (write_back || landed) {
             entry.write_back = write_back;
             entry.expected = std::make_shared<const std::vector<std::uint8_t>>(destination, destination + bytes);
             entry.verified = frame;
+            entry.landed = landed;
         } else if (limits.stamp_resident_copies) { entry.stamp = ++stamps; entry.write_stamps(); }
         invalidate_pointer(destination, bytes);
         textures_changed();
@@ -3126,8 +3127,8 @@ void GlesDirect::invalidate(const void* data, std::size_t size) {
     impl_->invalidate_pointer(static_cast<const std::uint8_t*>(data), size);
 }
 GlesDirect::ResidentTarget GlesDirect::resident_copy(const TextureCopy& p, std::uint32_t token, std::uint8_t* destination, std::size_t capacity,
-                                                     std::uint64_t write_back) {
-    return impl_->resident_copy(p, token, destination, capacity, write_back);
+                                                     std::uint64_t write_back, bool landed) {
+    return impl_->resident_copy(p, token, destination, capacity, write_back, landed);
 }
 bool GlesDirect::land_write_back(std::uint32_t token, std::uint64_t write_back, std::vector<std::uint8_t> texels, bool encoded) {
     return impl_->land_write_back(token, write_back, std::move(texels), encoded);

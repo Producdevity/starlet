@@ -55,6 +55,14 @@ public:
     virtual void write_back(std::uint32_t, std::size_t, bool) {}
     virtual std::uint64_t write_backs_issued() const { return 0; }
     virtual bool land_write_backs(std::uint64_t, bool) { return true; }
+    // A texture copy into a write_back range whose bytes the caller computed (contents, bytes long,
+    // as the copy encodes them): the renderer keeps its own copy as copy_texture does, and memory
+    // takes contents at once instead of a readback. Earlier copies into the range land first.
+    virtual void copy_texture_with_contents(const gx::TextureCopy& copy, std::uint8_t* destination, std::size_t bytes,
+                                            std::uint32_t address, const std::uint8_t* contents) {
+        static_cast<void>(contents);
+        copy_texture(copy, destination, bytes, address);
+    }
     // Optional EFB snapshots (gx::EfbPeekBackend), for draw-sync callbacks that read the EFB:
     // the GPU thread retains the EFB at their token and the callback reads it once read back.
     // snapshot_ready and the snapshot peeks run on any thread, the rest on the GPU thread.
