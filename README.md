@@ -108,6 +108,8 @@ from `main.dol`, go in the setup hook.
 
 An embedding project builds Starlet's tests only with `STARLET_TESTS` set.
 
+Aurora projects: see [docs/Aurora-integration.md](docs/Aurora-integration.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

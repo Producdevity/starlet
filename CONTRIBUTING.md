@@ -43,3 +43,7 @@ and code copied from a game or the console SDK.
 
 Contributions are licensed under the GNU General Public License v3.0, like the rest of the
 project.
+
+## Documentation
+
+Docs live in `docs/`. Each push to master mirrors them to the GitHub wiki, so edit them here, not in the wiki.
