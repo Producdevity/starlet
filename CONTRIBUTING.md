@@ -34,6 +34,28 @@ issue when you're unsure where a change fits.
   driver (for example Mali r20p0 or Panfrost). Several ports share this code, so say which
   ones you checked.
 
+## Comments
+
+Comments are rare, factual and justified. Write one only for a non-obvious hardware or format
+fact, an external constraint, an invariant or an edge case, at the line it explains. Put API
+contracts (thread and context ownership, lifetime, failure) in one or two lines on the public
+declaration. Hardware references with their sources and designs that span files go in `docs/`;
+decisions that would be costly to reverse go in `docs/adr/`. Leave out narration, restated
+names and history: git has the history.
+
+Bad, the comment restates the name:
+
+```cpp
+// Resident copies whose memory bytes the caller supplied (copy_texture_known).
+std::uint64_t known_copies = 0;
+```
+
+Good, the comment states a fact the code cannot show:
+
+```cpp
+// A channel with no vertex color reads white, following Dolphin; hardware unverified.
+```
+
 ## Game data
 
 Keep game files out of the repository: disc images, executables, extracted assets, saves,
