@@ -180,16 +180,23 @@ std::string fast_fragment_source(const TevPipeline& tev, const IndirectSnapshot&
             if (indirect_coordinate(s)) {
                 f << "        ivec2 base=ivec2(" << uv_of(stage.texture_coord) << "*uGxCoordinateScale[" << i << "]*uGxImageSize[" << i << "]*128.0);\n";
                 if (s.matrix)
-                    f << "        ivec2 offset=gxIndirectOffset(indirectSample" << unsigned(s.lookup) << ",uGxIndirectRows[" << (s.matrix - 1) * 2
-                      << "],uGxIndirectRows[" << (s.matrix - 1) * 2 + 1 << "],ivec3(" << ((s.bias & 1) ? 128 : 0) << ","
-                      << ((s.bias & 2) ? 128 : 0) << "," << ((s.bias & 4) ? 128 : 0) << "));\n";
+                    f << "        ivec2 offset=gxIndirectOffset(" << indirect_sample_glsl(s, "indirectSample" + std::to_string(unsigned(s.lookup)))
+                      << ",uGxIndirectRows[" << (s.matrix - 1) * 2 << "],uGxIndirectRows[" << (s.matrix - 1) * 2 + 1 << "],"
+                      << indirect_bias_glsl(s) << ");\n";
                 else f << "        ivec2 offset=ivec2(0);\n";
                 f << "        ivec2 fixedUV=(" << indirect_wrap_glsl(s, "base") << "+offset)&ivec2(0xffffff);\n"
                   << "        fixedUV=(fixedUV&ivec2(0x7fffff))-(fixedUV&ivec2(0x800000));\n";
                 uv = "vec2(fixedUV)/(128.0*uGxImageSize[" + std::to_string(i) + "])";
             } else uv = uv_of(stage.texture_coord) + "*uGxCoordinateScale[" + std::to_string(i) + "]";
-            if (z_lookup) f << "        gxZLookup=ivec4(" << sample(stage.texture_map, uv) << "*255.0+0.5);\n        vec4 tex=vec4(0.0);\n";
-            else f << "        vec4 tex=" << sample(stage.texture_map, uv) << "." << swizzle(stage.texture_swap) << ";\n";
+            auto sampled = sample(stage.texture_map, uv);
+            if (indirect_coordinate(s) && s.lod_unmodified) {
+                const auto unmodified = uv_of(stage.texture_coord) + "*uGxCoordinateScale[" + std::to_string(i) + "]";
+                const auto bias = "exp2(uGxSamplerBias[" + std::to_string(unsigned(stage.texture_map)) + "])";
+                sampled = "textureGrad(uGxTexture" + std::to_string(unsigned(stage.texture_map)) + "," + uv + ",dFdx(" + unmodified + ")*" + bias +
+                          ",dFdy(" + unmodified + ")*" + bias + ")";
+            }
+            if (z_lookup) f << "        gxZLookup=ivec4(" << sampled << "*255.0+0.5);\n        vec4 tex=vec4(0.0);\n";
+            else f << "        vec4 tex=" << sampled << "." << swizzle(stage.texture_swap) << ";\n";
         } else f << "        vec4 tex=vec4(" << (use.constant_texture && tev.disabled_texture ? "1.0" : "0.0") << ");\n";
         f << "        vec4 ras=" << (stage.raster == TevRaster::zero ? std::string("vec4(0.0)")
                                      : "gx_color" + std::to_string(code(stage.raster)) + "." + swizzle(stage.raster_swap)) << ";\n"

@@ -28,15 +28,16 @@ IndirectCapture capture_indirect(const State& state, const TevPipeline& tev) {
         if (!(word & ~0x7fu)) continue;
         const unsigned lookup = word & 3, wrap_s = (word >> 13) & 7, wrap_t = (word >> 16) & 7;
         unsigned matrix = (word >> 9) & 15;
-        if ((word & ~0x7fe73u) || ((word >> 2) & 3) || matrix > 3 || wrap_s == 7 || wrap_t == 7)
-            return fail("indirect mapping requires 8-bit static matrices without feedback or bump alpha");
+        if ((word & ~0xffe7fu) || matrix > 3 || wrap_s == 7 || wrap_t == 7)
+            return fail("indirect mapping requires static matrices without feedback or bump alpha");
         // A lookup beyond the enabled indirect stages is undefined on the console; it
         // adds no offset here, while the wrap modes still apply.
         if (lookup >= count) matrix = 0;
         if (!tev_stage_samples(tev, i) || (!matrix && !wrap_s && !wrap_t)) continue;
         result->stages[i] = {static_cast<std::uint8_t>(matrix ? lookup : 0), static_cast<std::uint8_t>(matrix),
                              static_cast<std::uint8_t>(matrix ? (word >> 4) & 7 : 0), static_cast<std::uint8_t>(wrap_s),
-                             static_cast<std::uint8_t>(wrap_t)};
+                             static_cast<std::uint8_t>(wrap_t), static_cast<std::uint8_t>(matrix ? (word >> 2) & 3 : 0),
+                             static_cast<std::uint8_t>((word >> 19) & 1)};
         if (matrix) result->lookup_mask |= 1u << lookup;
     }
     for (unsigned i = 0; i < count; ++i) {
@@ -61,10 +62,13 @@ IndirectCapture capture_indirect(const State& state, const TevPipeline& tev) {
 }
 
 std::array<std::int32_t, 2> evaluate_indirect_offset(const IndirectMatrix& matrix, TevColor sample,
-                                                   std::uint8_t bias) {
+                                                   std::uint8_t bias, std::uint8_t format) {
     if (bias > 7) throw std::invalid_argument("invalid indirect bias mask");
-    const std::array<int, 3> input{{int(sample[3]) - ((bias & 1) ? 128 : 0),
-        int(sample[2]) - ((bias & 2) ? 128 : 0), int(sample[1]) - ((bias & 4) ? 128 : 0)}};
+    if (format > 3) throw std::invalid_argument("invalid indirect format");
+    // The 5-, 4- and 3-bit formats keep each component's low bits and bias them by +1, not -128.
+    const int mask = format ? 0xff >> (format + 2) : 0xff, add = format ? 1 : -128;
+    const std::array<int, 3> input{{(int(sample[3]) & mask) + ((bias & 1) ? add : 0),
+        (int(sample[2]) & mask) + ((bias & 2) ? add : 0), (int(sample[1]) & mask) + ((bias & 4) ? add : 0)}};
     std::array<std::int32_t, 2> output{};
     for (unsigned r = 0; r < 2; ++r) {
         const auto& row = matrix.rows[r];
@@ -90,6 +94,16 @@ std::string indirect_wrap_glsl(const IndirectStage& stage, const std::string& ba
         return "(" + base + "." + component + "&" + std::to_string((256 >> (code - 1)) * 128 - 1) + ")";
     };
     return "ivec2(" + lane(stage.wrap_s, "x") + "," + lane(stage.wrap_t, "y") + ")";
+}
+
+std::string indirect_sample_glsl(const IndirectStage& stage, const std::string& sample) {
+    return stage.format ? sample + "&ivec4(" + std::to_string(0xff >> (stage.format + 2)) + ")" : sample;
+}
+
+std::string indirect_bias_glsl(const IndirectStage& stage) {
+    const int bias = stage.format ? -1 : 128;
+    return "ivec3(" + std::to_string((stage.bias & 1) ? bias : 0) + "," + std::to_string((stage.bias & 2) ? bias : 0) + "," +
+           std::to_string((stage.bias & 4) ? bias : 0) + ")";
 }
 
 const char* indirect_offset_glsl() {

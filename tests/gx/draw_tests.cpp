@@ -216,9 +216,61 @@ void inactive_indirect_inputs() {
         check(pipeline(planned).key==pipeline(reference).key && planned.pipeline.fragment==reference.pipeline.fragment &&
             planned.pipeline.vertex==reference.pipeline.vertex,"inactive format, lookup and bias preserve direct shader identity");
     }
-    for(unsigned effect:{128u,256u,1u<<19,1u<<20}) {
+    for(unsigned effect:{128u,256u,1u<<20}) {
         f.bp(0x10,0x70|effect);
-        check(!f.capture(),"matrix-off does not bypass active unsupported feedback, LOD or bump alpha");
+        check(!f.capture(),"matrix-off does not bypass active unsupported feedback or bump alpha");
+    }
+    f.bp(0x10,0x7c|1u<<19);
+    {
+        const auto captured=f.capture();const auto& draw=packet(captured);
+        check(draw.indirect->stages[0].format==0 && draw.indirect->stages[0].lod_unmodified==0,
+              "format and unmodified LOD of a stage without offset or wrap are inactive");
+        const auto planned=plan_gles_draw(draw);
+        check(pipeline(planned).key==pipeline(reference).key && planned.pipeline.fragment==reference.pipeline.fragment,
+              "inactive unmodified LOD preserves direct shader identity");
+    }
+}
+
+void indirect_formats_and_lod() {
+    IndirectMatrix matrix;
+    matrix.rows = {{{{16,0,0,10}},{{0,16,0,10}}}};
+    check(evaluate_indirect_offset(matrix,{0,0,0xf2,0x37},0,2) == std::array<std::int32_t,2>{{14336,4096}},
+          "4-bit format keeps the low bits of alpha and blue");
+    check(evaluate_indirect_offset(matrix,{0,0,0xf2,0x37},3,2) == std::array<std::int32_t,2>{{16384,6144}},
+          "small formats bias by +1");
+    check(evaluate_indirect_offset(matrix,{0,0,0xff,0xff},0,1) == std::array<std::int32_t,2>{{63488,63488}} &&
+          evaluate_indirect_offset(matrix,{0,0,0xff,0xff},0,3) == std::array<std::int32_t,2>{{14336,14336}},
+          "5- and 3-bit masks");
+    Fixture f;
+    f.bp(0,0x10012); f.bp(0x10,0x270); f.bp(0x27,1);
+    f.bp(6,0xc00010); f.bp(7,0x808000); f.bp(8,0x400000);
+    f.bp(0x81,0); f.bp(0x85,0); f.bp(0x89,0x100c07); f.bp(0x95,0x8000>>5);
+    const auto base_capture=f.capture(); const auto base=plan_gles_draw(packet(base_capture));
+    // Mario Party 4's tiled sprites: 4-bit offsets, matrix 0, wrap 16, LOD from unmodified coordinates.
+    f.bp(0x10,0x0da208);
+    const auto captured=f.capture(); const auto& draw=packet(captured);
+    const auto& s=draw.indirect->stages[0];
+    check(s.format==2 && s.lod_unmodified==1 && s.matrix==1 && s.wrap_s==5 && s.wrap_t==5,"tiled stage captures format and LOD source");
+    const auto tiled_plan=plan_gles_draw(draw); const auto& tiled=pipeline(tiled_plan);
+    check(tiled.key!=pipeline(base).key,"format and LOD source select a program");
+    check(tiled.fragment.find("gxIndirectOffset(indirectSample0&ivec4(15),")!=std::string::npos &&
+          tiled.fragment.find("ivec3(0,0,0))")!=std::string::npos,"4-bit offsets are masked");
+    check(tiled.fragment.find("textureGrad(uGxTexture3,")!=std::string::npos &&
+          tiled.fragment.find("dFdx((gx_tex1.xy/gx_tex1.z)*uGxCoordinateScale[0])")!=std::string::npos,
+          "LOD derivatives come from the unmodified coordinate");
+    f.bp(0x10,0x0da278);
+    const auto biased_capture=f.capture(); const auto biased_plan=plan_gles_draw(packet(biased_capture));
+    const auto& biased=pipeline(biased_plan);
+    check(biased.fragment.find("ivec3(-1,-1,-1))")!=std::string::npos && biased.key!=tiled.key,"small-format bias adds one");
+    f.bp(0x10,0x05a204);
+    const auto plain=f.capture();
+    const auto plain_plan=plan_gles_draw(packet(plain)); const auto& plain_gpu=pipeline(plain_plan);
+    check(packet(plain).indirect->stages[0].format==1 && packet(plain).indirect->stages[0].lod_unmodified==0 &&
+          plain_gpu.fragment.find("textureGrad")==std::string::npos &&
+          plain_gpu.fragment.find("indirectSample0&ivec4(31)")!=std::string::npos,"5-bit offsets with derived LOD");
+    for(unsigned effect:{128u,256u,1u<<20}) {
+        f.bp(0x10,0x0da208|effect);
+        check(!f.capture(),"bump alpha and feedback stay unsupported");
     }
 }
 
@@ -276,7 +328,7 @@ void indirect_lookup_and_offsets() {
     f.bp(0x10,0x270);
     f.bp(0,0x50012); check(!f.capture(),"more than four indirect lookups rejected");
     f.bp(0,0x10012);
-    for (const auto extra : {4u,128u,7u<<13,7u<<16,1u<<19,1u<<20}) {
+    for (const auto extra : {128u,256u,7u<<13,7u<<16,1u<<20}) {
         f.bp(0x10,0x270|extra); check(!f.capture(),"unimplemented indirect effects fail explicitly");
     }
     // Wrapping keeps the regular coordinate modulo 256..16 texels, or drops it (GX_ITW_0).
@@ -647,7 +699,7 @@ int main(int argc, char** argv) {
         direct_parity_cases();
         fast_program_rebuilds();
         disabled_lookup_draws();
-        clipped_texture_projection(); clip_disabled_draws(); offscreen_clip_disabled_draws(); clip_disabled_depth(); deferred_shader_source(); mipmap_lod_controls(); perspective_integration(); inactive_indirect_inputs(); indirect_lookup_and_offsets(); rgb8_full_replacement(); rgb8_alpha_update(); rgba6_fetch_boundary(); depth_shader_order(); routing_ownership_and_keys(); automatic_repeat_coordinates(); shared_maps_and_dead_inputs(); rejection_and_limits();
+        clipped_texture_projection(); clip_disabled_draws(); offscreen_clip_disabled_draws(); clip_disabled_depth(); deferred_shader_source(); mipmap_lod_controls(); perspective_integration(); inactive_indirect_inputs(); indirect_formats_and_lod(); indirect_lookup_and_offsets(); rgb8_full_replacement(); rgb8_alpha_update(); rgba6_fetch_boundary(); depth_shader_order(); routing_ownership_and_keys(); automatic_repeat_coordinates(); shared_maps_and_dead_inputs(); rejection_and_limits();
         if (argc == 2) {
             Fixture f; const auto c = f.capture(); const auto p = plan_gles_draw(packet(c));
             std::ofstream(std::string(argv[1]) + ".vert") << pipeline(p).vertex;

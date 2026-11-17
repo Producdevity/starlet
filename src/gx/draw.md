@@ -70,16 +70,19 @@ Indirect lookups now own their texture images alongside regular lookups, within
 one draw budget. Static two-row matrices decode signed11 coefficients and the
 five-bit exponent (the third column's upper scale bit, bit 23, is ignored, as
 Dolphin's register layout has it); matrix values stay uniforms. Lookup routing, bias and coordinate
-downshifts form shader identity. The implemented domain uses eight-bit ABG
-samples, optional per-component signed bias, and S17.7 offset arithmetic.
+downshifts form shader identity. The implemented domain uses ABG samples in the
+8-bit format with an optional -128 bias per component, or the low 5, 4 or 3 bits
+(GX_ITF_5/4/3) with an optional +1 bias, and S17.7 offset arithmetic. With the
+LOD bit (GXSetTevIndirect's utc_lod, bit 19), the regular texture's LOD comes
+from the coordinate before wrapping and offset (Mario Party 4's tiled sprites).
 Wrap modes apply to the stage's regular S17.7 coordinate before the offset is
 added: modulo 256, 128, 64, 32 or 16 texels, or zero (GX_ITW_0, which the
 depth-of-field blur uses to look up a ramp by depth alone). Feedback, dynamic
 matrices and bump-alpha modes fail with an error.
 The ordinary sampler filters apply to the indirect image too, and one map may serve
 regular and indirect lookups in the same draw. Matrix-off stages without wrapping,
-feedback, LOD changes or bump alpha remain direct lookups regardless of their
-unused indirect selector, format and bias bits; matrix-off stages that wrap take
+feedback or bump alpha remain direct lookups regardless of their
+unused indirect selector, format, bias and LOD bits; matrix-off stages that wrap take
 the S17.7 path with a zero offset. A stage selecting an indirect stage beyond the
 enabled count is undefined on the console; it adds no offset and keeps its wraps.
 

@@ -311,7 +311,8 @@ GlesDrawResult plan_gles_draw(const DrawPacket& packet, FramebufferFetch fetch, 
     p.key.push_back(packet.indirect->lookup_mask);
     for (unsigned i = 0; i < packet.tev->pipeline.stage_count; ++i) {
         const auto& stage = packet.indirect->stages[i];
-        p.key.insert(p.key.end(), {stage.matrix, stage.lookup, stage.bias});
+        p.key.insert(p.key.end(), {stage.matrix, stage.lookup,
+                                   static_cast<std::uint8_t>(stage.bias | stage.format << 3 | stage.lod_unmodified << 5)});
     }
     if (packet.indirect->lookup_mask & ~15u) return reject("invalid indirect lookup mask");
     for (unsigned i = 0; i < 4; ++i) if (packet.indirect->lookup_mask & (1u << i)) {
@@ -474,15 +475,25 @@ std::string gles_fragment_source(const TevPipeline& tev_pipeline, const std::str
                 << ".xy/gx_tex" << unsigned(stage.texture_coord) << ".z)*uGxCoordinateScale[" << i
                 << "]*uGxImageSize[" << i << "]*128.0);\n";
             if (stage_indirect.matrix)
-                fragment << "    ivec2 offset" << i << "=gxIndirectOffset(indirectSample" << unsigned(stage_indirect.lookup)
+                fragment << "    ivec2 offset" << i << "=gxIndirectOffset("
+                    << indirect_sample_glsl(stage_indirect, "indirectSample" + std::to_string(unsigned(stage_indirect.lookup)))
                     << ",uGxIndirectRows[" << (stage_indirect.matrix-1)*2 << "],uGxIndirectRows["
-                    << (stage_indirect.matrix-1)*2+1 << "],ivec3(" << ((stage_indirect.bias&1)?128:0) << ","
-                    << ((stage_indirect.bias&2)?128:0) << "," << ((stage_indirect.bias&4)?128:0) << "));\n";
+                    << (stage_indirect.matrix-1)*2+1 << "]," << indirect_bias_glsl(stage_indirect) << ");\n";
             else fragment << "    ivec2 offset" << i << "=ivec2(0);\n";
+            const auto uv = "vec2(fixed" + std::to_string(i) + ")/(128.0*uGxImageSize[" + std::to_string(i) + "])";
+            auto sampled = sample_expression(stage.texture_map, uv);
+            if (stage_indirect.lod_unmodified) {
+                const auto map = std::to_string(unsigned(stage.texture_map));
+                const auto unmodified = "(gx_tex" + std::to_string(stage.texture_coord) + ".xy/gx_tex" + std::to_string(stage.texture_coord) +
+                    ".z)*uGxCoordinateScale[" + std::to_string(i) + "]";
+                sampled = (mip_maps & (1u << stage.texture_map))
+                    ? "textureLod(uGxTexture" + map + "," + uv + ",gxTextureLod(dFdx(" + unmodified + "*vec2(textureSize(uGxTexture" + map +
+                          ",0))),dFdy(" + unmodified + "*vec2(textureSize(uGxTexture" + map + ",0))),uGxSamplerLod[" + map + "]))"
+                    : "textureGrad(uGxTexture" + map + "," + uv + ",dFdx(" + unmodified + "),dFdy(" + unmodified + "))";
+            }
             fragment << "    ivec2 fixed" << i << "=(" << indirect_wrap_glsl(stage_indirect, "base" + std::to_string(i)) << "+offset" << i << ")&ivec2(0xffffff);\n"
                 << "    fixed" << i << "=(fixed" << i << "&ivec2(0x7fffff))-(fixed" << i << "&ivec2(0x800000));\n"
-                << "    samples[" << i << "]=gxQuantize(" << sample_expression(stage.texture_map,
-                    "vec2(fixed" + std::to_string(i) + ")/(128.0*uGxImageSize[" + std::to_string(i) + "])") << ");\n";
+                << "    samples[" << i << "]=gxQuantize(" << sampled << ");\n";
         } else {
             fragment << "    samples[" << i << "]=gxQuantize(" << sample_expression(stage.texture_map,
                 "(gx_tex" + std::to_string(stage.texture_coord) + ".xy/gx_tex" + std::to_string(stage.texture_coord) +
