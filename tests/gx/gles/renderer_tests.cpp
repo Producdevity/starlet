@@ -55,6 +55,7 @@ extern GLint uniform_alignment;
 extern GLsizeiptr element_bytes;
 extern std::vector<std::string> shader_sources;
 extern std::vector<GLenum> invalidated;
+extern unsigned scissored_clears;
 extern GLenum depth_func;
 extern GLboolean depth_mask, depth_test;
 extern unsigned texture_copies;
@@ -365,8 +366,11 @@ void rgb8_replacement_boundary() {
 }
 void clear_boundary() {
     GlesRenderer renderer; EfbClear clear; clear.rectangle={0,0,640,456};
-    const auto count=fake::clears;renderer.clear_efb(clear);
+    const auto count=fake::clears, scissored=fake::scissored_clears;renderer.clear_efb(clear);
     check(fake::clears==count+1,"native clear reaches GPU even when only depth is written");
+    check(fake::scissored_clears==scissored,"a clear of the whole EFB runs without a scissor test");
+    clear.rectangle={0,0,608,456};renderer.clear_efb(clear);
+    check(fake::scissored_clears==scissored+1,"a partial clear keeps its scissor");
     clear.rectangle={639,455,2,1};rejects([&]{renderer.clear_efb(clear);},"invalid clear extent rejected");
     clear.rectangle={0,0,640,456};renderer.clear_efb(clear);
     clear.rgba6=true;clear.alpha_write=true;clear.color_write=true;renderer.clear_efb(clear);

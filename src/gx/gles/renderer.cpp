@@ -2032,12 +2032,14 @@ void GlesRenderer::Impl::clear_efb_gl(const EfbClear& operation) {
     auto& g = *this;
     const auto& r = operation.rectangle;
     const bool format_change = operation.rgba6 != g.rgba6;
-    const bool replaces_color = !r.x && !r.y && r.width==efb_width && r.height==efb_height &&
-        operation.color_write && (!operation.rgba6 || operation.alpha_write);
+    const bool whole = !r.x && !r.y && r.width==efb_width && r.height==efb_height;
+    const bool replaces_color = whole && operation.color_write && (!operation.rgba6 || operation.alpha_write);
     try {
         if (!replaces_color) g.reinterpret_format(operation.rgba6);
         glBindFramebuffer(GL_FRAMEBUFFER,g.framebuffer);
-        glViewport(0,0,efb_width,efb_height); glEnable(GL_SCISSOR_TEST); glScissor(r.x,r.y,r.width,r.height);
+        glViewport(0,0,efb_width,efb_height); glScissor(r.x,r.y,r.width,r.height);
+        // Mali's r20p0 driver clears under a scissor test with a draw that loads the rest of the pass first.
+        if (whole) glDisable(GL_SCISSOR_TEST); else glEnable(GL_SCISSOR_TEST);
         glDisable(GL_DITHER); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDepthMask(operation.depth_write);
         glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE); glDisable(GL_RASTERIZER_DISCARD);
         glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE); glDisable(GL_SAMPLE_COVERAGE);
@@ -2051,7 +2053,7 @@ void GlesRenderer::Impl::clear_efb_gl(const EfbClear& operation) {
             const auto& c=operation.tile[0];glClearColor(c[0]/255.0f,c[1]/255.0f,c[2]/255.0f,c[3]/255.0f);
             glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
             if (s.width && s.height) {
-                glBindFramebuffer(GL_FRAMEBUFFER,g.strip_framebuffer); glScissor(s.x,s.y,s.width,s.height);
+                glBindFramebuffer(GL_FRAMEBUFFER,g.strip_framebuffer); glEnable(GL_SCISSOR_TEST); glScissor(s.x,s.y,s.width,s.height);
                 glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT); glBindFramebuffer(GL_FRAMEBUFFER,g.framebuffer);
             }
             gl_check("MainLoop constant EFB clear");g.rgba6=operation.rgba6;return;

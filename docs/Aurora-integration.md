@@ -229,7 +229,8 @@ Other GPUs and other Aurora games are untested.
   private address range and storage: copies never write game memory or overlap. A display copy
   (BP `0x52` bit 14) has no destination of its own and is not planned, since the frame is presented
   from the EFB. Aurora clears colour, alpha and depth to the copy-clear values when a frame begins,
-  whatever the update masks, and the game relies on it.
+  whatever the update masks, and the game relies on it. The bridge clears the EFB's full 640 columns,
+  past a narrower frame: nothing draws or reads them, and a whole-EFB clear needs no scissor.
 - Offscreen passes. `GXCreateFrameBuffer` stands in for `GXSetViewport(0, 0, w, h, 0, 1)` and
   `GXSetScissor(0, 0, w, h)`; `GXRestoreFrameBuffer` puts back the frame's viewport and scissor.
   Draws and copies between them use a separate cleared target and leave the EFB as it was.

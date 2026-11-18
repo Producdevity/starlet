@@ -307,10 +307,11 @@ struct Backend {
   }
 
   // Aurora's GXCopyDisp does not run; Aurora clears colour, alpha and depth to the copy-clear
-  // values when a frame begins, whatever the update masks, and the game relies on it.
+  // values when a frame begins, whatever the update masks, and the game relies on it. Nothing
+  // draws or reads the EFB's columns right of the frame, so the clear covers them too.
   void clear_efb() {
     try {
-      auto clear = starlet::gx::plan_copy_clear(decoder.state(), {0, 0, frame_width, efb.height});
+      auto clear = starlet::gx::plan_copy_clear(decoder.state(), {0, 0, starlet::gx::EfbLayout::width, efb.height});
       clear.color_write = true;
       clear.alpha_write = clear.rgba6;
       clear.depth_write = true;
