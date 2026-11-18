@@ -256,7 +256,8 @@ from the Super Mario Galaxy port's platform layer. Malformed input throws `starl
   `starlet::os`). `THPVideoDecode` gets no frame length, as in the SDK: the frame ends with its
   scan, bounded at 4 MiB. It reports the planes it writes with `before_dma_write` and
   `report_cpu_write`, because the SDK's locked-cache DMA bypassed the data cache and GX texture
-  caches must see the new frame.
+  caches must see the new frame. The decoder keeps its tables and planes in host memory: it
+  outlives the game heap current at the call.
 
 ## Compat and SDK headers
 

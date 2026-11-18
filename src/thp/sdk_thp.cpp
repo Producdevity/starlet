@@ -1,12 +1,16 @@
 // The SDK's THPInit, THPVideoDecode and THPAudioDecode on starlet::thp, for ports whose player is
 // the SDK's. Frames and audio records are as read from the disc.
+#include "starlet/os/host_allocation.hpp"
 #include "starlet/os/os_core.hpp"
 #include "starlet/thp/thp.hpp"
 #include <cstdio>
 
 namespace {
 constexpr std::size_t packet_limit = 4 * 1024 * 1024;
+// The decoder outlives the game heaps current when guest threads call in, so its tables and planes
+// take host memory.
 starlet::thp::VideoDecoder* decoder() {
+    starlet::os::host_allocation_scope host;
     static starlet::thp::VideoDecoder instance;
     return &instance;
 }
@@ -29,6 +33,7 @@ starlet::sdk::s32 THPVideoDecode(void* file, void* tileY, void* tileU, void* til
     starlet::os::before_dma_write(tileU, luma / 4);
     starlet::os::before_dma_write(tileV, luma / 4);
     try {
+        starlet::os::host_allocation_scope host;
         decoder()->decode(frame, packet_limit, width, height,
                           {{{static_cast<std::uint8_t*>(tileY), luma},
                             {static_cast<std::uint8_t*>(tileU), luma / 4},

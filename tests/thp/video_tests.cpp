@@ -1,5 +1,6 @@
 #include "api.hpp"
 #ifdef STARLET_THP_SDK_TESTS
+#include "starlet/os/host_allocation.hpp"
 #include "starlet/os/os_core.hpp"
 #endif
 #include <algorithm>
@@ -326,6 +327,33 @@ void synthetic() {
 } // namespace
 #ifdef STARLET_THP_SDK_TESTS
 std::vector<std::pair<const void *, std::size_t>> reported;
+std::size_t game_heap_allocations = 0;
+
+// Guest threads allocate from the game's current heap, which the game frees and reuses (a section
+// heap in Pikmin 2). The decoder outlives it: making and growing it on a guest thread takes none.
+void sdk_decoder_takes_host_memory() {
+    Frame frame{64, 32};
+    for (int i = 0; i < 48; ++i)
+        frame.blocks.push_back(detailed(i * 5 - 90, 1));
+    auto bytes = encode(frame);
+    bytes.resize(bytes.size() + 65536);
+    std::vector<std::uint8_t> y(64 * 32), u(32 * 16), v(32 * 16), work(64);
+    starlet::os::GameHeap heap;
+    heap.ready = [] { return true; };
+    heap.allocate = [](std::size_t size) {
+        ++game_heap_allocations;
+        return std::malloc(size);
+    };
+    heap.release = [](void *pointer) { std::free(pointer); };
+    starlet::os::set_game_heap(heap);
+    starlet::os::set_guest_allocation(true);
+    const bool initialized = THPInit() != 0;
+    const bool decoded = THPVideoDecode(bytes.data(), y.data(), u.data(), v.data(), work.data()) == 0;
+    starlet::os::set_guest_allocation(false);
+    starlet::os::set_game_heap({});
+    check(initialized && decoded, "THPInit or THPVideoDecode failed on a guest thread");
+    check(game_heap_allocations == 0, "the THP decoder took memory from the game's heap");
+}
 
 // THPVideoDecode reports the planes it wrote, as the SDK's DMA bypassed the data cache, and
 // nothing when it decodes no frame.
@@ -355,6 +383,7 @@ int main() {
         bounds();
         synthetic();
 #ifdef STARLET_THP_SDK_TESTS
+        sdk_decoder_takes_host_memory();
         sdk_reports_planes();
 #endif
         std::puts("THP video: bounds and synthetic frames passed");
