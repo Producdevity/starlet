@@ -1644,7 +1644,8 @@ void main(){
 #endif
 #endif
  int alpha=RGBA6!=0?c.a:255;const int f=FORMAT;ivec4 d;
- if(f==3||f==11||f==12){int i=f==12?c.g:c.r;d=ivec4(i,i,i,f==3?alpha:(f==11?c.g:c.b));}
+ if(f==0){int v=((257*c.r+504*c.g+98*c.b+16000)/1000>>4)*17;d=ivec4(v);}
+ else if(f==3||f==11||f==12){int i=f==12?c.g:c.r;d=ivec4(i,i,i,f==3?alpha:(f==11?c.g:c.b));}
  else if(f==1||f>=7){int v=f==7?alpha:(LUMINANCE!=0?(257*c.r+504*c.g+98*c.b+16000)/1000:(f==1?c.r:c[clamp(f-8,0,2)]));d=ivec4(v);}
  else if(f==4)d=ivec4(e5(c.r>>3),e6(c.g>>2),e5(c.b>>3),255);
  else if(f==5){if(alpha>=224)d=ivec4(e5(c.r>>3),e5(c.g>>3),e5(c.b>>3),255);else{int a=alpha>>5;d=ivec4(e4(c.r>>4),e4(c.g>>4),e4(c.b>>4),(a<<5)|(a<<2)|(a>>1));}}

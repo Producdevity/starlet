@@ -1448,7 +1448,7 @@ struct GlesDirect::Impl {
         for (auto it : found) {
             const auto& c = it->second;
             const auto& p = c.plan;
-            const unsigned tile_width = d.format == TextureFormat::i8 ? 8 : 4, tile_bytes = d.format == TextureFormat::rgba8 ? 64 : 32;
+            const unsigned tile_width = d.format == TextureFormat::i8 || d.format == TextureFormat::i4 ? 8 : 4, tile_bytes = d.format == TextureFormat::rgba8 ? 64 : 32;
             std::string why;
             if (found.size() != 1) why += "several-copies ";
             if (it->first != d.address) why += "address ";
@@ -1491,7 +1491,7 @@ struct GlesDirect::Impl {
         if (found.size() == 1 && !older) {
             const auto& c = found[0]->second;
             const auto& p = c.plan;
-            const unsigned tile_width = d.format == TextureFormat::i8 ? 8 : 4, tile_bytes = d.format == TextureFormat::rgba8 ? 64 : 32;
+            const unsigned tile_width = d.format == TextureFormat::i8 || d.format == TextureFormat::i4 ? 8 : 4, tile_bytes = d.format == TextureFormat::rgba8 ? 64 : 32;
             const unsigned width = p.destination_width(), height = p.destination_height();
             // With the copy's stride, texel (x, y) of a lookup no larger than the copy is the copy's texel (x, y).
             if (found[0]->first == d.address && levels == 1 && static_cast<unsigned>(d.format) == texture_copy_sample_format(p) &&

@@ -97,14 +97,14 @@ void copy_tail() {
 void formats() {
     std::mt19937 random(7);
     unsigned cases = 0;
-    for (unsigned format : {1u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 12u}) for (unsigned variant = 0; variant < 3; ++variant)
+    for (unsigned format : {0u, 1u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 12u}) for (unsigned variant = 0; variant < 3; ++variant)
     for (bool half : {false, true}) for (bool rgba6 : {false, true}) {
         const bool depth_format = format == 1 || format == 3 || format == 6 || (format >= 8 && format <= 12);
         TextureCopy p;
         p.format = format; p.half_scale = half; p.rgba6 = rgba6;
-        p.luminance = format == 1 && variant != 2; p.depth = depth_format && variant == 2;
+        p.luminance = format == 0 || (format == 1 && variant != 2); p.depth = depth_format && variant == 2;
         p.x = 8; p.y = 4; p.width = 24 + 8 * variant; p.height = 12 + 4 * variant;
-        const auto tile_bytes = format == 6 ? 64u : 32u, tile_width = format == 1 || (format >= 7 && format <= 10) ? 8u : 4u;
+        const auto tile_bytes = format == 6 ? 64u : 32u, tile_width = format <= 1 || (format >= 7 && format <= 10) ? 8u : 4u;
         p.stride = ((p.destination_width() + tile_width - 1) / tile_width) * tile_bytes + 32 * variant;
         std::vector<std::uint8_t> rgba(std::size_t(p.width) * p.height * 4);
         for (auto& v : rgba) v = static_cast<std::uint8_t>(random());
@@ -127,7 +127,7 @@ void formats() {
             require(sample(p, {encoded, encoded + capacity}) == decoded, name + ": decoded texels differ from texture sampling");
         ++cases;
     }
-    require(cases == 132, "case count");
+    require(cases == 144, "case count");
 }
 // Twilight Princess's half-size depth copy for depth of field and heat haze: GX_TF_Z16 from an RGBA6 EFB.
 void z16_plan() {

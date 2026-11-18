@@ -7,8 +7,11 @@
 
 namespace starlet::gx {
 namespace {
-// Copy formats 3, 11 and 12 store two bytes per texel in 4x4 tiles; 1 and 7..10 one byte in 8x4.
-unsigned copy_tile_width(unsigned format) { return format == 1 || (format >= 7 && format <= 10) ? 8u : 4u; }
+// Copy formats 3, 11 and 12 store two bytes per texel in 4x4 tiles; 1 and 7..10 one byte in 8x4;
+// 0 (I4) four bits in 8x8.
+unsigned copy_tile_width(unsigned format) { return format <= 1 || (format >= 7 && format <= 10) ? 8u : 4u; }
+unsigned copy_tile_rows(unsigned format) { return format == 0 ? 8u : 4u; }
+unsigned intensity(const std::array<unsigned, 4>& c) { return (257 * c[0] + 504 * c[1] + 98 * c[2] + 16000) / 1000; }
 bool two_channel(unsigned format) { return format == 3 || format == 11 || format == 12; }
 // Depth copies split Z into high, middle and low bytes and encode them as R, G and B.
 bool depth_format(unsigned format) { return format == 1 || format == 3 || format == 6 || (format >= 8 && format <= 12); }
@@ -23,14 +26,15 @@ std::size_t texture_copy_bytes(const TextureCopy& p) {
         p.width > efb_width-p.x || p.height > end_row-p.y || width <= 0 || height <= 0 ||
         (p.strip && (p.depth || p.filtered() || p.clear)) ||
         (p.half_scale && ((p.width & 1) || (p.height & 1))) ||
-        (p.format != 1 && (p.format < 3 || p.format > 12)) || (p.depth && !depth_format(p.format)) ||
-        (p.format == 1 && !p.depth && !p.luminance) ||
-        (p.luminance && (p.depth || p.format != 1)) || (p.stride & 31) ||
+        (p.format > 1 && (p.format < 3 || p.format > 12)) || (p.depth && !depth_format(p.format)) ||
+        (p.format <= 1 && !p.depth && !p.luminance) ||
+        (p.luminance && (p.depth || p.format > 1)) || (p.stride & 31) ||
         p.stride < std::size_t((width+tile_width-1)/tile_width)*tile_bytes || p.stride > 1023*32)
         throw std::invalid_argument("invalid native texture-copy format="+std::to_string(p.format)+
             " rect="+std::to_string(p.x)+","+std::to_string(p.y)+","+std::to_string(p.width)+","+std::to_string(p.height)+
             " stride="+std::to_string(p.stride));
-    return std::size_t((height+3)/4-1)*p.stride+std::size_t((width+tile_width-1)/tile_width)*tile_bytes;
+    const auto rows = copy_tile_rows(p.format);
+    return std::size_t((height+rows-1)/rows-1)*p.stride+std::size_t((width+tile_width-1)/tile_width)*tile_bytes;
 }
 TextureCopy plan_texture_copy(const State& state, TextureCopyRegisters r, bool clear) {
     constexpr std::uint32_t allowed = 3u | 0x78u | 0x200u | 0x800u | 0x18000u | 0xff000000u;
@@ -40,7 +44,7 @@ TextureCopy plan_texture_copy(const State& state, TextureCopyRegisters r, bool c
     if ((r.source >> 24) != 0x49 || (r.size >> 24) != 0x4a || (r.stride >> 24) != 0x4d ||
         (r.source & 0x00f00000) || (r.size & 0x00f00000) || (r.stride & 0x00fffc00) ||
         (r.command & ~allowed) || (id && id != 0x52) ||
-        (conversion != 2 && conversion != 3) || (conversion == 3 && (r.depth || format != 1)) ||
+        (conversion != 2 && conversion != 3) || (conversion == 3 && (r.depth || format > 1)) ||
         (r.depth && !depth_format(format)) || (state.bp(0) & (1u<<9)) || (state.bp(0x43) & 0x38) ||
         ((state.bp(0x43) & 7) > 1 && !(r.depth && (state.bp(0x43) & 7) == 3)))
         throw std::runtime_error("unsupported native texture-copy AA/depth/scale/field/conversion");
@@ -130,9 +134,14 @@ void encode_texture_copy(const TextureCopy& p, ByteView rgba, std::uint8_t* dest
                 c[channel] = (c[channel]+source[4+channel]+next[channel]+next[4+channel])/4;
         }
         const unsigned alpha = p.rgba6 ? c[3] : 255;
-        auto* tile = destination+std::size_t(y/4)*p.stride+std::size_t(x/tile_width)*tile_bytes;
-        const auto pixel = (y&3)*tile_width+(x%tile_width);
-        if (two_channel(p.format)) {
+        const auto rows = copy_tile_rows(p.format);
+        auto* tile = destination+std::size_t(y/rows)*p.stride+std::size_t(x/tile_width)*tile_bytes;
+        const auto pixel = (y%rows)*tile_width+(x%tile_width);
+        if (p.format == 0) {
+            const unsigned v = intensity(c) >> 4;
+            auto& b = tile[pixel/2];
+            b = pixel & 1 ? (b & 0xf0) | v : (b & 0x0f) | (v << 4);
+        } else if (two_channel(p.format)) {
             tile[pixel*2] = p.format == 3 ? alpha : c[p.format == 11 ? 1 : 2];
             tile[pixel*2+1] = c[p.format == 12 ? 1 : 0];
         } else if (p.format == 1 || p.format >= 8) {
@@ -150,6 +159,7 @@ void encode_texture_copy(const TextureCopy& p, ByteView rgba, std::uint8_t* dest
     }
 }
 unsigned texture_copy_sample_format(const TextureCopy& p) {
+    if (p.format == 0) return 0;
     return p.format == 4 || p.format == 5 || p.format == 6 ? p.format : two_channel(p.format) ? 3 : 1;
 }
 bool texture_copy_extends(const TextureCopy& p, const TextureDescriptor& d, unsigned levels) {
@@ -177,9 +187,9 @@ namespace {
 unsigned expand(unsigned value, unsigned bits) { return bits == 4 ? value * 17 : bits == 5 ? (value << 3) | (value >> 2) : (value << 2) | (value >> 4); }
 std::size_t tile_offset(const TextureCopy& p, int x, int y, unsigned& pixel) {
     const auto tile_bytes = p.format == 6 ? 64u : 32u;
-    const auto tile_width = copy_tile_width(p.format);
-    pixel = (y & 3) * tile_width + (x % tile_width);
-    return std::size_t(y / 4) * p.stride + std::size_t(x / tile_width) * tile_bytes;
+    const auto tile_width = copy_tile_width(p.format), rows = copy_tile_rows(p.format);
+    pixel = (y % rows) * tile_width + (x % tile_width);
+    return std::size_t(y / rows) * p.stride + std::size_t(x / tile_width) * tile_bytes;
 }
 }
 std::vector<std::uint8_t> decode_texture_copy(const TextureCopy& p, ByteView rgba) {
@@ -198,7 +208,10 @@ std::vector<std::uint8_t> decode_texture_copy(const TextureCopy& p, ByteView rgb
         }
         const unsigned alpha = p.rgba6 ? c[3] : 255;
         std::array<unsigned, 4> d{};
-        if (two_channel(p.format)) {
+        if (p.format == 0) {
+            const unsigned v = (intensity(c) >> 4) * 17;
+            d = {{v, v, v, v}};
+        } else if (two_channel(p.format)) {
             const unsigned i = c[p.format == 12 ? 1 : 0], a = p.format == 3 ? alpha : c[p.format == 11 ? 1 : 2];
             d = {{i, i, i, a}};
         } else if (p.format == 1 || p.format >= 7) {
@@ -229,7 +242,10 @@ void store_texture_copy(const TextureCopy& p, ByteView decoded, std::uint8_t* de
         const auto* d = decoded.data + (std::size_t(y) * width + x) * 4;
         unsigned pixel = 0;
         auto* tile = destination + tile_offset(p, x, y, pixel);
-        if (two_channel(p.format)) { tile[pixel * 2] = d[3]; tile[pixel * 2 + 1] = d[0]; }
+        if (p.format == 0) {
+            auto& b = tile[pixel / 2];
+            b = pixel & 1 ? (b & 0xf0) | (d[0] >> 4) : (b & 0x0f) | ((d[0] >> 4) << 4);
+        } else if (two_channel(p.format)) { tile[pixel * 2] = d[3]; tile[pixel * 2 + 1] = d[0]; }
         else if (p.format == 1 || p.format >= 7) tile[pixel] = d[0];
         else if (p.format == 6) {
             tile[pixel * 2] = d[3]; tile[pixel * 2 + 1] = d[0];
