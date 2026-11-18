@@ -1598,22 +1598,36 @@ ivec4 efb(int x,int y){
 #endif
 }
 // The vertical filter weighs each source row with its neighbours before any reduction.
+ivec4 weigh(ivec4 above,ivec4 c,ivec4 below){
+ ivec3 v=((above.rgb*uFilter.x+c.rgb*uFilter.y+below.rgb*uFilter.z)>>6)&0x1ff;
+ return ivec4(min(v,ivec3(255)),c.a);
+}
 ivec4 source(int x,int y){
  ivec4 c=efb(x,y);
 #if FILTER
- ivec3 v=((efb(x,clamp(y-1,uRows.x,uRows.y)).rgb*uFilter.x+c.rgb*uFilter.y+efb(x,clamp(y+1,uRows.x,uRows.y)).rgb*uFilter.z)>>6)&0x1ff;
- c=ivec4(min(v,ivec3(255)),c.a);
+ c=weigh(efb(x,clamp(y-1,uRows.x,uRows.y)),c,efb(x,clamp(y+1,uRows.x,uRows.y)));
 #endif
  return c;
 }
+#if HALF && FILTER
+// Rows y and y+1 lie in the copied rectangle, inside uRows: their filters share two texels.
+ivec4 pair(int x,int y){
+ ivec4 a=efb(x,clamp(y-1,uRows.x,uRows.y)),b=efb(x,y),c=efb(x,y+1),d=efb(x,clamp(y+2,uRows.x,uRows.y));
+ return weigh(a,b,c)+weigh(b,c,d);
+}
+#endif
 int e4(int v){return v*17;}
 int e5(int v){return (v<<3)|(v>>2);}
 int e6(int v){return (v<<2)|(v>>4);}
 void main(){
  ivec2 o=ivec2(gl_FragCoord.xy);int x=uRect.x+o.x*(HALF+1);int y=uRect.y+o.y*(HALF+1);
+#if HALF && FILTER
+ ivec4 c=(pair(x,y)+pair(x+1,y))/4;
+#else
  ivec4 c=source(x,y);
 #if HALF
  c=(c+source(x+1,y)+source(x,y+1)+source(x+1,y+1))/4;
+#endif
 #endif
  int alpha=RGBA6!=0?c.a:255;const int f=FORMAT;ivec4 d;
  if(f==3||f==11||f==12){int i=f==12?c.g:c.r;d=ivec4(i,i,i,f==3?alpha:(f==11?c.g:c.b));}
