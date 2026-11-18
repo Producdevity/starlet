@@ -22,7 +22,11 @@ add_library(starlet_gx STATIC
     sync_stats.cpp
 )
 add_library(starlet::gx ALIAS starlet_gx)
-target_include_directories(starlet_gx PUBLIC "${PROJECT_SOURCE_DIR}/include")
+if(STARLET_GX_TRACE)
+    target_sources(starlet_gx PRIVATE trace/recorder.cpp trace/access.cpp)
+    target_compile_definitions(starlet_gx PUBLIC STARLET_GX_TRACE=1)
+endif()
+target_include_directories(starlet_gx PUBLIC "${PROJECT_SOURCE_DIR}/include" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(starlet_gx PUBLIC cxx_std_17)
 set_target_properties(starlet_gx PROPERTIES CXX_EXTENSIONS OFF)
 
@@ -41,7 +45,7 @@ if(STARLET_GLES_INCLUDE_DIR)
         gles/program_cache.cpp
         gles/program_list.cpp
     )
-    target_include_directories(starlet_gx_gles_objects PRIVATE "${STARLET_GLES_INCLUDE_DIR}")
+    target_include_directories(starlet_gx_gles_objects PRIVATE "${STARLET_GLES_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(starlet_gx_gles_objects PUBLIC starlet_gx Threads::Threads ${CMAKE_DL_LIBS})
 endif()
 if(STARLET_GLES)

@@ -9,6 +9,10 @@
 
 namespace starlet::gx {
 
+#if defined(STARLET_GX_TRACE)
+namespace trace { struct DecoderTap; }
+#endif
+
 struct MemoryArrayView {
     ByteView bytes;
     // Zero means canonical GX bytes; 2/4 mean native-endian words of that width.
@@ -178,6 +182,7 @@ public:
     Status load_tlut(std::uint32_t control, ByteView palette);
 
 private:
+    friend struct TraceAccess;
     struct Budget { std::size_t commands = 0; std::size_t bytes = 0; };
     enum class Parse { complete, incomplete, failed };
     Parse command(ByteView input, std::size_t& consumed, unsigned depth, Budget& budget);
@@ -196,6 +201,10 @@ private:
     bool read_memory(std::uint32_t address, std::uint8_t* destination, std::size_t size);
     bool fail(Error error, const char* message);
     void latch_exception() noexcept;
+#if defined(STARLET_GX_TRACE)
+    // GX trace recording (STARLET_GX_TRACE): wraps memory and sink; declared first so they bind to it.
+    std::unique_ptr<trace::DecoderTap, void (*)(trace::DecoderTap*)> tap_;
+#endif
     State state_;
     MemoryReader& memory_;
     CommandSink& sink_;

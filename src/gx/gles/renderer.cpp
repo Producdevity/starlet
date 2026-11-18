@@ -1,6 +1,7 @@
 #include "starlet/gx/gles/renderer.hpp"
 #include "starlet/gx/efb_format.hpp"
 #include "starlet/gx/sync_stats.hpp"
+#include "trace/recorder.hpp"
 
 #include <GLES3/gl31.h>
 #if defined(__linux__)
@@ -1881,9 +1882,18 @@ void GlesRenderer::Impl::read_depth(int x, int y, int width, int height, std::ui
     glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
     gl_check("native D24 pixel query");
 }
+#if defined(STARLET_GX_TRACE)
+GlesRenderer::GlesRenderer(GlesLimits limits) : impl_(std::make_unique<Impl>(limits)) {
+    impl_->initialize(); clear({{0,0,0}});
+    trace::renderer_created(this, limits);
+}
+GlesRenderer::~GlesRenderer() { trace::renderer_destroyed(this); }
+#else
 GlesRenderer::GlesRenderer(GlesLimits limits) : impl_(std::make_unique<Impl>(limits)) { impl_->initialize(); clear({{0,0,0}}); }
 GlesRenderer::~GlesRenderer() = default;
+#endif
 void GlesRenderer::clear(std::array<std::uint8_t, 3> color) {
+    STARLET_GX_TRACE_RENDERER(clear, [&](trace::Encoder& e) { e.w.raw(color.data(), 3); });
     auto& g = *impl_; g.require_ready();
     ++g.efb_writes;
     try {
@@ -1895,6 +1905,7 @@ void GlesRenderer::clear(std::array<std::uint8_t, 3> color) {
     } catch (...) { g.failed = true; throw; }
 }
 void GlesRenderer::clear_efb(const EfbClear& operation) {
+    STARLET_GX_TRACE_RENDERER(clear_efb, [&](trace::Encoder& e) { trace::put(e.w, operation); });
     auto& g = *impl_; g.require_ready();
     ++g.efb_writes;
     const auto& r = operation.rectangle;
@@ -1911,6 +1922,7 @@ void GlesRenderer::clear_efb(const EfbClear& operation) {
     g.execute([&g, operation] { g.clear_efb_gl(operation); }, false);
 }
 void GlesRenderer::begin_offscreen() {
+    STARLET_GX_TRACE_RENDERER(begin_offscreen);
     auto& g = *impl_; g.require_ready();
     if (g.offscreen_open) throw std::logic_error("offscreen pass already open");
     if (g.bloom_open) throw std::logic_error("offscreen pass inside native bloom");
@@ -1919,6 +1931,7 @@ void GlesRenderer::begin_offscreen() {
     g.execute([&g] { g.begin_offscreen_gl(); }, false, true);
 }
 void GlesRenderer::end_offscreen() {
+    STARLET_GX_TRACE_RENDERER(end_offscreen);
     auto& g = *impl_; g.require_ready();
     if (!g.offscreen_open) throw std::logic_error("offscreen pass ended without begin");
     g.offscreen_open = false;
@@ -1958,6 +1971,7 @@ void GlesRenderer::Impl::begin_offscreen_gl() {
     gl_check("offscreen begin");
 }
 void GlesRenderer::begin_bloom() {
+    STARLET_GX_TRACE_RENDERER(begin_bloom);
     auto& g = *impl_; g.require_ready();
     if (g.bloom_open) throw std::logic_error("native bloom already open");
     if (g.offscreen_open) throw std::logic_error("native bloom inside an offscreen pass");
@@ -1965,6 +1979,7 @@ void GlesRenderer::begin_bloom() {
     g.execute([&g] { g.begin_bloom_gl(); }, false);
 }
 void GlesRenderer::end_bloom(const EfbBloom& bloom) {
+    STARLET_GX_TRACE_RENDERER(end_bloom, [&](trace::Encoder& e) { trace::put(e.w, bloom); });
     auto& g = *impl_; g.require_ready();
     if (!g.bloom_open) throw std::logic_error("native bloom ended without begin");
     g.bloom_open = false;
@@ -2140,6 +2155,7 @@ void GlesRenderer::Impl::clear_efb_now(const EfbClear& operation, bool waited) {
     } catch (...) { g.failed = true; throw; }
 }
 void GlesRenderer::draw_direct(const State& state, const Draw& command, MemoryReader& memory, TextureCmprModel cmpr) {
+    STARLET_GX_TRACE_RENDERER(draw_direct, [&](trace::Encoder& e) { e.w.u8(static_cast<std::uint8_t>(cmpr)); });
     auto& g = *impl_; g.check_owner();
     ++g.efb_writes;
     if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
@@ -2149,6 +2165,7 @@ void GlesRenderer::draw_direct(const State& state, const Draw& command, MemoryRe
     g.direct->draw(state, command, memory, cmpr);
 }
 void GlesRenderer::draw(const State& state, const Draw& command, MemoryReader& memory, TextureCmprModel cmpr) {
+    STARLET_GX_TRACE_RENDERER(draw, [&](trace::Encoder& e) { e.w.u8(static_cast<std::uint8_t>(cmpr)); });
     ++impl_->efb_writes;
     auto& g = *impl_; g.require_ready();
     if (command.merged()) throw std::invalid_argument("GX merged draws need draw_direct");
@@ -2234,6 +2251,7 @@ void GlesRenderer::Impl::submit(const DrawPacket& packet,const GlesDrawPipeline&
     } catch (...) { g.failed = true; throw; }
 }
 void GlesRenderer::draw(const DrawPacket& packet) {
+    STARLET_GX_TRACE_RENDERER(packet_draw);
     ++impl_->efb_writes;
     auto& g=*impl_;g.require_ready();
     if(packet.raster && packet.raster->efb!=g.limits.efb) throw std::invalid_argument("draw planned for another EFB layout");
@@ -2248,6 +2266,7 @@ void GlesRenderer::draw(const DrawPacket& packet) {
     g.submit(packet,p,vertices,packet.vertices->indices(),1);
 }
 void GlesRenderer::draw_batch(const DrawPacket* packets,std::size_t count) {
+    STARLET_GX_TRACE_RENDERER(packet_draw);
     ++impl_->efb_writes;
     auto& g=*impl_;g.require_ready();
     if(count>4096 || (!packets && count)) throw std::invalid_argument("invalid GLES draw batch span");
@@ -2290,6 +2309,7 @@ void GlesRenderer::draw_batch(const DrawPacket* packets,std::size_t count) {
 }
 
 void GlesRenderer::present(int width, int height) {
+    STARLET_GX_TRACE_RENDERER(present, [&](trace::Encoder& e) { e.w.i32(width); e.w.i32(height); });
     auto& g = *impl_; g.require_ready();
     if (width <= 0 || height <= 0) throw std::invalid_argument("invalid drawable extent");
     g.execute([&g, width, height] {
@@ -2304,6 +2324,7 @@ void GlesRenderer::present(int width, int height) {
     if (g.direct) g.direct->next_frame();
 }
 void GlesRenderer::copy_display(const DisplayCopy &p, std::uint8_t *destination, std::size_t capacity) {
+    STARLET_GX_TRACE_RENDERER(copy_display, [&](trace::Encoder& e) { trace::put(e.w, p); e.pointer(destination, display_copy_bytes(p)); e.w.u64(capacity); });
     ++impl_->efb_writes;
     auto &g = *impl_;
     g.require_ready();
@@ -2390,6 +2411,7 @@ void GlesRenderer::Impl::copy_display_gl(const DisplayCopy& p, std::uint8_t* des
     }
 }
 void GlesRenderer::copy_texture(const TextureCopy& p, std::uint8_t* destination, std::size_t capacity) {
+    STARLET_GX_TRACE_RENDERER(copy_texture, [&](trace::Encoder& e) { trace::put(e.w, p); e.pointer(destination, texture_copy_bytes(p)); e.w.u64(capacity); });
     ++impl_->efb_writes;
     auto& g = *impl_; g.require_ready();
     if (p.efb != g.limits.efb) throw std::invalid_argument("texture copy planned for another EFB layout");
@@ -2437,10 +2459,15 @@ void GlesRenderer::copy_texture(const TextureCopy& p, std::uint8_t* destination,
     } catch (...) { g.failed = true; throw; }
 }
 void GlesRenderer::copy_texture_resident(const TextureCopy& p, std::uint8_t* destination, std::size_t capacity, std::uint32_t token) {
+    STARLET_GX_TRACE_RENDERER(copy_known, [&](trace::Encoder& e) { trace::put(e.w, p); e.target(destination, texture_copy_bytes(p), token); e.w.u64(capacity); e.w.u32(token); e.w.u8(0); });
     copy_texture_known(p, destination, capacity, token, nullptr);
 }
 void GlesRenderer::copy_texture_known(const TextureCopy& p, std::uint8_t* destination, std::size_t capacity, std::uint32_t token,
                                       const std::uint8_t* contents) {
+    STARLET_GX_TRACE_RENDERER(copy_known, [&](trace::Encoder& e) {
+        trace::put(e.w, p); e.target(destination, texture_copy_bytes(p), token); e.w.u64(capacity); e.w.u32(token);
+        e.w.u8(contents != nullptr); if (contents) e.w.bytes(contents, texture_copy_bytes(p));
+    });
     ++impl_->efb_writes;
     auto& g = *impl_; g.check_owner();
     if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
@@ -2519,6 +2546,7 @@ void GlesRenderer::copy_texture_known(const TextureCopy& p, std::uint8_t* destin
     } catch (...) { g.failed = true; throw; }
 }
 void GlesRenderer::write_back(std::uint32_t token, std::size_t bytes, bool on) {
+    STARLET_GX_TRACE_RENDERER(write_back, [&](trace::Encoder& e) { e.w.u32(token); e.w.u64(bytes); e.w.u8(on); });
     auto& g = *impl_; g.check_owner();
     auto& ranges = g.write_back_ranges;
     const auto found = std::find(ranges.begin(), ranges.end(), std::make_pair(token, bytes));
@@ -2527,6 +2555,7 @@ void GlesRenderer::write_back(std::uint32_t token, std::size_t bytes, bool on) {
 }
 std::uint64_t GlesRenderer::write_backs_issued() const { return impl_->write_back_sequence; }
 bool GlesRenderer::land_write_backs(std::uint64_t through, bool wait) {
+    STARLET_GX_TRACE_RENDERER(land_write_backs, [&](trace::Encoder& e) { e.w.u64(through); e.w.u8(wait); });
     auto& g = *impl_; g.check_owner();
     auto& issued = g.issued_write_backs;
     // Packed copies are read back together once 2 ms pass without another (Bianco Hills copies
@@ -2581,17 +2610,20 @@ void GlesRenderer::Impl::wait_write_back(std::uint64_t sequence) {
     if (!arrived) throw std::runtime_error("texture-copy write-back did not arrive within two seconds");
 }
 void GlesRenderer::release_resident(std::uint32_t token, std::size_t bytes) {
+    STARLET_GX_TRACE_RENDERER(release_resident, [&](trace::Encoder& e) { e.w.u32(token); e.w.u64(bytes); });
     auto& g = *impl_; g.check_owner();
     g.flush_copies();
     if (g.direct) g.direct->release(token, bytes);
 }
 void GlesRenderer::before_dma_read(const void* data, std::size_t bytes) {
+    STARLET_GX_TRACE_RENDERER(dma_read, [&](trace::Encoder& e) { e.pointer(data, bytes); e.w.u64(bytes); });
     auto& g = *impl_; g.check_owner();
     if (!g.direct) return;
     if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
     try { g.flush_copies(); g.direct->before_read(data, bytes); } catch (...) { g.failed = true; throw; }
 }
 void GlesRenderer::before_dma_write(const void* data, std::size_t bytes) {
+    STARLET_GX_TRACE_RENDERER(dma_write, [&](trace::Encoder& e) { e.pointer(data, bytes); e.w.u64(bytes); });
     auto& g = *impl_; g.check_owner();
     if (!g.direct) return;
     if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
@@ -2602,6 +2634,13 @@ bool GlesRenderer::resident_in(const void* data, std::size_t bytes) const {
     return direct && direct->resident_in(data, bytes);
 }
 bool GlesRenderer::present_framebuffer(const FramebufferView &f, int width, int height, bool black) {
+    STARLET_GX_TRACE_RENDERER(present_framebuffer, [&](trace::Encoder& e) {
+        const bool shown = !black && f.bytes.data;
+        e.pointer(shown ? f.bytes.data : nullptr, f.bytes.size);
+        if (shown) e.memory(f.bytes.data, f.bytes.size);
+        e.w.u64(f.bytes.size); e.w.u32(f.width); e.w.u32(f.height); e.w.u64(f.stride);
+        e.w.i32(width); e.w.i32(height); e.w.u8(black);
+    });
     auto &g = *impl_;
     g.require_ready();
     if (!black)
@@ -2673,6 +2712,7 @@ void GlesRenderer::Impl::present_gl(const FramebufferView& f, int width, int hei
     }
 }
 void GlesRenderer::wait_until_idle() {
+    STARLET_GX_TRACE_RENDERER(wait_until_idle);
     auto& g = *impl_; g.require_ready();
     // Direct draws consume their inputs when recorded and keep copies GPU-resident,
     // so completion needs only GL command order; presentation bounds the queue.
@@ -2694,8 +2734,14 @@ void GlesRenderer::wait_until_idle() {
     }, true);
 }
 int GlesRenderer::snapshot_efb() { return snapshot_efb(EfbRegion{}); }
-int GlesRenderer::snapshot_efb(const EfbRegion& requested) { return impl_->snapshot(requested, impl_->snapshot_scale()); }
-int GlesRenderer::snapshot_efb_exact(const EfbRegion& requested) { return impl_->snapshot(requested, 1); }
+int GlesRenderer::snapshot_efb(const EfbRegion& requested) {
+    STARLET_GX_TRACE_RENDERER(snapshot, [&](trace::Encoder& e) { e.w.u8(0); trace::put(e.w, requested); });
+    return STARLET_GX_TRACE_RETURN(impl_->snapshot(requested, impl_->snapshot_scale()));
+}
+int GlesRenderer::snapshot_efb_exact(const EfbRegion& requested) {
+    STARLET_GX_TRACE_RENDERER(snapshot, [&](trace::Encoder& e) { e.w.u8(1); trace::put(e.w, requested); });
+    return STARLET_GX_TRACE_RETURN(impl_->snapshot(requested, 1));
+}
 int GlesRenderer::Impl::snapshot(const EfbRegion& requested, int scale) {
     auto& g = *this; g.require_ready();
     if (!g.direct) return -1;
@@ -2812,6 +2858,7 @@ int GlesRenderer::Impl::snapshot(const EfbRegion& requested, int scale) {
 }
 bool GlesRenderer::snapshot_ready(int index) const { return impl_->snapshot_ready(index); }
 void GlesRenderer::wait_snapshot(int index) {
+    STARLET_GX_TRACE_RENDERER(wait_snapshot, [&](trace::Encoder& e) { e.w.i32(index); });
     auto& g = *impl_; g.check_owner();
     if (index < 0 || index >= static_cast<int>(g.snapshot_busy.size()) || !g.snapshot_busy[std::size_t(index)])
         throw std::out_of_range("unknown EFB snapshot");
@@ -2862,12 +2909,14 @@ bool GlesRenderer::peek_color_snapshot(int index, int x, int y, std::uint32_t& v
     return true;
 }
 void GlesRenderer::select_snapshot(int index) {
+    STARLET_GX_TRACE_RENDERER(select_snapshot, [&](trace::Encoder& e) { e.w.i32(index); });
     auto& g = *impl_; g.check_owner();
     if (index >= static_cast<int>(g.snapshot_busy.size()) || (index >= 0 && !g.snapshot_busy[index]))
         throw std::out_of_range("unknown EFB snapshot");
     g.selected_snapshot = index;
 }
 void GlesRenderer::release_snapshot(int index) {
+    STARLET_GX_TRACE_RENDERER(release_snapshot, [&](trace::Encoder& e) { e.w.i32(index); });
     auto& g = *impl_; g.check_owner();
     if (index < 0 || index >= static_cast<int>(g.snapshot_busy.size())) throw std::out_of_range("unknown EFB snapshot");
     if (g.snapshot_refs[std::size_t(index)] > 1) { --g.snapshot_refs[std::size_t(index)]; return; }
@@ -2877,6 +2926,7 @@ void GlesRenderer::release_snapshot(int index) {
     if (g.last_snapshot == index) g.last_snapshot = -1;
 }
 void GlesRenderer::retain_snapshot(int index) {
+    STARLET_GX_TRACE_RENDERER(retain_snapshot, [&](trace::Encoder& e) { e.w.i32(index); });
     auto& g = *impl_; g.check_owner();
     if (index < 0 || index >= static_cast<int>(g.snapshot_busy.size()) || !g.snapshot_busy[std::size_t(index)])
         throw std::out_of_range("unknown EFB snapshot");
@@ -2913,6 +2963,7 @@ void GlesRenderer::start_submission_on(std::function<void(std::function<void()>)
     g.ensure_direct();
 }
 void GlesRenderer::end_frame() {
+    STARLET_GX_TRACE_RENDERER(end_frame);
     auto& g = *impl_; g.require_ready();
     g.execute([&g] {
         try { g.bound_frames(); gl_check("GLES frame end"); } catch (...) { g.failed = true; throw; }
@@ -2921,6 +2972,7 @@ void GlesRenderer::end_frame() {
 }
 void GlesRenderer::present_into(unsigned framebuffer, int source_width, int source_height, int x, int y, int width,
                                 int height) {
+    STARLET_GX_TRACE_RENDERER(present_into, [&](trace::Encoder& e) { for (int v : {source_width, source_height, x, y, width, height}) e.w.i32(v); });
     auto& g = *impl_;
     if (!g.submission.post || std::this_thread::get_id() != g.submission.id)
         throw std::logic_error("present_into runs on the host's GL thread");
@@ -2956,11 +3008,13 @@ void GlesRenderer::stop_submission() {
 }
 void GlesRenderer::set_swap(std::function<void()> swap) { impl_->swap = std::move(swap); }
 void GlesRenderer::set_frames_in_flight(unsigned frames) {
+    STARLET_GX_TRACE_RENDERER(frames_in_flight, [&](trace::Encoder& e) { e.w.u32(frames); });
     auto& g = *impl_; g.require_ready();
     if (frames < 1 || frames > 2) throw std::invalid_argument("frames in flight must be 1 or 2");
     g.execute([&g, frames] { g.frames_in_flight = frames; sync_stats::state("frames_in_flight=" + std::to_string(frames)); }, false);
 }
 void GlesRenderer::release_snapshots() {
+    STARLET_GX_TRACE_RENDERER(release_snapshots);
     auto& g = *impl_; g.check_owner();
     std::fill(g.snapshot_busy.begin(), g.snapshot_busy.end(), false);
     std::fill(g.snapshot_refs.begin(), g.snapshot_refs.end(), 0u);
@@ -2997,6 +3051,7 @@ const std::uint8_t* GlesRenderer::Impl::peek_snapshot(int x, int y, bool color) 
     return snapshot_pixel(std::size_t(snapshot), x, y, color);
 }
 std::uint32_t GlesRenderer::peek_depth(int x, int y) {
+    STARLET_GX_TRACE_RENDERER(peek_depth, [&](trace::Encoder& e) { e.w.i32(x); e.w.i32(y); });
     auto& g=*impl_;g.check_owner();
     if (x<0 || x>=g.efb_width || y<0 || y>=g.efb_height)
         throw std::invalid_argument("depth query outside native EFB");
@@ -3016,14 +3071,15 @@ std::uint32_t GlesRenderer::peek_depth(int x, int y) {
     return packed_depth(&g.live_depth[(std::size_t(g.efb_height-1-y) * g.efb_width + x) * 4]);
 }
 int GlesRenderer::request_depth_readback() {
+    STARLET_GX_TRACE_RENDERER(request_depth);
     auto& g = *impl_; g.require_ready();
     for (std::size_t i = 0; i < g.depth_readbacks.size(); ++i) {
         auto& d = g.depth_readbacks[i];
-        if (d.refs && d.writes == g.efb_writes) { ++d.refs; return int(i); }
+        if (d.refs && d.writes == g.efb_writes) { ++d.refs; return STARLET_GX_TRACE_RETURN(int(i)); }
     }
     std::size_t index = 0;
     while (index < g.depth_readbacks.size() && g.depth_readbacks[index].refs) ++index;
-    if (index == g.depth_readbacks.size()) return -1;
+    if (index == g.depth_readbacks.size()) return STARLET_GX_TRACE_RETURN(-1);
     auto& d = g.depth_readbacks[index];
     d.refs = 1;
     d.writes = g.efb_writes;
@@ -3052,7 +3108,7 @@ int GlesRenderer::request_depth_readback() {
             gl_check("EFB depth readback");
         } catch (...) { g.failed = true; throw; }
     }, false);
-    return int(index);
+    return STARLET_GX_TRACE_RETURN(int(index));
 }
 bool GlesRenderer::depth_readback_value(int handle, int x, int y, std::uint32_t& value) const {
     const auto& g = *impl_;
@@ -3064,6 +3120,7 @@ bool GlesRenderer::depth_readback_value(int handle, int x, int y, std::uint32_t&
     return true;
 }
 void GlesRenderer::wait_depth_readback(int handle) {
+    STARLET_GX_TRACE_RENDERER(wait_depth, [&](trace::Encoder& e) { e.w.i32(handle); });
     auto& g = *impl_; g.check_owner();
     if (handle < 0 || handle >= int(g.depth_readbacks.size()) || !g.depth_readbacks[std::size_t(handle)].refs)
         throw std::out_of_range("unknown EFB depth readback");
@@ -3081,12 +3138,14 @@ void GlesRenderer::wait_depth_readback(int handle) {
     }, true);
 }
 void GlesRenderer::release_depth_readback(int handle) {
+    STARLET_GX_TRACE_RENDERER(release_depth, [&](trace::Encoder& e) { e.w.i32(handle); });
     auto& g = *impl_; g.check_owner();
     if (handle < 0 || handle >= int(g.depth_readbacks.size()) || !g.depth_readbacks[std::size_t(handle)].refs)
         throw std::out_of_range("unknown EFB depth readback");
     --g.depth_readbacks[std::size_t(handle)].refs;
 }
 std::uint32_t GlesRenderer::peek_color(int x, int y) {
+    STARLET_GX_TRACE_RENDERER(peek_color, [&](trace::Encoder& e) { e.w.i32(x); e.w.i32(y); });
     auto& g = *impl_; g.check_owner();
     if (x < 0 || x >= g.efb_width || y < 0 || y >= g.efb_height)
         throw std::invalid_argument("colour query outside native EFB");

@@ -1,5 +1,14 @@
 #include "starlet/gx/decoder.hpp"
 
+#if defined(STARLET_GX_TRACE)
+#include "trace/recorder.hpp"
+#define STARLET_GX_TRACE_DECODER(...) ::starlet::gx::trace::DecoderCall starlet_trace_call(tap_.get(), *this, __VA_ARGS__)
+#define STARLET_GX_TRACE_DECODER_RESULT(value) starlet_trace_call.result(value)
+#else
+#define STARLET_GX_TRACE_DECODER(...) ((void)0)
+#define STARLET_GX_TRACE_DECODER_RESULT(value) ((void)0)
+#endif
+
 #include <stdexcept>
 
 #include <algorithm>
@@ -38,7 +47,12 @@ bool primitive(std::uint8_t opcode) {
 }
 
 Decoder::Decoder(MemoryReader& memory, CommandSink& sink, Limits limits, EfbLayout efb)
+#if defined(STARLET_GX_TRACE)
+    : tap_(trace::attach(this, memory, sink, limits, efb), trace::detach), state_(efb), memory_(trace::memory(*tap_)),
+      sink_(trace::sink(*tap_)), limits_(limits) {
+#else
     : state_(efb), memory_(memory), sink_(sink), limits_(limits) {
+#endif
     if (limits_.max_command_bytes < 6 || limits_.max_expanded_bytes < limits_.max_command_bytes ||
         limits_.max_commands == 0 || limits_.max_display_list_depth > 64) {
         fail(Error::invalid_input, "invalid GX decoder limits");
@@ -409,6 +423,7 @@ Decoder::Parse Decoder::host_command(ByteView input, std::size_t& consumed, unsi
 }
 
 void Decoder::set_texture_extent(std::uint8_t map, TextureExtent extent) {
+    STARLET_GX_TRACE_DECODER(trace::Op::texture_extent, {}, std::uint32_t{map} | std::uint32_t{extent.width} << 4 | std::uint32_t{extent.height} << 18);
     if (map >= 8 || extent.width > 8192 || extent.height > 8192 || (!extent.width != !extent.height))
         throw std::invalid_argument("invalid host texture extent");
     auto& current = state_.texture_extents_[map];
@@ -616,6 +631,7 @@ Decoder::Parse Decoder::command(ByteView input, std::size_t& consumed, unsigned 
 }
 
 Status Decoder::feed(ByteView bytes) try {
+    STARLET_GX_TRACE_DECODER(trace::Op::feed, bytes);
     if (!status_) {
         return status_;
     }
@@ -680,6 +696,7 @@ Status Decoder::feed(ByteView bytes) try {
 }
 
 Status Decoder::inject(ByteView bytes) try {
+    STARLET_GX_TRACE_DECODER(trace::Op::inject, bytes);
     if (!status_) return status_;
     if (feeding_ ? !host_callback_ : !pending_.empty()) {
         fail(Error::reentrant_call, feeding_ ? "GX commands can be injected only from host_command and filter_bp"
@@ -718,6 +735,7 @@ Status Decoder::inject(ByteView bytes) try {
 }
 
 Status Decoder::load_tlut(std::uint32_t control, ByteView palette) {
+    STARLET_GX_TRACE_DECODER(trace::Op::load_tlut, palette, control);
     const std::uint8_t command[5] = {0x61, 0x65, static_cast<std::uint8_t>(control >> 16), static_cast<std::uint8_t>(control >> 8),
                                      static_cast<std::uint8_t>(control)};
     struct Guard {
@@ -729,12 +747,15 @@ Status Decoder::load_tlut(std::uint32_t control, ByteView palette) {
 }
 
 bool Decoder::extend_pending(ByteView bytes) {
+    STARLET_GX_TRACE_DECODER(trace::Op::extend, bytes);
     if (!status_ || feeding_ || pending_.empty() || !bytes.data || pending_required_ <= pending_.size() + bytes.size) return false;
     pending_.insert(pending_.end(), bytes.data, bytes.data + bytes.size);
+    STARLET_GX_TRACE_DECODER_RESULT(true);
     return true;
 }
 
 Status Decoder::finish() try {
+    STARLET_GX_TRACE_DECODER(trace::Op::finish);
     if (feeding_) {
         fail(Error::reentrant_call, "GX decoder cannot be finished from its callbacks");
     } else if (!pending_.empty()) {
@@ -747,6 +768,7 @@ Status Decoder::finish() try {
 }
 
 Status Decoder::call_display_list(ByteView bytes, bool owned) try {
+    STARLET_GX_TRACE_DECODER(trace::Op::call_list, bytes, owned);
     if (!status_) return status_;
     if (feeding_) {
         fail(Error::reentrant_call, "GX decoder cannot be called from its callbacks");

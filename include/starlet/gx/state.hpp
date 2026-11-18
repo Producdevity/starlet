@@ -122,6 +122,7 @@ public:
 
 private:
     friend class Decoder;
+    friend struct TraceAccess;
     // Register writes only mark their address. The key words and hashes below are brought up to date
     // from the register images when a draw reads them, so a register rewritten between draws, or one
     // no key covers, costs a bit set instead of a table walk. Single-threaded, like the rest of State.
