@@ -35,6 +35,8 @@ std::map<GLint,std::array<double,4>> uniform_values;
 GLenum error = GL_NO_ERROR;
 // Atomic: tests change it while the submission thread polls fences.
 std::atomic<GLenum> wait_result{GL_ALREADY_SIGNALED};
+// Waits that time out before wait_result applies: a fence that signals late.
+std::atomic<int> timeouts_before_signal{0};
 // Mapped pack buffers hold byte i % 251 instead of zeros.
 bool map_pattern = false;
 // With map_pattern, a read into client memory gets the same pattern as a mapped pack
@@ -244,6 +246,10 @@ void glClearDepthf(GLfloat d) {}
 GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
     fake::hold_readback();
     fake::waited_fences.push_back(sync);
+    if (fake::timeouts_before_signal > 0) {
+        --fake::timeouts_before_signal;
+        return GL_TIMEOUT_EXPIRED;
+    }
     return fake::wait_result;
 }
 void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {}

@@ -31,6 +31,7 @@ extern std::map<std::pair<GLuint,std::string>,GLint> uniform_locations;
 extern std::map<GLint,std::array<double,4>> uniform_values;
 extern GLenum error;
 extern std::atomic<GLenum> wait_result;
+extern std::atomic<int> timeouts_before_signal;
 extern GLboolean links;
 extern bool map_pattern;
 extern int read_pattern_row;
@@ -527,6 +528,20 @@ void explicit_completion() {
     rejects([&] { renderer.wait_until_idle(); }, "timed out GPU completion rejects");
     rejects([&] { renderer.clear({{0,0,0}}); }, "failed completion latches renderer failure");
     fake::wait_result = GL_ALREADY_SIGNALED;
+}
+// A driver that builds uncached programs while it submits their draws can take seconds to retire a
+// frame; the renderer waits instead of failing.
+void slow_retirement_is_a_hitch() {
+    GlesRenderer renderer;
+    for (int frame = 0; frame < 4; ++frame) renderer.present(640, 480);
+    fake::timeouts_before_signal = 3;
+    renderer.present(640, 480);
+    check(fake::timeouts_before_signal == 0, "a frame that retires after three seconds is waited for");
+    renderer.present(640, 480);
+    fake::timeouts_before_signal = 5;
+    renderer.wait_until_idle();
+    check(fake::timeouts_before_signal == 0, "GPU work that retires late completes");
+    renderer.present(640, 480);
 }
 void program_reuse_across_tev_colours() {
     GlesLimits limits; limits.direct.shading=DirectShading::fast;
@@ -2532,6 +2547,7 @@ void direct_source_geometry() {
 }
 int main() {
     explicit_completion();
+    slow_retirement_is_a_hitch();
     try {
         adjacent_draw_batches(); clip_disabled_draw_behind_eye(); batch_geometry_bound(); parallel_batch_preparation(); program_uniform_values(); program_working_set(); depth_query_transfer_bounds(); captured_texture_cache(); complete_mip_cache_budget(); resident_texture_cache();
         failed_upload_poison();

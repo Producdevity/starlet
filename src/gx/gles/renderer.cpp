@@ -27,6 +27,21 @@
 
 namespace starlet::gx {
 namespace {
+bool signalled(GLenum status) { return status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED; }
+// Waits for a fence the caller needs now. A driver may build the programs a draw uses while it
+// submits that draw (Mali does), so work behind uncached programs can take seconds: a hitch, not a
+// failure. A failed wait, or a fence still pending after 30 s, is a lost GPU.
+bool retired(GLsync sync, GLbitfield flags, const char* what) {
+    for (int second = 0; second < 30; ++second) {
+        const GLenum status = glClientWaitSync(sync, second == 0 ? flags : 0, 1000000000);
+        if (signalled(status)) {
+            if (second) std::fprintf(stderr, "starlet: gles: %s retired after %d s\n", what, second);
+            return true;
+        }
+        if (status != GL_TIMEOUT_EXPIRED) return false;
+    }
+    return false;
+}
 void gl_check(const char* operation) {
     const auto error = glGetError();
     if (error != GL_NO_ERROR) throw std::runtime_error(std::string(operation) + ": GLES error " + std::to_string(error));
@@ -681,11 +696,12 @@ void main(){
             auto& r = *fenced_readbacks.front();
             const bool forced = r.write_backs.front()->sequence <= through;
             const bool flushing = forced || (flush && !r.flushed);
-            const auto status = glClientWaitSync(r.fence, flushing ? GL_SYNC_FLUSH_COMMANDS_BIT : 0, forced ? 1000000000 : 0);
+            const GLbitfield flags = flushing ? GL_SYNC_FLUSH_COMMANDS_BIT : 0;
+            const bool done = forced ? retired(r.fence, flags, "texture-copy write-back") : signalled(glClientWaitSync(r.fence, flags, 0));
             // One flush submits every fence made before it.
             if (flushing) for (const auto& f : fenced_readbacks) f->flushed = true;
-            if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) {
-                if (forced) throw std::runtime_error("texture-copy write-back did not retire within one second");
+            if (!done) {
+                if (forced) throw std::runtime_error("texture-copy write-back did not retire");
                 return;
             }
             glDeleteSync(r.fence); r.fence = nullptr;
@@ -721,9 +737,10 @@ void main(){
             auto& d = snapshots[it->index];
             const bool forced = int(it->index) == wait;
             const bool flush_now = forced || (flush && it == pending_reads.begin());
-            const auto status = glClientWaitSync(d.ready, flush_now ? GL_SYNC_FLUSH_COMMANDS_BIT : 0, forced ? 1000000000 : 0);
-            if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) {
-                if (forced) throw std::runtime_error("EFB snapshot readback did not retire within one second");
+            const GLbitfield flags = flush_now ? GL_SYNC_FLUSH_COMMANDS_BIT : 0;
+            const bool done = forced ? retired(d.ready, flags, "EFB snapshot readback") : signalled(glClientWaitSync(d.ready, flags, 0));
+            if (!done) {
+                if (forced) throw std::runtime_error("EFB snapshot readback did not retire");
                 ++it; continue;
             }
             glBindBuffer(GL_PIXEL_PACK_BUFFER, d.pack);
@@ -1790,10 +1807,9 @@ void main(){
         const auto done = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         if (!done) throw std::runtime_error("resident texture-copy fence allocation failed");
         sync_stats::Wait blocked("materialize-fence");
-        const auto wait = glClientWaitSync(done, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000);
+        const bool finished = retired(done, GL_SYNC_FLUSH_COMMANDS_BIT, "resident texture-copy materialization");
         glDeleteSync(done);
-        if (wait != GL_ALREADY_SIGNALED && wait != GL_CONDITION_SATISFIED)
-            throw std::runtime_error("resident texture-copy materialization did not retire within one second");
+        if (!finished) throw std::runtime_error("resident texture-copy materialization did not retire");
         glBindBuffer(GL_COPY_READ_BUFFER, materialize_buffer);
         const auto* mapped = static_cast<const std::uint8_t*>(glMapBufferRange(GL_COPY_READ_BUFFER, 0, bytes, GL_MAP_READ_BIT));
         if (!mapped) throw std::runtime_error("resident texture-copy materialization map failed");
@@ -1806,9 +1822,8 @@ void main(){
     void bound_frames() {
         while (frames.size() >= frames_in_flight) {
             sync_stats::Wait blocked("frame-fence (previous frame)");
-            const auto wait = glClientWaitSync(frames.front(), GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000);
-            if (wait != GL_ALREADY_SIGNALED && wait != GL_CONDITION_SATISFIED)
-                throw std::runtime_error("GLES previous frame did not retire within one second");
+            if (!retired(frames.front(), GL_SYNC_FLUSH_COMMANDS_BIT, "previous frame"))
+                throw std::runtime_error("GLES previous frame did not retire");
             glDeleteSync(frames.front()); frames.pop_front();
         }
         const auto fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -2666,10 +2681,9 @@ void GlesRenderer::wait_until_idle() {
         try {
             fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
             if (!fence) throw std::runtime_error("GLES completion fence allocation failed");
-            const auto result = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000);
+            const bool finished = retired(fence, GL_SYNC_FLUSH_COMMANDS_BIT, "GPU work");
             glDeleteSync(fence); fence = nullptr;
-            if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED)
-                throw std::runtime_error("GLES GPU work did not retire within one second");
+            if (!finished) throw std::runtime_error("GLES GPU work did not retire");
             gl_check("GX GPU completion");
         } catch (...) {
             if (fence) glDeleteSync(fence);
@@ -3058,9 +3072,8 @@ void GlesRenderer::wait_depth_readback(int handle) {
     g.execute([&g, &d] {
         try {
             if (d.ready() || !d.fence) return;
-            const auto result = glClientWaitSync(d.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000);
-            if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED)
-                throw std::runtime_error("EFB depth readback did not retire within one second");
+            if (!retired(d.fence, GL_SYNC_FLUSH_COMMANDS_BIT, "EFB depth readback"))
+                throw std::runtime_error("EFB depth readback did not retire");
             g.map_depth_readback(d);
         } catch (...) { g.failed = true; throw; }
     }, true);
