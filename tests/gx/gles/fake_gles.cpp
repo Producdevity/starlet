@@ -85,6 +85,8 @@ const char* renderer_name = "private dispatch fixture";
 // Shader sources in compile order; depth state as last set.
 std::vector<std::string> shader_sources;
 std::vector<GLenum> invalidated;
+// Per invalidated attachment: the framebuffer and the texture attached there.
+std::vector<GLuint> invalidated_framebuffers, invalidated_textures;
 unsigned scissored_clears = 0;
 // Colour attachments by framebuffer and attachment, each framebuffer's draw buffers, the textures
 // the last blit and the last glDrawArrays wrote (their draw framebuffer's draw buffers), and the
@@ -231,7 +233,11 @@ void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage
 GLenum glCheckFramebufferStatus(GLenum target) { return GL_FRAMEBUFFER_COMPLETE; }
 void glClear(GLbitfield mask) { ++fake::clears; if (fake::enabled.count(GL_SCISSOR_TEST)) ++fake::scissored_clears; }
 void glInvalidateFramebuffer(GLenum, GLsizei count, const GLenum* attachments) {
-    for (GLsizei i = 0; i < count; ++i) fake::invalidated.push_back(attachments[i]);
+    for (GLsizei i = 0; i < count; ++i) {
+        fake::invalidated.push_back(attachments[i]);
+        fake::invalidated_framebuffers.push_back(fake::framebuffer);
+        fake::invalidated_textures.push_back(fake::attached[{fake::framebuffer, attachments[i]}]);
+    }
 }
 void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {}
 void glClearDepthf(GLfloat d) {}

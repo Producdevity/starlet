@@ -55,6 +55,7 @@ extern GLint uniform_alignment;
 extern GLsizeiptr element_bytes;
 extern std::vector<std::string> shader_sources;
 extern std::vector<GLenum> invalidated;
+extern std::vector<GLuint> invalidated_framebuffers, invalidated_textures;
 extern unsigned scissored_clears;
 extern GLenum depth_func;
 extern GLboolean depth_mask, depth_test;
@@ -1194,6 +1195,10 @@ void merged_copies() {
         renderer.wait_until_idle();
         check(fake::draws == draws + 1 && fake::array_targets.size() == 2 && fake::array_targets[0] != fake::array_targets[1] &&
               renderer.stats().merged_copies == 1, "two identical program copies are one draw into both targets");
+        const auto& gone = fake::invalidated_textures;
+        check(std::find(gone.begin(), gone.end(), fake::array_targets[0]) != gone.end() &&
+              std::find(gone.begin(), gone.end(), fake::array_targets[1]) != gone.end(),
+              "a copy program invalidates the targets it overwrites");
         bool outputs = false;
         for (auto i = sources; i < fake::shader_sources.size(); ++i)
             outputs = outputs || fake::shader_sources[i].find("layout(location=1) out vec4 color1;") != std::string::npos;
@@ -1212,9 +1217,12 @@ void copy_clear_invalidation() {
         TextureCopy p; p.width = width; p.height = height; p.format = depth ? 11 : 4; p.depth = depth; p.stride = ((width + 3) / 4) * 32;
         EfbClear clear; clear.rectangle = {0, 456 - height, width, height};
         clear.depth_write = depth_write; clear.color_write = color_write; clear.alpha_write = alpha_write; p.clear = clear;
-        fake::invalidated.clear();
+        fake::invalidated.clear(); fake::invalidated_framebuffers.clear();
         renderer.copy_texture_resident(p, bytes.data(), bytes.size(), 0x8000); renderer.wait_until_idle();
-        return fake::invalidated;
+        std::vector<GLenum> efb;
+        for (std::size_t i = 0; i < fake::invalidated.size(); ++i)
+            if (fake::invalidated_framebuffers[i] != fake::array_framebuffer) efb.push_back(fake::invalidated[i]);
+        return efb;
     };
     check(copy(640, 456, false, true, true, false) == std::vector<GLenum>{GL_DEPTH_ATTACHMENT}, "a full colour copy and clear invalidates depth");
     check(copy(320, 456, false, true, true, false).empty(), "a partial clear invalidates nothing");

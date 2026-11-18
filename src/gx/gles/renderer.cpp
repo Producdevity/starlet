@@ -1667,6 +1667,10 @@ void main(){
                 glUniform2i(found->rows, top, bottom);
             }
         }
+        // The copy writes every texel of its targets; without this Mali loads their old contents first.
+        GLenum outputs[merged_targets];
+        for (unsigned i = 0; i < count; ++i) outputs[i] = GL_COLOR_ATTACHMENT0 + i;
+        glInvalidateFramebuffer(GL_FRAMEBUFFER, GLsizei(count), outputs);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glBindSampler(0, 0);
         if (count > 1) detach_merged(count);

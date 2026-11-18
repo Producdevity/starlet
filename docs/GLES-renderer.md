@@ -88,6 +88,7 @@ frames cost no presentation pass.
 - Copy and clear invalidation: a resident texture copy whose clear covers the whole EFB and rewrites an
   attachment the copy does not read (depth for colour copies; colour, alpha included, for depth copies)
   invalidates that attachment first, so the pass the copy ends does not write it back (`GlesStats::invalidations`).
+  Copy programs invalidate their targets before drawing, so the pass does not load the targets' old texels.
 - Clears: a clear of the whole EFB runs without a scissor test, since Mali's r20p0 driver clears under one with a
   draw that first loads the rest of the pass.
 
