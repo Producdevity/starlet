@@ -203,6 +203,7 @@ void randomized() {
         draw.primitive = primitives[pick(4)];
         const unsigned unit = draw.primitive == 0x80 ? 4 : (draw.primitive == 0x90 ? 3 : 1);
         draw.vertex_count = static_cast<std::uint16_t>(draw.primitive >= 0x98 ? 3 + pick(40) : unit * (1 + pick(12)));
+        if (draw.primitive == 0x80 && pick(4) == 0) draw.vertex_count += 3;
         std::vector<std::uint8_t> fifo(draw.layout.stride * draw.vertex_count);
         for (auto& byte : fifo) byte = static_cast<std::uint8_t>(random());
         // Keep indices inside the arrays except for occasional sentinels and misses.

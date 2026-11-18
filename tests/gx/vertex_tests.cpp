@@ -452,6 +452,9 @@ void limits_and_failures() {
     require(f.capture({0},0x88).error==VertexError::invalid_primitive,"reserved primitive rejected");
     for (auto opcode : {0x80,0x90,0x98,0xa0,0xa8,0xb0})
         require(f.capture({0},static_cast<std::uint8_t>(opcode)).error==VertexError::partial_primitive,"incomplete primitive count");
+    const auto trailing=f.capture({0,0,0,0,0,0,0},0x80,7); ok(trailing);
+    require(trailing.snapshot->indices().size()==9,"three vertices after the last quad draw one triangle");
+    require(f.capture({0,0,0,0,0,0},0x80,6).error==VertexError::partial_primitive,"two vertices after the last quad are incomplete");
     Draw draw; std::string error; require(f.decoder.state().vertex_layout(0,draw.layout,error),"valid layout");
     draw.primitive=0xb8; draw.vertex_count=1; draw.vertices={nullptr,1};
     require(capture_vertices(f.decoder.state(),draw,f.memory).error==VertexError::invalid_input,"null FIFO bytes");

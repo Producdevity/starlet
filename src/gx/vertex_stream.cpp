@@ -290,7 +290,8 @@ ColumnFunction column_function(const Input& in) {
 }
 bool primitive_count(std::uint8_t primitive, std::size_t n, std::size_t& count) {
     switch (primitive) {
-    case 0x80: count = (n / 4) * 6; return n % 4 == 0;
+    // Three vertices left after the last full quad draw one triangle (The Wind Waker's stars).
+    case 0x80: count = (n / 4) * 6 + (n % 4 == 3 ? 3 : 0); return n % 4 == 0 || n % 4 == 3;
     case 0x90: count = n; return n % 3 == 0;
     case 0x98: case 0xa0: count = n >= 3 ? (n - 2) * 3 : 0; return n == 0 || n >= 3;
     default: return false;
@@ -504,7 +505,10 @@ StreamResult append_stream_vertices(const State& state, const Draw& draw, Memory
         for (std::size_t r = 0; r < run_count; ++r) {
             const std::size_t n = runs[r].vertex_count, b = base;
             switch (runs[r].primitive) {
-            case 0x80: for (std::size_t i = 0; i < n; i += 4) { emit(b + i, b + i + 1, b + i + 2); emit(b + i, b + i + 2, b + i + 3); } break;
+            case 0x80:
+                for (std::size_t i = 0; i + 4 <= n; i += 4) { emit(b + i, b + i + 1, b + i + 2); emit(b + i, b + i + 2, b + i + 3); }
+                if (n % 4 == 3) emit(b + n - 3, b + n - 2, b + n - 1);
+                break;
             case 0x90: for (std::size_t i = 0; i < n; i += 3) emit(b + i, b + i + 1, b + i + 2); break;
             case 0x98: for (std::size_t i = 2; i < n; ++i) { if (i % 2 == 0) emit(b + i - 2, b + i - 1, b + i); else emit(b + i - 2, b + i, b + i - 1); } break;
             case 0xa0: for (std::size_t i = 2; i < n; ++i) emit(b, b + i - 1, b + i); break;

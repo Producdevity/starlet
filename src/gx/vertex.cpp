@@ -176,7 +176,8 @@ bool numbers(ArrayReader& arrays, const Attribute& a, unsigned array, const std:
 bool primitive_size(std::uint8_t primitive, std::size_t n, Topology& topology, std::size_t& count) {
     topology = Topology::triangles;
     switch (primitive) {
-    case 0x80: count = (n / 4) * 6; return n % 4 == 0;
+    // Three vertices left after the last full quad draw one triangle (The Wind Waker's stars).
+    case 0x80: count = (n / 4) * 6 + (n % 4 == 3 ? 3 : 0); return n % 4 == 0 || n % 4 == 3;
     case 0x90: count = n; return n % 3 == 0;
     case 0x98: case 0xa0: count = n >= 3 ? (n - 2) * 3 : 0; return n == 0 || n >= 3;
     case 0xa8: topology = Topology::lines; count = n; return n % 2 == 0;
@@ -457,7 +458,8 @@ VertexResult capture_vertices(const State& state, const Draw& draw, MemoryReader
     const std::size_t n = draw.vertex_count;
     switch (draw.primitive) {
     case 0x80:
-        for (std::size_t i = 0; i < n; i += 4) { emit({i, i + 1, i + 2}); emit({i, i + 2, i + 3}); }
+        for (std::size_t i = 0; i + 4 <= n; i += 4) { emit({i, i + 1, i + 2}); emit({i, i + 2, i + 3}); }
+        if (n % 4 == 3) emit({n - 3, n - 2, n - 1});
         break;
     case 0x90:
         for (std::size_t i = 0; i < n; i += 3) emit({i, i + 1, i + 2});

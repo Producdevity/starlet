@@ -158,7 +158,7 @@ GLenum factor(unsigned value, bool source) {
 // Byte-identical vertices yield identical attributes, so every triangle has zero area.
 bool zero_area(const Draw& draw) {
     const auto n = draw.vertex_count;
-    const bool valid = (draw.primitive == 0x80 && n % 4 == 0) || (draw.primitive == 0x90 && n % 3 == 0) ||
+    const bool valid = (draw.primitive == 0x80 && (n % 4 == 0 || n % 4 == 3)) || (draw.primitive == 0x90 && n % 3 == 0) ||
                        ((draw.primitive == 0x98 || draw.primitive == 0xa0) && n >= 3);
     if (!valid || n < 3 || !draw.layout.stride || draw.vertices.size != draw.layout.stride * n) return false;
     for (std::size_t i = 1; i < n; ++i)
