@@ -539,7 +539,8 @@ struct GlesDirect::Impl {
     std::array<std::atomic<std::uint64_t>, 5> program_waits{};
     std::atomic<std::uint64_t> program_wait_max_ms{0}, fallback_links{0}, fallback_link_max_ms{0};
     std::chrono::steady_clock::time_point last_fallback{}; // GL thread: end of its last link of an unready program.
-    std::uint64_t gl_segments = 0, rejected_programs = 0; // GL thread.
+    std::uint64_t gl_segments = 0; // GL thread.
+    std::atomic<std::uint64_t> rejected_programs{0};
     std::unordered_multimap<std::uint64_t, Program*> program_index;
     std::vector<std::unique_ptr<Texture>> textures;
     std::unordered_multimap<std::uint64_t, Texture*> texture_index;
@@ -3202,6 +3203,7 @@ GlesDirectStats GlesDirect::stats() const {
     result.program_wait_max_ms = impl_->program_wait_max_ms.load();
     result.fallback_links = impl_->fallback_links.load();
     result.fallback_link_max_ms = impl_->fallback_link_max_ms.load();
+    result.rejected_programs = impl_->rejected_programs.load();
     if (impl_->program_cache) result.program_cache = impl_->program_cache->stats();
     return result;
 }

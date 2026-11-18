@@ -82,6 +82,9 @@ which also links the target's `libGLESv2`. `starlet::host` builds when SDL2 is
 found (`STARLET_SDL2_INCLUDE_DIR`, `STARLET_SDL2_LIBRARY`); `-DSTARLET_HOST=OFF`
 leaves it out.
 
+`-DSTARLET_GX_TRACE=ON` builds the GX trace recorder into a port; `tools/replay-all.sh`
+replays recorded traces against a checkout. See [docs/Replay-traces.md](docs/Replay-traces.md).
+
 ## Using Starlet in a port
 
 ```cmake

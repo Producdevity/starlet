@@ -128,6 +128,8 @@ struct GlesDirectStats {
     // thread linked itself after unready_link_ms, and its longest such link.
     std::array<std::uint64_t, 5> program_waits{};
     std::uint64_t program_wait_max_ms = 0, fallback_links = 0, fallback_link_max_ms = 0;
+    // Generated programs the driver refused to compile or link; their draws are skipped.
+    std::uint64_t rejected_programs = 0;
     // Draws added as instances to the previous resident draw.
     std::uint64_t instanced_draws = 0;
     // Batched draws whose alpha test keeps failing fragments with alpha 0 (batched_zero_alpha).

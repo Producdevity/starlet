@@ -10,3 +10,4 @@ in a port, see the [README](https://github.com/Producdevity/starlet#readme).
 - [Host services](Host-services.md): SDL audio, controllers and quit
 - [Discs and memory cards](Discs-and-memory-cards.md): disc images, first-launch setup and memory cards
 - [Aurora integration](Aurora-integration.md): Starlet as the renderer of an Aurora GLES port
+- [Replay traces](Replay-traces.md): recorded GX traces, the replay suite and its references

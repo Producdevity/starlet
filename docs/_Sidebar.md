@@ -6,3 +6,4 @@
 - [Host services](Host-services.md)
 - [Discs and memory cards](Discs-and-memory-cards.md)
 - [Aurora integration](Aurora-integration.md)
+- [Replay traces](Replay-traces.md)
