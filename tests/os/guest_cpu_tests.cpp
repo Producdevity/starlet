@@ -411,6 +411,34 @@ void priority_preemption() {
     expect(trace == "maM", "equal priority waits for a yield");
 }
 
+OSThread* switched_from[8];
+OSThread* switched_to[8];
+int switch_count = 0;
+
+void note_thread_switch(OSThread* from, OSThread* to) {
+    if (switch_count < 8) {
+        switched_from[switch_count] = from;
+        switched_to[switch_count] = to;
+    }
+    ++switch_count;
+}
+
+// The switch callback sees each hand-over of the CPU between OS threads, as JKRThreadSwitch keeps
+// a current heap per thread with it.
+void switch_callback_sees_switches() {
+    static const char a = 'a';
+    OSThread* main_thread = OSGetCurrentThread();
+    switch_count = 0;
+    expect(OSSetSwitchThreadCallback(note_thread_switch) == nullptr, "no switch callback before");
+    OSCreateThread(&thread_a, mark, const_cast<char*>(&a), stack_a + sizeof stack_a, sizeof stack_a, 10, 0);
+    OSResumeThread(&thread_a);
+    OSJoinThread(&thread_a, nullptr);
+    expect(OSSetSwitchThreadCallback(nullptr) == note_thread_switch, "previous switch callback");
+    expect(switch_count == 2, "two switches");
+    expect(switched_from[0] == main_thread && switched_to[0] == &thread_a, "main to a");
+    expect(switched_from[1] == &thread_a && switched_to[1] == main_thread, "a back to main");
+}
+
 int run_tests() {
     priorities();
     messages_block();
@@ -425,6 +453,7 @@ int run_tests() {
     switching();
     interrupts_wake_the_cpu();
     priority_preemption();
+    switch_callback_sees_switches();
     return failures;
 }
 

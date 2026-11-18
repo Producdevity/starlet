@@ -66,6 +66,8 @@ std::unordered_map<OSThread*, Guest*> guests;
 int scheduler_disabled = 0;
 Guest interrupt_guest;
 OSThread* last_guest = nullptr;
+// OSSetSwitchThreadCallback: called as the CPU passes from one OS thread to another.
+OSSwitchThreadCallback switch_callback = nullptr;
 std::atomic<SwitchTrace> switch_trace{nullptr};
 
 // The guest CPU's host thread: its own context runs only while no guest thread is ready.
@@ -163,6 +165,7 @@ Guest* take_next() {
         trace_dispatch(next);
         if (!next->interrupt_thread) {
             next->os->state = OS_THREAD_STATE_RUNNING;
+            if (switch_callback && last_guest != next->os) switch_callback(last_guest, next->os);
             last_guest = next->os;
         }
         return next;
@@ -574,6 +577,13 @@ using namespace starlet::os;
 extern "C" {
 
 void OSInitThreadQueue(OSThreadQueue* queue) { init_queue(queue); }
+
+OSSwitchThreadCallback OSSetSwitchThreadCallback(OSSwitchThreadCallback callback) {
+    std::lock_guard<std::mutex> lock(scheduler);
+    const OSSwitchThreadCallback previous = switch_callback;
+    switch_callback = callback;
+    return previous;
+}
 
 OSThread* OSGetCurrentThread() {
     if (!self) return nullptr;

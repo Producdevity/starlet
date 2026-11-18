@@ -225,6 +225,9 @@ using OSSwitchThreadCallback = void (*)(OSThread* from, OSThread* to);
 extern "C" {
 
 void OSInitThreadQueue(starlet::sdk::OSThreadQueue* queue);
+// The callback runs on the guest CPU, with the scheduler held, each time the CPU passes from one OS
+// thread to another (from is the thread that ran last, null before the first). Returns the previous one.
+starlet::sdk::OSSwitchThreadCallback OSSetSwitchThreadCallback(starlet::sdk::OSSwitchThreadCallback callback);
 starlet::sdk::OSThread* OSGetCurrentThread();
 starlet::sdk::BOOL OSIsThreadTerminated(starlet::sdk::OSThread* thread);
 starlet::sdk::BOOL OSIsThreadSuspended(starlet::sdk::OSThread* thread);

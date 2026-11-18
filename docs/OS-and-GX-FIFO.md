@@ -32,6 +32,8 @@ Game code never runs concurrently with game code.
   stack is at least 1 MiB. The game's own stack memory only carries the end-of-stack mark games check for
   overflow.
 - Under TSan each guest thread is a TSan fiber.
+- `OSSetSwitchThreadCallback` runs the game's callback, with the scheduler held, each time the CPU passes from one OS
+  thread to another (JSystem's JKRThreadSwitch keeps a current heap per thread with it). Interrupt fibers do not count.
 - `set_switch_trace` reports each hand-over of the CPU for diagnostics; the GX frame trace records them (kinds
   `h`, `g`, `x`, `i`, `j`, see `starlet/gx_fifo/frame_trace.hpp`).
 
