@@ -1628,11 +1628,13 @@ ivec4 efb(int x,int y){
  return ivec4(floor(t*255.0+0.5));
 #endif
 }
+#if FILTER
 // The vertical filter weighs each source row with its neighbours before any reduction.
 ivec4 weigh(ivec4 above,ivec4 c,ivec4 below){
  ivec3 v=((above.rgb*uFilter.x+c.rgb*uFilter.y+below.rgb*uFilter.z)>>6)&0x1ff;
  return ivec4(min(v,ivec3(255)),c.a);
 }
+#endif
 ivec4 source(int x,int y){
  ivec4 c=efb(x,y);
 #if FILTER
