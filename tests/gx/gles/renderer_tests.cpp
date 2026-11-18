@@ -368,9 +368,11 @@ void rgb8_replacement_boundary() {
 void clear_boundary() {
     GlesRenderer renderer; EfbClear clear; clear.rectangle={0,0,640,456};
     const auto count=fake::clears, scissored=fake::scissored_clears;renderer.clear_efb(clear);
+    check(fake::clears==count,"a constant clear waits for the next GL work");
+    renderer.present(640,480);
     check(fake::clears==count+1,"native clear reaches GPU even when only depth is written");
     check(fake::scissored_clears==scissored,"a clear of the whole EFB runs without a scissor test");
-    clear.rectangle={0,0,608,456};renderer.clear_efb(clear);
+    clear.rectangle={0,0,608,456};renderer.clear_efb(clear);renderer.present(640,480);
     check(fake::scissored_clears==scissored+1,"a partial clear keeps its scissor");
     clear.rectangle={639,455,2,1};rejects([&]{renderer.clear_efb(clear);},"invalid clear extent rejected");
     clear.rectangle={0,0,640,456};renderer.clear_efb(clear);
@@ -379,14 +381,30 @@ void clear_boundary() {
     renderer.clear_efb(clear);
     clear.rectangle={0,0,640,456};renderer.clear_efb(clear);
     fake::error=GL_INVALID_OPERATION;
-    rejects([&]{renderer.clear_efb(clear);},"clear propagates driver failure");
+    rejects([&]{renderer.clear_efb(clear);renderer.present(640,480);},"clear propagates driver failure");
     rejects([&]{renderer.present(640,480);},"failed clear poisons renderer");
+}
+// A constant clear starts the pass that next uses its attachments, so it never costs a pass of its own:
+// the EFB's waits across an offscreen pass, and the pair's, still waiting when the pass ends, is dropped.
+void waiting_clears() {
+    GlesRenderer renderer; Fixture f;
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+    EfbClear clear; clear.rectangle={0,0,640,456}; clear.color_write=true; clear.depth_write=true;
+    const auto before=fake::clears;
+    renderer.clear_efb(clear);
+    renderer.begin_offscreen();
+    EfbClear part=clear; part.rectangle={0,64,384,384}; renderer.clear_efb(part);
+    renderer.end_offscreen(); renderer.wait_until_idle();
+    check(fake::clears==before+1,"only the offscreen pass's own whole clear reaches GL inside it");
+    const auto draws=fake::draws;
+    renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
+    check(fake::clears==before+2 && fake::draws==draws+1,"the EFB's clear runs before the next draw into it");
 }
 // A renderer serves one EFB layout; work planned for another frame height is refused.
 void efb_layout_boundary() {
     GlesLimits limits; limits.efb = EfbLayout{480};
     GlesRenderer renderer(limits); EfbClear clear; clear.efb = EfbLayout{480}; clear.rectangle={0,0,640,480};
-    const auto count=fake::clears;renderer.clear_efb(clear);
+    const auto count=fake::clears;renderer.clear_efb(clear);renderer.present(640,480);
     check(fake::clears==count+1,"a 640x480 frame clears whole");
     clear.rectangle={0,0,640,481};rejects([&]{renderer.clear_efb(clear);},"clears stay inside the 480-row frame");
     clear.efb = EfbLayout{}; clear.rectangle={0,0,640,456};
@@ -2520,7 +2538,7 @@ int main() {
         inherited_transfer_state();
         fence_failure_and_thread_owner();
         validation_precedes_mutation();
-        warm_shader_validation(); rgb8_replacement_boundary(); clear_boundary(); efb_layout_boundary();
+        warm_shader_validation(); rgb8_replacement_boundary(); clear_boundary(); waiting_clears(); efb_layout_boundary();
         display_copy_boundary(); repeated_presentation();
         direct_draw_path(); live_depth_peeks_share_a_readback(); asynchronous_depth_readback();
         rejected_program_skips_draws();

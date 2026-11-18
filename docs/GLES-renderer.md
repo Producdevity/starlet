@@ -89,8 +89,12 @@ frames cost no presentation pass.
   attachment the copy does not read (depth for colour copies; colour, alpha included, for depth copies)
   invalidates that attachment first, so the pass the copy ends does not write it back (`GlesStats::invalidations`).
   Copy programs invalidate their targets before drawing, so the pass does not load the targets' old texels.
-- Clears: a clear of the whole EFB runs without a scissor test, since Mali's r20p0 driver clears under one with a
-  draw that first loads the rest of the pass.
+- Clears: a constant clear without a format change waits for the next GL task and runs at its start, so it opens
+  the pass that uses its attachments. Run at once, a clear followed by work on other attachments is a pass of its
+  own that Mali stores and the next pass loads back (Twilight Princess's title clears the EFB and then renders
+  an offscreen pass). A clear still waiting when an offscreen pass ends is dropped: nothing reads the pair
+  afterwards and the next pass clears it whole. A clear of the whole EFB runs without a scissor test, since Mali's
+  r20p0 driver clears under one with a draw that first loads the rest of the pass.
 
 ## Display and texture copies
 

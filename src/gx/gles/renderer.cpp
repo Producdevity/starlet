@@ -348,6 +348,17 @@ struct GlesRenderer::Impl {
     bool bloom_open = false;
     bool offscreen_open = false;
     GLuint offscreen_color = 0, offscreen_depth = 0; // The EFB's own while an offscreen pass is open.
+    // GL thread. A constant clear waits for the next task, so it starts the pass that uses its
+    // attachments instead of a pass of its own: [0] the EFB's, [1] an offscreen pass's.
+    std::optional<EfbClear> waiting_clears[2];
+    bool offscreen_attached = false;
+    void settle_clear() {
+        auto& waiting = waiting_clears[offscreen_attached];
+        if (!waiting) return;
+        const auto operation = *waiting;
+        waiting.reset();
+        clear_efb_now(operation, true);
+    }
     std::vector<ResidentProgram> resident_programs;
     struct Xfb { const std::uint8_t* data; GLuint texture; int width, height; GLuint framebuffer = 0; };
     std::vector<Xfb> xfbs;
@@ -781,8 +792,10 @@ void main(){
         std::function<void(std::function<void()>)> post;
     } submission;
     std::function<void()> swap;
-    void execute(std::function<void()> op, bool wait) {
+    // keeps_clears: the task only swaps attachments, so a waiting clear stays for the work after it.
+    void execute(std::function<void()> op, bool wait, bool keeps_clears = false) {
         auto& q = submission;
+        if (!keeps_clears) op = [this, inner = std::move(op)] { settle_clear(); inner(); };
         if (!q.running || std::this_thread::get_id() == q.id) { op(); return; }
         std::unique_lock<std::mutex> lock(q.mutex);
         if (q.failure) std::rethrow_exception(q.failure);
@@ -1139,6 +1152,7 @@ void main(){
     }
     void read_depth(int x, int y, int width, int height, std::uint8_t* pixels, int snapshot);
     void clear_efb_gl(const EfbClear&);
+    void clear_efb_now(const EfbClear&, bool waited);
     void attach_color() {
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
@@ -1855,6 +1869,7 @@ void GlesRenderer::clear(std::array<std::uint8_t, 3> color) {
     auto& g = *impl_; g.require_ready();
     ++g.efb_writes;
     try {
+        g.waiting_clears[g.offscreen_attached].reset();
         glBindFramebuffer(GL_FRAMEBUFFER, g.framebuffer);
         glDisable(GL_SCISSOR_TEST); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); glDepthMask(GL_TRUE);
         glClearColor(color[0] / 255.0f, color[1] / 255.0f, color[2] / 255.0f, 1); glClearDepthf(1);
@@ -1883,7 +1898,7 @@ void GlesRenderer::begin_offscreen() {
     if (g.bloom_open) throw std::logic_error("offscreen pass inside native bloom");
     g.offscreen_open = true;
     ++g.efb_writes;
-    g.execute([&g] { g.begin_offscreen_gl(); }, false);
+    g.execute([&g] { g.begin_offscreen_gl(); }, false, true);
 }
 void GlesRenderer::end_offscreen() {
     auto& g = *impl_; g.require_ready();
@@ -1891,10 +1906,13 @@ void GlesRenderer::end_offscreen() {
     g.offscreen_open = false;
     ++g.efb_writes;
     g.execute([&g] {
+        // Nothing reads the pair after the pass, and the next pass clears it whole.
+        g.waiting_clears[1].reset();
         g.swap_offscreen();
+        g.offscreen_attached = false;
         glBindFramebuffer(GL_FRAMEBUFFER, g.framebuffer);
         gl_check("offscreen end");
-    }, false);
+    }, false, true);
 }
 void GlesRenderer::Impl::begin_offscreen_gl() {
     if (!offscreen_color) {
@@ -1909,6 +1927,8 @@ void GlesRenderer::Impl::begin_offscreen_gl() {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
     }
     swap_offscreen();
+    offscreen_attached = true;
+    waiting_clears[1].reset();
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         throw std::runtime_error("offscreen framebuffer is incomplete");
@@ -2047,13 +2067,22 @@ void GlesRenderer::Impl::end_bloom_gl(const EfbBloom& p) {
     ++stats.blooms;
 }
 void GlesRenderer::Impl::clear_efb_gl(const EfbClear& operation) {
+    const bool constant = std::all_of(operation.tile.begin(),operation.tile.end(),[&](const auto& c){return c==operation.tile[0];});
+    if (constant && !operation.strip_rectangle.width && operation.rgba6 == rgba6) {
+        waiting_clears[offscreen_attached] = operation;
+        return;
+    }
+    clear_efb_now(operation, false);
+}
+// waited: a clear without a format change, run late; formats set since then stay.
+void GlesRenderer::Impl::clear_efb_now(const EfbClear& operation, bool waited) {
     auto& g = *this;
     const auto& r = operation.rectangle;
-    const bool format_change = operation.rgba6 != g.rgba6;
+    const bool format_change = !waited && operation.rgba6 != g.rgba6;
     const bool whole = !r.x && !r.y && r.width==efb_width && r.height==efb_height;
     const bool replaces_color = whole && operation.color_write && (!operation.rgba6 || operation.alpha_write);
     try {
-        if (!replaces_color) g.reinterpret_format(operation.rgba6);
+        if (!replaces_color && !waited) g.reinterpret_format(operation.rgba6);
         glBindFramebuffer(GL_FRAMEBUFFER,g.framebuffer);
         glViewport(0,0,efb_width,efb_height); glScissor(r.x,r.y,r.width,r.height);
         // Mali's r20p0 driver clears under a scissor test with a draw that loads the rest of the pass first.
@@ -2074,7 +2103,7 @@ void GlesRenderer::Impl::clear_efb_gl(const EfbClear& operation) {
                 glBindFramebuffer(GL_FRAMEBUFFER,g.strip_framebuffer); glEnable(GL_SCISSOR_TEST); glScissor(s.x,s.y,s.width,s.height);
                 glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT); glBindFramebuffer(GL_FRAMEBUFFER,g.framebuffer);
             }
-            gl_check("MainLoop constant EFB clear");g.rgba6=operation.rgba6;return;
+            gl_check("MainLoop constant EFB clear");if (!waited) g.rgba6=operation.rgba6;return;
         }
         if (!g.clear_program) {
             GlesDrawPipeline p;
@@ -2115,6 +2144,7 @@ void GlesRenderer::Impl::submit(const DrawPacket& packet,const GlesDrawPipeline&
                                 const std::vector<std::uint16_t>& indices,std::size_t logical_draws) {
     auto& g=*this;
     try {
+        g.settle_clear();
         if (!p.full_replacement) g.reinterpret_format(p.rgba6_copy);
         auto& program = g.program(p,packet);
         glUseProgram(program.name); glBindFramebuffer(GL_FRAMEBUFFER, g.framebuffer);
@@ -3064,6 +3094,7 @@ std::vector<std::uint8_t> GlesRenderer::readback() {
     auto& g = *impl_; g.require_ready();
     std::vector<std::uint8_t> pixels(std::size_t(g.efb_width) * g.efb_height * 4);
     try {
+        g.settle_clear();
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g.framebuffer);
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
