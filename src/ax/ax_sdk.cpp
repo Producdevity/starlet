@@ -481,9 +481,10 @@ void new_frame() {
     __AXLocalProfile.auxProcessingStart = u64(platform::time());
     process_aux();
     __AXLocalProfile.auxProcessingEnd = u64(platform::time());
+    const starlet::ai::Stats ai = starlet::ai::stats();
     diag::end_frame(output_buffers[frame_command.output], aux_callback_a ? aux.a[(aux_cpu + 2) % 3] : nullptr,
                     aux_callback_b && cl_mode != AX_MODE_DPL2 ? aux.b[(aux_cpu + 2) % 3] : nullptr, saturated,
-                    take_reads_past_end());
+                    take_reads_past_end(), {ai.output.underruns, ai.output.underrun_frames, ai.repeats});
     __AXLocalProfile.userCallbackStart = u64(platform::time());
     if (user_callback) user_callback();
     __AXLocalProfile.userCallbackEnd = u64(platform::time());

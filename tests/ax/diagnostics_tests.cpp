@@ -168,7 +168,8 @@ void clip_from_state(const std::string& directory) {
         if (f == 21) diag::running_voice(4, bad, false, memory);  // unchanged: no second line
         aux_a[0] = 40000;                                             // saturated aux A return
         aux_a[160] = 100;
-        diag::end_frame(out.data(), aux_a.data(), f < 100 ? nullptr : aux_b.data(), f == 30 ? 5 : 0, f == 40 ? 2 : 0);
+        diag::end_frame(out.data(), aux_a.data(), f < 100 ? nullptr : aux_b.data(), f == 30 ? 5 : 0, f == 40 ? 2 : 0,
+                        {f < 50 ? 0u : 3u, f < 50 ? 0u : 700u, f < 60 ? 0u : 1u});
     }
     check(starlet::ax::save_audio_clip("test"), "a clip is saved");
     check(starlet::ax::save_audio_clip("exit"), "the exit clip is saved");
@@ -189,6 +190,8 @@ void clip_from_state(const std::string& directory) {
           "the anomalous start carries its flags and parameters");
     check(text.find("saturated main 5 aux-A 250") != std::string::npos, "totals count saturated samples");
     check(text.find("reads past end 2") != std::string::npos, "totals count reads past end");
+    check(text.find("output this run: gaps 3 (700 frames of silence), replayed blocks 1") != std::string::npos,
+          "the clip reports the output's gaps and replays");
 }
 
 }

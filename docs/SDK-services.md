@@ -94,7 +94,10 @@ reference; behaviour is not verified against hardware.
 - Accelerator: ADPCM (4-bit, 8-byte frames with a predictor/scale header, nibble addresses), PCM16
   and PCM8 (sample addresses, big-endian in ARAM, gain 0x800 and 0x100 set by `AXSetVoiceAddr`).
   The wrap compares the current address with the end address for equality, so a current address
-  beyond the end keeps reading memory (counted in the diagnostics). Reading the sample at the end
+  beyond the end keeps reading memory (counted in the diagnostics). Games rely on it: RE4's stream
+  ring leaves a stream's end behind the voice after the loop jump until the voice reaches the
+  ring's last slot, so a looping stream counts about 3 to 6 s of reads past its end after each
+  loop while it plays the right data. Reading the sample at the end
   address loops to the loop address with the loop predictor/scale and, unless the voice is a
   stream, the loop history. Without the loop flag the voice stops. An ADPCM end address at a
   frame's first or second nibble wraps without reading a header.
@@ -145,8 +148,10 @@ Always on (`starlet/ax/diagnostics.hpp`). Every line goes to stderr with the pre
   polyphase, LPF and ITD notes at most 3 per second and 100 per run. Dropped lines are counted in
   the next window's first line.
 - Once per second, when non-zero: output samples clamped in the main mix, aux A and aux B return
-  samples beyond 16 bits (after the callbacks), and 1 ms voice blocks whose current address is
-  past the end address.
+  samples beyond 16 bits (after the callbacks), 1 ms voice blocks whose current address is
+  past the end address, and what the speaker got without the mix: output gaps (device requests
+  the output ring could not fill, played as silence) and blocks the AI replayed because the game
+  programmed the next one late. The clip's text file has the run's totals of all of them.
 - A ring holds the last 10 s of the main mix and the aux A and B returns (the mean of L and R),
   2.56 MB. `save_audio_clip` writes `audio-clip-<seconds>.wav` (32 kHz, 4 channels: main L, main
   R, aux A, aux B) and `.txt` into the folder given to `set_diagnostics_directory`: the voices

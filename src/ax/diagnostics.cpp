@@ -65,6 +65,8 @@ struct State {
     // The counters of the second in progress, and the totals.
     std::uint64_t sat_main = 0, sat_a = 0, sat_b = 0, past_end = 0;
     std::uint64_t total_sat_main = 0, total_sat_a = 0, total_sat_b = 0, total_past_end = 0, starts = 0;
+    // The output counters as last seen and at the start of the second in progress.
+    OutputTotals output, output_second;
     unsigned clips = 0;
     std::string directory;
     std::vector<s16> main_l, main_r, aux_a, aux_b;
@@ -285,7 +287,8 @@ void running_voice(int index, const AXPB& pb, bool started, std::size_t memory_b
         log_line("", diagnostics_seconds(), "(voice lines stop here for this run)");
 }
 
-void end_frame(const s16* main_rl, const s32* aux_a, const s32* aux_b, unsigned main_saturated, unsigned reads_past_end) {
+void end_frame(const s16* main_rl, const s32* aux_a, const s32* aux_b, unsigned main_saturated, unsigned reads_past_end,
+               const OutputTotals& output) {
     State* s = global.load();
     if (!s) return;
     constexpr int n = 160;
@@ -308,12 +311,20 @@ void end_frame(const s16* main_rl, const s32* aux_a, const s32* aux_b, unsigned 
     {
         std::lock_guard<std::mutex> lock(s->mutex);
         s->ring.push(left, right, aux_a ? ret_a : nullptr, aux_b ? ret_b : nullptr, n);
+        s->output = output;
     }
     if (++s->frame % frames_per_second == 0) {
-        if (s->sat_main || s->sat_a || s->sat_b || s->past_end) {
-            char text[160];
-            std::snprintf(text, sizeof text, "1 s: saturated samples main %" PRIu64 " aux-A %" PRIu64 " aux-B %" PRIu64 ", reads past end %" PRIu64,
-                          s->sat_main, s->sat_a, s->sat_b, s->past_end);
+        const OutputTotals& was = s->output_second;
+        const std::uint64_t gaps = output.gaps - std::min(output.gaps, was.gaps);
+        const std::uint64_t gap_frames = output.gap_frames - std::min(output.gap_frames, was.gap_frames);
+        const std::uint64_t replays = output.replays - std::min(output.replays, was.replays);
+        s->output_second = output;
+        if (s->sat_main || s->sat_a || s->sat_b || s->past_end || gaps || replays) {
+            char text[240];
+            std::snprintf(text, sizeof text,
+                          "1 s: saturated samples main %" PRIu64 " aux-A %" PRIu64 " aux-B %" PRIu64 ", reads past end %" PRIu64
+                          ", output gaps %" PRIu64 " (%" PRIu64 " frames), replayed blocks %" PRIu64,
+                          s->sat_main, s->sat_a, s->sat_b, s->past_end, gaps, gap_frames, replays);
             log_line("", diagnostics_seconds(), text);
         }
         s->total_sat_main += s->sat_main;
@@ -349,6 +360,7 @@ bool save_audio_clip(const char* reason) {
     std::string path;
     double now;
     std::uint64_t totals[5];
+    OutputTotals output;
     {
         std::lock_guard<std::mutex> lock(s->mutex);
         if (s->directory.empty() || s->ring.size() == 0) return false;
@@ -369,6 +381,7 @@ bool save_audio_clip(const char* reason) {
         totals[2] = s->total_sat_b + s->sat_b;
         totals[3] = s->total_past_end + s->past_end;
         totals[4] = s->starts;
+        output = s->output;
     }
     const std::size_t frames = audio.size() / clip_channels;
     const bool wav = write_wav(path + ".wav", audio.data(), frames, clip_channels, clip_rate);
@@ -381,6 +394,8 @@ bool save_audio_clip(const char* reason) {
         std::fprintf(text, "window: t=%.3f to %.3f s (the wav's first sample is at t=%.3f)\n", now - double(frames) / clip_rate, now, start);
         std::fprintf(text, "totals this run: saturated main %" PRIu64 " aux-A %" PRIu64 " aux-B %" PRIu64 ", reads past end %" PRIu64 ", voice starts %" PRIu64 "\n",
                      totals[0], totals[1], totals[2], totals[3], totals[4]);
+        std::fprintf(text, "output this run: gaps %" PRIu64 " (%" PRIu64 " frames of silence), replayed blocks %" PRIu64 "\n",
+                     output.gaps, output.gap_frames, output.replays);
         std::fprintf(text, "voices started in the window: %zu (wav time = (clock - %" PRIu64 ") / %u s)\n", window.size(), first_frame, clip_rate);
         for (const Record& r : window) {
             std::fprintf(text, "\nt=%.3f wav+%.3f s: %s [%s]\nAXPB words:", r.seconds, double(r.clock - std::min(r.clock, first_frame)) / clip_rate,

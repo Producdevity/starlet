@@ -85,9 +85,16 @@ void reset();
 // Once per frame for each running voice after the sync; started when it was not running before.
 void running_voice(int index, const AXPB& pb, bool started, std::size_t memory_bytes);
 void stopped_voice(int index);
+// What reached the speaker since the AI opened (starlet::ai::Stats): device requests the output
+// ring could not fill (heard as gaps), the frames of silence they got, and blocks the AI played
+// twice because the game had not programmed the next one in time.
+struct OutputTotals {
+    std::uint64_t gaps = 0, gap_frames = 0, replays = 0;
+};
+
 // Once per frame after the aux callbacks. main is the AI buffer (right channel first); aux_a and aux_b
 // are the aux buffers (L, R, S of 160 samples each) or null without a callback.
 void end_frame(const s16* main_rl, const s32* aux_a, const s32* aux_b, unsigned main_saturated,
-               unsigned reads_past_end);
+               unsigned reads_past_end, const OutputTotals& output = {});
 
 }
