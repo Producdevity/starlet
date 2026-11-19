@@ -126,6 +126,29 @@ void looping() {
     }
 }
 
+// RE4's stream ring (snd_str2.cpp str_ax_voice_loop_to_top): at the stream's loop end the game sets
+// the end in the playing ring slot and the loop address in the next one, and leaves that end behind
+// the voice after the jump until the voice enters the ring's last slot. The wrap compares for
+// equality, so the voice reads on through the slots that hold the loop's data.
+void end_left_behind() {
+    const u32 ring = 0x2800;
+    for (u32 i = 0; i < 128; ++i) put16(ring + i, s16(i));
+    AXPB pb = pcm16_block(ring + 3 * 16 + 5, ring + 2 * 16 + 10, ring + 2 * 16 + 8, true);
+    auto out = read(pb, 23);
+    bool on = out[0] == 40 && out[1] == 41 && out[2] == 42;
+    for (int i = 3; i < 23; ++i) on &= out[i] == 53 + (i - 3);
+    check(on, "after the loop jump the voice reads on past the end it left behind");
+    check_eq<u16>(pb.state, AX_PB_STATE_RUN, "and keeps running");
+    check_eq<u32>(current(pb), ring + 73, "it is beyond the old end");
+
+    pb.addr.endAddressHi = u16((ring + 127) >> 16);
+    pb.addr.endAddressLo = u16(ring + 127);
+    pb.addr.loopAddressHi = u16(ring >> 16);
+    pb.addr.loopAddressLo = u16(ring);
+    out = read(pb, 56);
+    check(out[54] == 127 && out[55] == 0, "the ring's own end wraps it to the ring's start");
+}
+
 void sample_rate_conversion() {
     for (u32 i = 0; i < 400; ++i) put16(0x2000 + i, s16(i * 10));
     for (u16 select : {u16(0), u16(1)}) {
@@ -352,6 +375,7 @@ void lpf_coefficients() {
 int main() {
     adpcm_decoding();
     looping();
+    end_left_behind();
     sample_rate_conversion();
     lpf_coefficients();
     volume_ramps();
