@@ -269,6 +269,36 @@ void probe_dump() {
         require(frames[i * 2] == 0 && frames[i * 2 + 1] == 0, "an underrun plays silence, not stale samples");
 }
 
+// The probe's file stops at STARLET_AUDIO_PROBE_SECONDS.
+void probe_limit() {
+    const std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/starlet-audio-probe-limit.wav";
+    std::remove(path.c_str());
+    setenv("STARLET_AUDIO_PROBE", path.c_str(), 1);
+    setenv("STARLET_AUDIO_PROBE_SECONDS", "1", 1);
+    {
+        AudioOutput output;
+        output.open_push(32000, 500);
+        std::vector<std::int16_t> block;
+        std::uint32_t written = 0;
+        const auto started = Clock::now();
+        while (Clock::now() - started < std::chrono::milliseconds(1800)) {
+            fill(block, 160, written);
+            if (output.write(block.data(), 160)) written += 160;
+            wait_ms(3);
+        }
+        output.close();
+    }
+    unsetenv("STARLET_AUDIO_PROBE");
+    unsetenv("STARLET_AUDIO_PROBE_SECONDS");
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    require(file != nullptr, "the limited probe writes its file");
+    std::fseek(file, 0, SEEK_END);
+    const long size = std::ftell(file);
+    std::fclose(file);
+    std::remove(path.c_str());
+    require(size == 44 + 32000 * 4, "the dump stops at its limit: " + std::to_string(size));
+}
+
 }
 
 int main() {
@@ -279,6 +309,7 @@ int main() {
     push(true);
     pull(true);
     probe_dump();
+    probe_limit();
     // An audio driver SDL lacks stands in for a handheld without a device.
     setenv("SDL_AUDIODRIVER", "starlet-missing", 1);
     push(false);

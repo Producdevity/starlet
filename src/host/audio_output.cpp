@@ -188,15 +188,28 @@ struct AudioOutput::Impl {
         else write_wav_header(file, probe.rate, 0);
         std::vector<std::int16_t> chunk(4096 * 2);
         std::uint64_t frames_total = 0;
+        // The file stops growing after STARLET_AUDIO_PROBE_SECONDS (600 by default).
+        std::uint64_t limit = std::uint64_t(probe.rate) * 600;
+        if (const char* text = std::getenv("STARLET_AUDIO_PROBE_SECONDS"))
+            if (const long seconds = std::atol(text); seconds > 0) limit = std::uint64_t(probe.rate) * std::uint64_t(seconds);
+        bool full = false;
         auto next_line = Clock::now() + std::chrono::seconds(1);
         unsigned seconds = 0;
-        std::uint64_t last_callbacks = 0, last_late = 0, last_under = 0, last_under_frames = 0, last_dropped = 0;
+        std::uint64_t last_dw = 0, last_callbacks = 0, last_late = 0, last_under = 0, last_under_frames = 0, last_dropped = 0;
         const auto flush = [&] {
             for (;;) {
                 const std::size_t got = probe.ring.read(chunk.data(), 4096);
                 if (!got) break;
-                if (file) std::fwrite(chunk.data(), 4, got, file);
-                frames_total += got;
+                if (frames_total >= limit) {
+                    if (!full) std::fprintf(stderr, "starlet: audio-probe: the dump holds its limit of %llu s; later audio is not recorded\n",
+                                            (unsigned long long)(limit / probe.rate));
+                    full = true;
+                    continue;
+                }
+                const std::size_t keep = std::size_t(std::min<std::uint64_t>(got, limit - frames_total));
+                if (file) std::fwrite(chunk.data(), 4, keep, file);
+                frames_total += keep;
+                if (keep < got) frames_total = limit;
             }
         };
         while (probe.running.load(std::memory_order_acquire)) {
@@ -209,6 +222,11 @@ struct AudioOutput::Impl {
                                 under_frames = underrun_frames.load(), dropped = probe.dropped.load();
             const std::uint64_t max_us = probe.max_interval_us.exchange(0);
             const std::uint64_t min_level = probe.min_level.exchange(~std::uint64_t{0});
+            const std::uint64_t dw = dropped_writes.load();
+            // Quiet seconds are logged every 30 s; anything else at once.
+            const bool eventful = late != last_late || under != last_under || dropped != last_dropped || dw != last_dw;
+            last_dw = dw;
+            if (eventful || seconds % 30 == 0)
             std::fprintf(stderr,
                          "starlet: audio-probe: %us: callbacks %llu (nominal %llu), max interval %.1f ms, late %llu, "
                          "ring min %lld frames, underruns %llu (%llu frames), dump drops %llu, dropped writes %llu\n",
