@@ -79,9 +79,15 @@ GXDrawSyncCallback draw_sync_callback = nullptr;
 GXBreakPtCallback break_point_callback = nullptr;
 volatile BOOL draw_done = FALSE;
 OSThreadQueue finish_queue;
+// GXSetDrawDone calls and the draw-done interrupts raised so far. On the console the GPU reaches a
+// draw done long before the game sets the next one (JFWDisplay sets one without waiting after its
+// display copy and waits for another at the frame's end), so a wait returns at its own. The GPU
+// thread can fall frames behind (GL stalls); a wait that returned at an older one would let the
+// game free memory the GPU has yet to read. So the flag rises only once the newest one is reached.
+u32 draw_done_requests = 0, draw_done_arrivals = 0;
 
 void finish_interrupt() {
-    draw_done = TRUE;
+    if (s32(++draw_done_arrivals - draw_done_requests) >= 0) draw_done = TRUE;
     if (draw_done_callback) draw_done_callback();
     OSWakeupThread(&finish_queue);
 }
@@ -558,6 +564,7 @@ u16 GXReadDrawSync() { return gpu_token(); }
 void GXSetDrawDone() {
     frame_event('d');
     const BOOL enabled = OSDisableInterrupts();
+    ++draw_done_requests;
     GX_WRITE_U8(GX_FIFO_CMD_LOAD_BP_REG);
     GX_WRITE_U32(0x45000002u);
     GXFlush();

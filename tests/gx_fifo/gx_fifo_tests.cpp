@@ -11,8 +11,11 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -33,7 +36,12 @@ void require(bool value, const char* what) {
 class RecordingRenderer final : public gx_fifo::Renderer {
 public:
     void draw(const gx::State&, const gx::Draw&, gx::MemoryReader&) override { add("draw"); }
-    void wait_until_idle() override { add("idle"); }
+    void wait_until_idle() override {
+        // While gated, each interrupt waits for a release from the test.
+        while (gated.load() && !releases.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (gated.load()) --releases;
+        add("idle");
+    }
     void copy_display(const gx::DisplayCopy& copy, std::uint8_t* destination, std::size_t bytes) override {
         std::memset(destination, 0x80, bytes);
         add("display " + std::to_string(copy.width) + "x" + std::to_string(copy.height));
@@ -47,6 +55,8 @@ public:
     }
     std::vector<std::uint8_t> readback() override { return {}; }
     void print_stats(const gx_fifo::GpuCounters&) override {}
+    std::atomic<bool> gated{false};
+    std::atomic<int> releases{0};
 
     std::vector<std::string> take() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -183,6 +193,24 @@ int guest_main() {
     __GXAbort();
     require(renderer.saw("present 640x448"), "VI presents the copied XFB");
     require(gx_fifo::gpu_failure()[0] == 0, "no command stream failure");
+
+    // A draw done set without waiting and one waited for: the wait returns once the GPU passed
+    // the second, even when the first arrives while it waits.
+    interrupts.clear();
+    renderer.take();
+    renderer.gated = true;
+    GXSetDrawDone();
+    std::thread releaser([] {
+        for (int i = 0; i < 2; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            ++renderer.releases;
+        }
+    });
+    GXDrawDone();
+    require(interrupts == std::vector<std::string>{"done", "done"}, "the wait returns at the newest draw done");
+    releaser.join();
+    renderer.gated = false;
+
     return 0;
 }
 

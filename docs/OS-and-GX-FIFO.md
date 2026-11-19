@@ -252,6 +252,13 @@ The pixel engine's interrupts are raised on the GPU thread in command order: BP 
 token. A draw the renderer refuses (it throws) is reported once per message and skipped: the console's GPU would
 draw something and the stream after it stays valid. `gpu_failure()` names the first command stream failure.
 
+`GXWaitDrawDone` returns once the GPU has passed the newest `GXSetDrawDone`. The SDK's flag rises at any draw-done
+interrupt; on the console the GPU reaches a draw done long before the game sets the next one, so the flag means
+its own. JFWDisplay sets one without waiting after its display copy and waits for another at the end of the frame,
+and the GPU thread can fall frames behind the game (GL stalls): an older draw done would end that wait, the game
+would run frames ahead of the GPU, and free and reuse memory the GPU had yet to read (The Wind Waker's actors at a
+stage change). Each draw-done interrupt still calls the game's callback.
+
 A token whose callback read the EFB carries an EFB snapshot taken as it executed; it and later interrupts are
 raised once that snapshot is read back, and the guest releases it. Other tokens carry no snapshot. See below.
 
