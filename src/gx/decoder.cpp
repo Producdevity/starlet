@@ -667,6 +667,7 @@ Status Decoder::feed(ByteView bytes) try {
         Parse result;
         if (!bp_command(input.data, input.size, 0, budget, result)) result = command(input, consumed, 0, budget);
         if (result == Parse::failed) {
+            if (!buffered && input.data[0] == 0x40 && consumed == 9 && input.size >= 9) status_.resume = offset + 9;
             break;
         }
         if (result == Parse::complete) {
@@ -752,6 +753,15 @@ bool Decoder::extend_pending(ByteView bytes) {
     pending_.insert(pending_.end(), bytes.data, bytes.data + bytes.size);
     STARLET_GX_TRACE_DECODER_RESULT(true);
     return true;
+}
+
+void Decoder::recover() {
+    STARLET_GX_TRACE_DECODER(trace::Op::recover);
+    if (feeding_) return;
+    status_ = {};
+    pending_.clear();
+    pending_required_ = 0;
+    runs_.clear();
 }
 
 Status Decoder::finish() try {

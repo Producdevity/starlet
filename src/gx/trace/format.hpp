@@ -33,7 +33,7 @@ enum class Op : std::uint8_t {
     array = 3,      // address, size, native_unit, host_order: array_view result
     state = 10,     // decoder state the following calls start from
     // Decoder calls, each closed by call_end after the events it caused.
-    feed = 20, extend = 21, finish = 22, call_list = 23, inject = 24, texture_extent = 25, load_tlut = 26,
+    feed = 20, extend = 21, finish = 22, call_list = 23, inject = 24, texture_extent = 25, load_tlut = 26, recover = 27,
     call_end = 29,  // error, bool result
     // Sink callbacks during a decoder call, each closed by sink_end.
     sink_draw = 30, sink_bp = 31, sink_invalidate = 32, sink_host = 33, sink_filter = 34,

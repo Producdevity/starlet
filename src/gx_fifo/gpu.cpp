@@ -650,15 +650,26 @@ private:
             }
             try {
                 if (job.used) feed({job.bytes.data(), job.used});
-                buffer_pool.give(std::move(job.bytes));
-                if (job.call) job.call();
             } catch (const std::exception& error) {
                 const auto& st = decoder_->state();
                 char detail[160];
                 std::snprintf(detail, sizeof detail, " (bp 00=%06x 22=%06x 43=%06x 44=%06x 68=%06x)", st.bp(0x00), st.bp(0x22),
                               st.bp(0x43), st.bp(0x44), st.bp(0x68));
                 report(std::string("GX command failed: ") + error.what() + detail);
-                new_decoder();
+                decoder_->recover();
+                try {
+                    run_dropped_draw_done({job.bytes.data(), job.used});
+                } catch (const std::exception& again) {
+                    report(std::string("GX command failed: ") + again.what());
+                    decoder_->recover();
+                }
+            }
+            buffer_pool.give(std::move(job.bytes));
+            // A call (a peek, a snapshot, a presentation) leaves the command stream as it was.
+            try {
+                if (job.call) job.call();
+            } catch (const std::exception& error) {
+                report(std::string("GX call failed: ") + error.what());
             }
             pump();
             std::lock_guard<std::mutex> lock(mutex_);
@@ -668,13 +679,33 @@ private:
         if (setup_.stop) setup_.stop();
     }
 
+    // The draw-done write GXSetDrawDone ends its submission with, before GXFlush's padding NOPs.
+    static constexpr std::uint8_t draw_done_write[5] = {0x61, 0x45, 0x00, 0x00, 0x02};
+
     void feed(gx::ByteView bytes) {
         decoded_ += bytes.size;
-        const auto status = decoder_->feed(bytes);
-        if (!status) {
+        for (;;) {
+            const auto status = decoder_->feed(bytes);
+            if (status) return;
             report("GX command stream failed: " + status.message);
-            new_decoder();
+            decoder_->recover();
+            if (status.resume && status.resume < bytes.size) {
+                bytes = {bytes.data + status.resume, bytes.size - status.resume};
+                continue;
+            }
+            run_dropped_draw_done(bytes);
+            return;
         }
+    }
+    // A failure with no command boundary after it drops the rest of the submission, but a game
+    // waiting for the draw done that ends it still gets it, as the console's GPU reads on to it.
+    void run_dropped_draw_done(gx::ByteView bytes) {
+        std::size_t end = bytes.size;
+        while (end && !bytes.data[end - 1]) --end;
+        if (end <= sizeof draw_done_write ||
+            std::memcmp(bytes.data + end - sizeof draw_done_write, draw_done_write, sizeof draw_done_write) != 0)
+            return;
+        if (!decoder_->feed({draw_done_write, sizeof draw_done_write})) decoder_->recover();
     }
 
     void report(const std::string& message) {

@@ -252,6 +252,13 @@ The pixel engine's interrupts are raised on the GPU thread in command order: BP 
 token. A draw the renderer refuses (it throws) is reported once per message and skipped: the console's GPU would
 draw something and the stream after it stays valid. `gpu_failure()` names the first command stream failure.
 
+A command the decoder refuses (garbage in a display list the game freed and reused, for one) is reported and the
+decoder recovers (`Decoder::recover`): the registers keep their values, as the console's GPU keeps them whatever it
+reads, since the game never sends again the state it believes the GPU holds. A failed display list ends there and
+the stream goes on after its call. A failure with no command boundary after it drops the rest of its submission;
+the draw-done write that ends a `GXSetDrawDone` submission still runs, so the game waiting for it goes on. A failed
+call on the GPU thread (a peek outside the EFB) is reported and leaves the stream alone.
+
 `GXWaitDrawDone` returns once the GPU has passed the newest `GXSetDrawDone`. The SDK's flag rises at any draw-done
 interrupt; on the console the GPU reaches a draw done long before the game sets the next one, so the flag means
 its own. JFWDisplay sets one without waiting after its display copy and waits for another at the end of the frame,

@@ -121,6 +121,10 @@ enum class Error {
 struct Status {
     Error error = Error::none;
     std::string message;
+    // After a failed feed: the offset in its bytes just past the display-list call whose list
+    // failed, where the stream goes on as the console's GPU goes on after a list's last byte;
+    // 0 when the failure leaves no known command boundary.
+    std::size_t resume = 0;
     explicit operator bool() const { return error == Error::none; }
 };
 
@@ -154,9 +158,14 @@ public:
     };
     const Counts& counts() const { return counts_; }
     // Feeds may end anywhere, including within a vertex. Whole commands commit in order.
-    // Errors latch; discard this decoder after failure. Earlier commands remain applied.
+    // Errors latch until recover(). Earlier commands remain applied.
     // Processing exceptions latch failure and propagate without changing their type.
     Status feed(ByteView bytes);
+    // Clears a latched failure and drops the unfinished command, for a stream that goes on
+    // after bytes the decoder refused. The registers and memories keep what the commands
+    // before the failure wrote, as the console's GPU keeps them whatever it reads. Not from
+    // the decoder's callbacks.
+    void recover();
     // Appends bytes that only extend a buffered command which they cannot complete;
     // false leaves the decoder unchanged and the caller uses feed.
     bool extend_pending(ByteView bytes);

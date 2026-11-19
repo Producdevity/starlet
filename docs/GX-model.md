@@ -28,7 +28,7 @@ The renderer implements `CommandSink`. The port provides `MemoryReader` over reg
 
 - `Decoder::feed` takes big-endian FIFO or display-list bytes. `write_u8/u16/u32/f32` replace a port's write-gather writes. All paths mutate the same state in command order.
 - `finish` checks a submission boundary for a truncated command. It does not clear state.
-- Errors latch. Commands already completed stay applied. Discard a failed decoder.
+- Errors latch. Commands already completed stay applied. `recover` clears the failure and drops the unfinished command; the registers and memories keep what the commands before it wrote, as the console's GPU keeps them whatever it reads. A game sends only the state it changed, so a fresh decoder would draw every later frame without the rest.
 - An exception from a callback or from decoder allocation also latches before propagating with its original type. The latched failure message is empty so handling an allocation failure does not itself allocate. After catching one, later feeds cannot replay a partially processed command.
 - The decoder buffers at most one bounded command, reads every display-list call into a fresh owned snapshot, and limits nesting, expanded input and command count per feed. Nesting has an absolute ceiling of 64. The other limits are configurable.
 - Every applied BP write reaches the sink, which must reject operations it cannot implement. The decoder handles CP state, XF writes, the four indexed XF arrays, VCD/VAT vertex sizing, TLUT loads and vertex-cache invalidation. Unsupported opcodes, CP addresses, formats and out-of-range transfers fail with an error.

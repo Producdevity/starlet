@@ -461,6 +461,7 @@ private:
             return;
         }
         case Op::finish: status = decoder_->finish(); break;
+        case Op::recover: decoder_->recover(); status = decoder_->status(); break;
         case Op::call_list: {
             const bool owned = in_->u8();
             const auto b = in_->bytes();
@@ -538,6 +539,7 @@ private:
         }
         case Op::state: TraceAccess::load(*decoder_, *in_); break;
         case Op::feed: case Op::extend: case Op::finish: case Op::call_list: case Op::inject: case Op::texture_extent: case Op::load_tlut:
+        case Op::recover:
             decoder_call(op);
             break;
         case Op::draw_direct: case Op::draw: {

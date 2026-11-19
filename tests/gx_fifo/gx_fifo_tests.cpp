@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <string>
 #include <vector>
@@ -47,7 +48,10 @@ public:
         add("display " + std::to_string(copy.width) + "x" + std::to_string(copy.height));
     }
     void copy_texture(const gx::TextureCopy&, std::uint8_t*, std::size_t, std::uint32_t) override { add("texture"); }
-    std::uint32_t peek_depth(int x, int y) override { return std::uint32_t(x * 1000 + y); }
+    std::uint32_t peek_depth(int x, int y) override {
+        if (x >= 640) throw std::invalid_argument("depth query outside the EFB");
+        return std::uint32_t(x * 1000 + y);
+    }
     std::uint32_t peek_color(int x, int y) override { return 0xff000000u | std::uint32_t(x << 8 | y); }
     bool present(const gx::FramebufferView& frame, int, int, bool black) override {
         add(black ? std::string("present black") : "present " + std::to_string(frame.width) + "x" + std::to_string(frame.height));
@@ -211,6 +215,31 @@ int guest_main() {
     releaser.join();
     renderer.gated = false;
 
+    // A peek the renderer refuses reads 0 and leaves the stream alone.
+    GXPeekZ(700, 0, &z);
+    require(z == 0, "a refused peek reads 0");
+    token(0x4343);
+    GXDrawDone();
+    require(GXReadDrawSync() == 0x4343, "the stream goes on after a refused peek");
+
+    // A failed display list ends there; the stream goes on after its call.
+    interrupts.clear();
+    std::uint8_t* list = arena + 16 * fifo_size;
+    std::memset(list, 0x7f, 32);
+    GX_WRITE_U8(0x40);
+    GX_WRITE_U32(os::native_to_physical(list));
+    GX_WRITE_U32(32);
+    token(0x4444);
+    GXDrawDone();
+    require(gx_fifo::gpu_failure()[0] != 0, "the failed list is reported");
+    require(interrupts == std::vector<std::string>{"token 17476", "done"}, "commands after a failed list run");
+
+    // Garbage with no command boundary after it: the draw done that ends the submission still runs.
+    interrupts.clear();
+    GX_WRITE_U8(0x7f);
+    token(0x4545);
+    GXDrawDone();
+    require(interrupts == std::vector<std::string>{"done"}, "the draw done after unparsable bytes runs");
     return 0;
 }
 

@@ -852,13 +852,34 @@ void sdk_state_write_cache() {
     require(write(0x41000008) && starlet_gx_xf_keep(&cache, 0x40, 123, 0), "generation wrap cannot resurrect old state");
 }
 
+// recover() clears a latched failure and drops the unfinished command; the registers keep what
+// the commands before it wrote.
+void recovery_keeps_state() {
+    Memory memory; Sink sink; Decoder d(memory, sink);
+    position_xy_u8(d); bp(d, 0x12, 0x123456);
+    const std::uint8_t bad[] = {0x7f};
+    require(d.feed({bad, sizeof(bad)}).error == Error::unknown_opcode, "unknown opcode latches");
+    require(d.write_u8(0x00).error == Error::unknown_opcode, "the failure stays latched until recovery");
+    d.recover();
+    ok(d.status());
+    require(d.state().bp(0x12) == 0x123456 && d.state().cp(0x50) == 0x200, "recovery keeps the registers");
+    point(d);
+    require(sink.draws.size() == 1, "draws after recovery use the kept vertex layout");
+    ok(d.write_u8(0x61)); ok(d.write_u8(0x13));
+    d.recover();
+    point(d);
+    require(sink.draws.size() == 2 && d.state().bp(0x13) == 0, "recovery drops the unfinished command");
+    ok(d.finish());
+}
+
 int main() {
     try {
         bp_mask_and_order(); tev_register_banks(); texgen_fields(); layouts_and_streaming(); layout_revision_ignores_arrays(); indexed_xf_and_bounds(); indexed_xf_reader_hook();
         palettes_snapshot_and_reload(); host_palette_loads(); lists_mutation_and_shared_state(); rejected_inputs_and_limits(); failed_memory_is_not_applied(); immutable_list_during_execution();
         callback_reentry_is_rejected(); processing_exceptions_latch(); merged_primitives(); every_split_boundary();
         host_commands_and_filtered_bp(); tev_banks_in_fed_writes(); list_fast_path_matches_general_path(); selective_bp_notifications(); sdk_state_write_cache(); indexed_list_state_footprint(); xf_numeric_transfers();
-        std::cout << "GX core: 20 test groups passed\n";
+        recovery_keeps_state();
+        std::cout << "GX core: 21 test groups passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "GX core failure: " << error.what() << '\n';
