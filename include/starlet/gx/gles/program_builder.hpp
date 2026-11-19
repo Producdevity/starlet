@@ -21,6 +21,8 @@ struct GlesProgramBuilderStats {
     bool planned = false; // The lists are read; to_build counts their programs missing from the cache.
     bool lists_done = false;
     std::size_t listed = 0, to_build = 0, finished = 0, built = 0, rejected = 0, failed = 0, requested = 0;
+    // Renderer requests no worker has taken yet, and those queued or being built (queued <= pending).
+    std::size_t queued = 0, pending = 0;
 };
 
 // How requested programs are built once background() ends the start-up phase.
@@ -54,6 +56,8 @@ public:
     void done(std::uint64_t key) { pending_.erase(key); }
     bool pending(std::uint64_t key) const { return pending_.count(key) != 0; }
     bool queued() const { return !queue_.empty(); }
+    std::size_t queued_count() const { return queue_.size(); }
+    std::size_t pending_count() const { return pending_.size(); }
     void clear() { queue_.clear(); pending_.clear(); }
 
 private:

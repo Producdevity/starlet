@@ -170,6 +170,11 @@ bool GlesProgramBuilder::claim(const std::string& vertex, const std::string& fra
 
 GlesProgramBuilderStats GlesProgramBuilder::stats() const {
     GlesProgramBuilderStats s;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        s.queued = requests_.queued_count();
+        s.pending = requests_.pending_count();
+    }
     s.running = running();
     s.planned = planned_;
     s.to_build = s.planned ? todo_.size() : 0;

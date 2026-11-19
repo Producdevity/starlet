@@ -579,6 +579,7 @@ void unready_program_policy() {
     check(!requests.claim(1) && requests.pending(1), "the GL thread does not take back a request a worker builds");
     check(requests.claim(2) && !requests.pending(2) && !requests.queued() && !requests.take(taken, false),
           "the GL thread takes back a queued request, so no worker builds it again");
+    check(requests.queued_count() == 0 && requests.pending_count() == 1, "queued requests are always pending: one in flight, none queued");
     requests.done(1);
     check(!requests.pending(1) && !requests.claim(1) && requests.add(1, "v1", "f1"), "a finished request can be made again");
     GlesRenderer renderer; Fixture f;

@@ -472,6 +472,8 @@ every consumed array span is unchanged.
   normal priority): builds took 28-230 ms, and about two thirds of the GL thread's links repeated a build already in
   flight. Leaving those to the workers cut the GL thread's links from 23-25 to 10 per run and frames over 100 ms
   from 33-36 to 24, with as many draws skipped (1018-1143 before, 1115-1252 after).
+- `tools/replay-all.sh` replays every recorded trace with an empty program cache and the builder running, and fails
+  when a program stays undelivered or the builder's books are inconsistent (docs/Replay-traces.md, Cold program cache).
 
 ### Batch entry (packets)
 
