@@ -237,6 +237,8 @@ void probe_dump() {
             if (output.write(block.data(), 160)) written += 160;
             wait_ms(3);
         }
+        // The producer stops: the device drains the ring, then gets silence for the rest.
+        wait_ms(900);
         output.close();
     }
     unsetenv("STARLET_AUDIO_PROBE");
@@ -260,6 +262,11 @@ void probe_dump() {
     std::size_t run = 0;
     while (at + run < count && follows(frames.data() + (at + run) * 2, 1, std::uint32_t(run))) ++run;
     require(run >= 1000, "the pushed frames follow each other in the dump: " + std::to_string(run));
+    // After the last pushed frame the device callback wrote only zeros, never stale ring memory.
+    std::size_t tail = at + run;
+    require(count - tail > 1000, "an underrun follows the pushed frames in the dump");
+    for (std::size_t i = tail; i < count; ++i)
+        require(frames[i * 2] == 0 && frames[i * 2 + 1] == 0, "an underrun plays silence, not stale samples");
 }
 
 }
