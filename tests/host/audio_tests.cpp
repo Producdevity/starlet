@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -218,6 +219,49 @@ void rejects() {
     require(!output.write(nullptr, 0), "no write before open");
 }
 
+// STARLET_AUDIO_PROBE writes what the device callback received: the pushed frames in order, after
+// the silence before the device primes.
+void probe_dump() {
+    const std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/starlet-audio-probe-test.wav";
+    std::remove(path.c_str());
+    setenv("STARLET_AUDIO_PROBE", path.c_str(), 1);
+    constexpr unsigned rate = 32000;
+    {
+        AudioOutput output;
+        output.open_push(rate, 500);
+        std::vector<std::int16_t> block;
+        std::uint32_t written = 0;
+        const auto started = Clock::now();
+        while (Clock::now() - started < std::chrono::milliseconds(1500)) {
+            fill(block, 160, written);
+            if (output.write(block.data(), 160)) written += 160;
+            wait_ms(3);
+        }
+        output.close();
+    }
+    unsetenv("STARLET_AUDIO_PROBE");
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    require(file != nullptr, "the probe writes its file");
+    std::vector<unsigned char> bytes(1 << 22);
+    const std::size_t size = std::fread(bytes.data(), 1, bytes.size(), file);
+    std::fclose(file);
+    std::remove(path.c_str());
+    require(size > 44 && std::memcmp(bytes.data(), "RIFF", 4) == 0 && std::memcmp(bytes.data() + 36, "data", 4) == 0, "a WAV header");
+    std::uint32_t data = 0, sample_rate = 0;
+    std::memcpy(&data, bytes.data() + 40, 4);
+    std::memcpy(&sample_rate, bytes.data() + 24, 4);
+    require(sample_rate == rate && data == size - 44 && data % 4 == 0, "the header matches the data written");
+    std::vector<std::int16_t> frames(data / 2);
+    std::memcpy(frames.data(), bytes.data() + 44, data);
+    const std::size_t count = data / 4;
+    std::size_t at = 0;
+    while (at + 1 < count && !(frames[at * 2] == 0 && frames[at * 2 + 1] == -1 && frames[at * 2 + 2] == 1)) ++at;
+    require(count > 2000 && at + 1 < count, "the dump holds the pushed frames");
+    std::size_t run = 0;
+    while (at + run < count && follows(frames.data() + (at + run) * 2, 1, std::uint32_t(run))) ++run;
+    require(run >= 1000, "the pushed frames follow each other in the dump: " + std::to_string(run));
+}
+
 }
 
 int main() {
@@ -227,6 +271,7 @@ int main() {
     rejects();
     push(true);
     pull(true);
+    probe_dump();
     // An audio driver SDL lacks stands in for a handheld without a device.
     setenv("SDL_AUDIODRIVER", "starlet-missing", 1);
     push(false);

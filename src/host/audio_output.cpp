@@ -11,7 +11,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <glob.h>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -35,6 +38,49 @@ void name_thread(const char* name) {
 
 enum class Mode { closed, pull, push };
 
+std::string read_text(const char* path) {
+    std::string text;
+    if (std::FILE* file = std::fopen(path, "r")) {
+        char buffer[512];
+        std::size_t n;
+        while ((n = std::fread(buffer, 1, sizeof buffer, file)) > 0) text.append(buffer, n);
+        std::fclose(file);
+    }
+    for (char& c : text)
+        if (c == '\n') c = ' ';
+    return text;
+}
+
+// Development probe (STARLET_AUDIO_PROBE=<file.wav>): writes what the SDL callback hands the
+// device as a WAV and logs the callback timing and the ALSA state of the playing devices.
+struct Probe {
+    AudioRing ring;
+    std::thread writer;
+    std::atomic<bool> running{false};
+    std::string path;
+    unsigned rate = 0, nominal_frames = 0;
+    Clock::time_point last{};
+    bool have_last = false;
+    std::atomic<std::uint64_t> callbacks{0}, late{0}, max_interval_us{0}, min_level{~std::uint64_t{0}}, dropped{0};
+    std::atomic<std::uint64_t> frames_written{0};
+};
+
+void write_wav_header(std::FILE* file, unsigned rate, std::uint64_t frames) {
+    auto le32 = [](std::uint8_t* p, std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) p[i] = std::uint8_t(v >> (8 * i));
+    };
+    const std::uint32_t bytes = std::uint32_t(frames * 4);
+    std::uint8_t h[44] = {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0, 2, 0,
+                          0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 16, 0, 'd', 'a', 't', 'a', 0, 0, 0, 0};
+    le32(h + 4, 36 + bytes);
+    le32(h + 24, rate);
+    le32(h + 28, rate * 4);
+    le32(h + 40, bytes);
+    std::fseek(file, 0, SEEK_SET);
+    std::fwrite(h, 1, sizeof h, file);
+    std::fseek(file, 0, SEEK_END);
+}
+
 }
 
 struct AudioOutput::Impl {
@@ -57,6 +103,8 @@ struct AudioOutput::Impl {
         dropped_frames{0};
     mutable std::mutex error_mutex;
     std::string error;
+    Probe probe;
+    std::atomic<bool> probing{false};
 
     void set_error(std::string text) {
         std::lock_guard<std::mutex> lock(error_mutex);
@@ -78,6 +126,29 @@ struct AudioOutput::Impl {
     }
 
     void consume(std::int16_t* out, std::size_t count) noexcept {
+        if (probing.load(std::memory_order_relaxed)) probe_begin(count);
+        fill(out, count);
+        if (probing.load(std::memory_order_relaxed) && !probe.ring.write(out, count))
+            probe.dropped.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    void probe_begin(std::size_t count) noexcept {
+        const auto now = Clock::now();
+        probe.callbacks.fetch_add(1, std::memory_order_relaxed);
+        if (probe.have_last) {
+            const auto interval = std::uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - probe.last).count());
+            std::uint64_t old = probe.max_interval_us.load(std::memory_order_relaxed);
+            while (old < interval && !probe.max_interval_us.compare_exchange_weak(old, interval, std::memory_order_relaxed)) {}
+            if (interval > 2 * 1000000ull * count / std::max(1u, rate)) probe.late.fetch_add(1, std::memory_order_relaxed);
+        }
+        probe.last = now;
+        probe.have_last = true;
+        const std::uint64_t level = ring.level();
+        std::uint64_t old = probe.min_level.load(std::memory_order_relaxed);
+        while (old > level && !probe.min_level.compare_exchange_weak(old, level, std::memory_order_relaxed)) {}
+    }
+
+    void fill(std::int16_t* out, std::size_t count) noexcept {
         if (!primed.load(std::memory_order_relaxed)) {
             if (ring.level() < start_level) {
                 std::memset(out, 0, count * 4);
@@ -90,6 +161,97 @@ struct AudioOutput::Impl {
         std::memset(out + got * 2, 0, (count - got) * 4);
         underruns.fetch_add(1, std::memory_order_relaxed);
         underrun_frames.fetch_add(count - got, std::memory_order_relaxed);
+    }
+
+    void probe_alsa(bool params) const {
+        glob_t found{};
+        if (glob("/proc/asound/card*/pcm*p/sub0/status", 0, nullptr, &found) == 0) {
+            for (std::size_t i = 0; i < found.gl_pathc; ++i) {
+                const std::string status = read_text(found.gl_pathv[i]);
+                if (status.find("RUNNING") == std::string::npos && status.find("XRUN") == std::string::npos &&
+                    status.find("PREPARED") == std::string::npos && status.find("DRAINING") == std::string::npos) continue;
+                std::fprintf(stderr, "starlet: audio: alsa %s: %s\n", found.gl_pathv[i], status.c_str());
+                if (params) {
+                    std::string hw = found.gl_pathv[i];
+                    hw.replace(hw.rfind("status"), 6, "hw_params");
+                    std::fprintf(stderr, "starlet: audio: alsa %s: %s\n", hw.c_str(), read_text(hw.c_str()).c_str());
+                }
+            }
+        }
+        globfree(&found);
+    }
+
+    void probe_thread() noexcept {
+        name_thread("starlet-aprobe");
+        std::FILE* file = std::fopen(probe.path.c_str(), "wb");
+        if (!file) std::fprintf(stderr, "starlet: audio-probe: cannot write %s\n", probe.path.c_str());
+        else write_wav_header(file, probe.rate, 0);
+        std::vector<std::int16_t> chunk(4096 * 2);
+        std::uint64_t frames_total = 0;
+        auto next_line = Clock::now() + std::chrono::seconds(1);
+        unsigned seconds = 0;
+        std::uint64_t last_callbacks = 0, last_late = 0, last_under = 0, last_under_frames = 0, last_dropped = 0;
+        const auto flush = [&] {
+            for (;;) {
+                const std::size_t got = probe.ring.read(chunk.data(), 4096);
+                if (!got) break;
+                if (file) std::fwrite(chunk.data(), 4, got, file);
+                frames_total += got;
+            }
+        };
+        while (probe.running.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            flush();
+            if (Clock::now() < next_line) continue;
+            next_line += std::chrono::seconds(1);
+            ++seconds;
+            const std::uint64_t cb = probe.callbacks.load(), late = probe.late.load(), under = underruns.load(),
+                                under_frames = underrun_frames.load(), dropped = probe.dropped.load();
+            const std::uint64_t max_us = probe.max_interval_us.exchange(0);
+            const std::uint64_t min_level = probe.min_level.exchange(~std::uint64_t{0});
+            std::fprintf(stderr,
+                         "starlet: audio-probe: %us: callbacks %llu (nominal %llu), max interval %.1f ms, late %llu, "
+                         "ring min %lld frames, underruns %llu (%llu frames), dump drops %llu, dropped writes %llu\n",
+                         seconds, (unsigned long long)(cb - last_callbacks),
+                         (unsigned long long)(std::uint64_t(rate) / std::max(1u, probe.nominal_frames)),
+                         double(max_us) / 1000.0, (unsigned long long)(late - last_late),
+                         min_level == ~std::uint64_t{0} ? -1ll : (long long)min_level,
+                         (unsigned long long)(under - last_under), (unsigned long long)(under_frames - last_under_frames),
+                         (unsigned long long)(dropped - last_dropped), (unsigned long long)dropped_writes.load());
+            last_callbacks = cb, last_late = late, last_under = under, last_under_frames = under_frames, last_dropped = dropped;
+            if (seconds == 3 || seconds % 5 == 0) probe_alsa(seconds == 3);
+            if (file && seconds % 2 == 0) {
+                std::fflush(file);
+                write_wav_header(file, probe.rate, frames_total);
+                std::fflush(file);
+            }
+        }
+        flush();
+        if (file) {
+            write_wav_header(file, probe.rate, frames_total);
+            std::fclose(file);
+        }
+    }
+
+    void probe_start() {
+        const char* path = std::getenv("STARLET_AUDIO_PROBE");
+        if (!path || !*path || !device_open.load()) return;
+        probe.path = path;
+        probe.rate = rate;
+        probe.nominal_frames = device_frames.load();
+        probe.have_last = false;
+        for (auto* c : {&probe.callbacks, &probe.late, &probe.max_interval_us, &probe.dropped}) c->store(0);
+        probe.min_level.store(~std::uint64_t{0});
+        probe.ring.reset(std::size_t(rate) * 4);
+        probe.running.store(true, std::memory_order_release);
+        probe.writer = std::thread([this] { probe_thread(); });
+        probing.store(true, std::memory_order_release);
+    }
+
+    void probe_stop() noexcept {
+        probing.store(false, std::memory_order_release);
+        probe.running.store(false, std::memory_order_release);
+        if (probe.writer.joinable()) probe.writer.join();
     }
 
     static void SDLCALL callback(void* self, Uint8* stream, int bytes) {
@@ -126,6 +288,9 @@ struct AudioOutput::Impl {
         }
         device_frames = obtained.samples;
         device_open = true;
+        std::fprintf(stderr, "starlet: audio: SDL driver %s, %d Hz s16 stereo, device buffer %u frames (%u bytes)\n",
+                     SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?", obtained.freq, unsigned(obtained.samples),
+                     unsigned(obtained.size));
     }
 
     // Pull mode: one ~5 ms slice per tick on a steady clock, with the device buffer plus four
@@ -148,8 +313,11 @@ struct AudioOutput::Impl {
         const auto tick = std::chrono::nanoseconds(std::uint64_t(size) * 1000000000u / rate);
         while (running.load(std::memory_order_acquire) && ring.level() < start_level) produce();
         auto next = Clock::now() + tick;
+        unsigned ticks = 0;
         while (running.load(std::memory_order_acquire)) {
             std::this_thread::sleep_until(next);
+            // Once, a few seconds in: how the playing ALSA devices run, for logs from handhelds.
+            if (++ticks == 600 && !probing.load(std::memory_order_relaxed)) probe_alsa(true);
             const auto now = Clock::now();
             next = now - next > 4 * tick ? now + tick : next + tick;
             std::size_t queued = ring.level();
@@ -187,8 +355,10 @@ struct AudioOutput::Impl {
         running.store(true, std::memory_order_release);
         try {
             if (opened == Mode::pull) feeder = std::thread([this] { feed(); });
-            if (device) SDL_PauseAudioDevice(device, 0);
-            else silent = std::thread([this] { silent_clock(); });
+            if (device) {
+                probe_start();
+                SDL_PauseAudioDevice(device, 0);
+            } else silent = std::thread([this] { silent_clock(); });
         } catch (...) {
             stop();
             throw;
@@ -216,6 +386,7 @@ struct AudioOutput::Impl {
             SDL_CloseAudioDevice(device);
             device = 0;
         }
+        probe_stop();
         if (silent.joinable()) silent.join();
         if (sdl_audio) {
             SDL_QuitSubSystem(SDL_INIT_AUDIO);

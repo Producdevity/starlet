@@ -38,6 +38,12 @@ Without a device (no SDL audio driver, no card, a refused format) `device_error(
 so the game's DMA keeps finishing blocks. With the firmware volume at 0 the device plays
 normally; `frames`, `nonzero_samples` and `peak` show the game produced sound.
 
+Every open logs SDL's audio driver and the device buffer it granted, and a pull output logs the
+playing ALSA devices' `hw_params` and `status` once, about 3 s in. `STARLET_AUDIO_PROBE=<file.wav>`
+records what the device callback receives (the samples the speaker path is given, at the output
+rate) and logs once per second the callbacks and their longest interval, the ring's lowest level
+and the underruns, plus the ALSA status every 5 s. For development only.
+
 `open_*`, `close` and the destructor allocate host memory; a port with its own `operator new`
 (Galaxy's game arenas) calls them inside its host-allocation scope.
 
