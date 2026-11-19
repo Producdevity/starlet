@@ -46,8 +46,9 @@ struct GlesDirectLimits {
     // Fast shading with a cache: programs missing from it are built in the background while
     // their draws are skipped. Otherwise the GL thread compiles them before the draw.
     bool background_programs = true;
-    // A program its draws have waited for unready_link_ms since its request is linked by the
-    // GL thread itself: one frame as long as the link instead of a longer gap. 0 always waits.
+    // A program its draws have waited for unready_link_ms since its request, and that no builder
+    // worker has started, is linked by the GL thread itself: one frame as long as the link
+    // instead of a longer gap. 0 always waits.
     // A scene that needs many new programs at once would stall for all their links (seconds
     // on Mali), so the GL thread links again only unready_link_interval_ms after its last
     // link ended; meanwhile those draws wait for the builder.

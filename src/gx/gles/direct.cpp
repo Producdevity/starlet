@@ -1224,7 +1224,9 @@ struct GlesDirect::Impl {
             const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(now - p.requested_at);
             const auto since_link = last_fallback == std::chrono::steady_clock::time_point{} ? std::chrono::milliseconds::max()
                                   : std::chrono::duration_cast<std::chrono::milliseconds>(now - last_fallback);
-            if (!link_unready_program(p.requested, waited, limits.unready_link_ms, since_link, limits.unready_link_interval_ms)) {
+            // A program a worker already compiles is left to it: linking it here would repeat the compile.
+            if (!link_unready_program(p.requested, waited, limits.unready_link_ms, since_link, limits.unready_link_interval_ms) ||
+                !builder->claim(v, f)) {
                 if (!p.requested) { p.requested = true; p.requested_at = now; builder->request(v, f); }
                 p.unbuilt = gl_segments;
                 return false;

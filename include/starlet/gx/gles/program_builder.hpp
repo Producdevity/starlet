@@ -41,6 +41,26 @@ typename Queue::value_type take_request(Queue& queue, bool newest_first) {
     return job;
 }
 
+// Requested programs by source key: queued until a worker takes one, then in flight until done.
+class ProgramRequests {
+public:
+    struct Request { std::uint64_t key = 0; std::string vertex, fragment; };
+    // False when the program is already queued or in flight.
+    bool add(std::uint64_t key, std::string vertex, std::string fragment);
+    // The next queued request, now in flight; false when none is queued.
+    bool take(Request& request, bool newest_first);
+    // Removes a queued request that no worker has taken; false when in flight or not requested.
+    bool claim(std::uint64_t key);
+    void done(std::uint64_t key) { pending_.erase(key); }
+    bool pending(std::uint64_t key) const { return pending_.count(key) != 0; }
+    bool queued() const { return !queue_.empty(); }
+    void clear() { queue_.clear(); pending_.clear(); }
+
+private:
+    std::deque<Request> queue_;
+    std::unordered_set<std::uint64_t> pending_;
+};
+
 // Builds programs into a program cache on threads with their own EGL contexts sharing
 // the current one, so draws load binaries instead of compiling: first the fast programs
 // of program lists (see ProgramList) missing from the cache, then whatever the renderer
@@ -62,6 +82,9 @@ public:
     void request(const std::string& vertex, const std::string& fragment);
     // Requested and neither stored nor failed yet.
     bool building(const std::string& vertex, const std::string& fragment) const;
+    // Takes back a request no worker has started, for the caller to link itself; false while
+    // a worker builds it or when it is not requested.
+    bool claim(const std::string& vertex, const std::string& fragment);
     GlesProgramBuilderStats stats() const;
 
 private:
@@ -78,8 +101,7 @@ private:
     std::vector<std::unique_ptr<Context>> contexts_;
     mutable std::mutex mutex_;
     std::condition_variable wake_;
-    std::deque<std::pair<std::string, std::string>> requests_;
-    std::unordered_set<std::uint64_t> building_;
+    ProgramRequests requests_;
     std::vector<Entry> todo_; // Written before planned_, then read only.
     std::atomic<std::size_t> next_{0}, finished_{0};
     std::atomic<bool> stop_{false}, planned_{false}, background_{false};

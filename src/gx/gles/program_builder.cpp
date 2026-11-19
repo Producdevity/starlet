@@ -130,18 +130,42 @@ void GlesProgramBuilder::background() {
     wake_.notify_all();
 }
 
+bool ProgramRequests::add(std::uint64_t key, std::string vertex, std::string fragment) {
+    if (!pending_.insert(key).second) return false;
+    queue_.push_back({key, std::move(vertex), std::move(fragment)});
+    return true;
+}
+
+bool ProgramRequests::take(Request& request, bool newest_first) {
+    if (queue_.empty()) return false;
+    request = take_request(queue_, newest_first);
+    return true;
+}
+
+bool ProgramRequests::claim(std::uint64_t key) {
+    const auto it = std::find_if(queue_.begin(), queue_.end(), [key](const Request& r) { return r.key == key; });
+    if (it == queue_.end()) return false;
+    queue_.erase(it);
+    pending_.erase(key);
+    return true;
+}
+
 void GlesProgramBuilder::request(const std::string& vertex, const std::string& fragment) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (stop_ || !building_.insert(source_key(vertex, fragment)).second) return;
-        requests_.emplace_back(vertex, fragment);
+        if (stop_ || !requests_.add(source_key(vertex, fragment), vertex, fragment)) return;
     }
     wake_.notify_all();
 }
 
 bool GlesProgramBuilder::building(const std::string& vertex, const std::string& fragment) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return building_.count(source_key(vertex, fragment)) != 0;
+    return requests_.pending(source_key(vertex, fragment));
+}
+
+bool GlesProgramBuilder::claim(const std::string& vertex, const std::string& fragment) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return requests_.claim(source_key(vertex, fragment));
 }
 
 GlesProgramBuilderStats GlesProgramBuilder::stats() const {
@@ -167,15 +191,14 @@ void GlesProgramBuilder::build(const std::string& vertex, const std::string& fra
 
 // Builds one requested program; false when none is waiting.
 bool GlesProgramBuilder::serve_request() {
-    std::pair<std::string, std::string> job;
+    ProgramRequests::Request job;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (requests_.empty()) return false;
-        job = take_request(requests_, policy_.newest_first);
+        if (!requests_.take(job, policy_.newest_first)) return false;
     }
-    build(job.first, job.second, requested_);
+    build(job.vertex, job.fragment, requested_);
     std::lock_guard<std::mutex> lock(mutex_);
-    building_.erase(source_key(job.first, job.second));
+    requests_.done(job.key);
     return true;
 }
 
@@ -234,7 +257,7 @@ void GlesProgramBuilder::work(unsigned index) {
             std::lock_guard<std::mutex> lock(mutex_);
             planned_ = true;
             // Without a current context nothing completes; the renderer links requests itself.
-            if (!current) { stop_ = true; building_.clear(); }
+            if (!current) { stop_ = true; requests_.clear(); }
         }
         wake_.notify_all();
     } else {
@@ -276,7 +299,7 @@ void GlesProgramBuilder::work(unsigned index) {
         for (;;) {
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                wake_.wait(lock, [this] { return stop_ || !requests_.empty(); });
+                wake_.wait(lock, [this] { return stop_ || requests_.queued(); });
                 if (stop_) break;
             }
             while (!stop_ && serve_request()) {}

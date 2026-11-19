@@ -456,16 +456,22 @@ every consumed array span is unchanged.
   low-priority thread builds the rest and the programs the GL thread finds missing; draws using such a program are
   skipped until its binary can be loaded.
 - A draw whose program the builder has not delivered is skipped. Once its program has waited
-  `GlesDirectLimits::unready_link_ms` (default 67) since its request, the GL thread links it itself: one frame
-  lengthened by the link instead of a longer gap. The GL thread does that again only `unready_link_interval_ms`
-  (default 500) after its previous such link ended, because a scene that needs many new programs at once would
-  otherwise stall for all their links; those draws wait for the builder.
+  `GlesDirectLimits::unready_link_ms` (default 67) since its request and no worker has taken the request, the GL
+  thread takes it back and links the program itself: one frame lengthened by the link instead of a longer gap. A
+  program a worker already compiles stays with the worker: a second compile on the GL thread would end no sooner.
+  The GL thread links again only `unready_link_interval_ms` (default 500) after its previous such link ended,
+  because a scene that needs many new programs at once would otherwise stall for all their links; those draws wait
+  for the builder.
 - Measured on muos_35-h (H700, Mali-G31 r20): a GL-thread link takes 76-422 ms beside a busy game. Pikmin 2 from an
   empty cache without a program list, landing in Awakening Wood (200 s): 48,484 draws skipped without the GL-thread
   link, 33,054 with 67/500, 28,085 with 50/250, and 10,805 with 50/250 plus `builder_policy.request_workers` 2 at
   `normal_priority`; the longest frame stayed within 469-544 ms. Without the interval (50/0) only 996 were skipped,
   but the landing linked 43 programs back to back in one 5.5 s frame. Program lists remove these builds; this
-  bounds what lists miss.
+  bounds what lists miss. These Pikmin 2 counts predate the rule that leaves a started build to its worker.
+- The Wind Waker on muos_35-sp (H700, Mali-G31 r20), empty cache, title to Outset (50/250, two request workers at
+  normal priority): builds took 28-230 ms, and about two thirds of the GL thread's links repeated a build already in
+  flight. Leaving those to the workers cut the GL thread's links from 23-25 to 10 per run and frames over 100 ms
+  from 33-36 to 24, with as many draws skipped (1018-1143 before, 1115-1252 after).
 
 ### Batch entry (packets)
 

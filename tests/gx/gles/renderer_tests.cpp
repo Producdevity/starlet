@@ -570,6 +570,17 @@ void unready_program_policy() {
     std::deque<int> queue{1, 2, 3};
     check(take_request(queue, false) == 1 && take_request(queue, true) == 3 && queue.size() == 1 && queue.front() == 2,
           "requests are taken oldest or newest first");
+    ProgramRequests requests;
+    ProgramRequests::Request taken;
+    check(requests.add(1, "v1", "f1") && requests.add(2, "v2", "f2") && !requests.add(1, "v1", "f1"),
+          "a program is requested once while pending");
+    check(requests.take(taken, false) && taken.key == 1 && taken.vertex == "v1" && requests.pending(1),
+          "a taken request stays pending while a worker builds it");
+    check(!requests.claim(1) && requests.pending(1), "the GL thread does not take back a request a worker builds");
+    check(requests.claim(2) && !requests.pending(2) && !requests.queued() && !requests.take(taken, false),
+          "the GL thread takes back a queued request, so no worker builds it again");
+    requests.done(1);
+    check(!requests.pending(1) && !requests.claim(1) && requests.add(1, "v1", "f1"), "a finished request can be made again");
     GlesRenderer renderer; Fixture f;
     renderer.draw_direct(f.decoder.state(), f.command(), f.memory); renderer.wait_until_idle();
     const auto stats = renderer.stats().direct;
