@@ -68,7 +68,8 @@ frames cost no presentation pass.
 - A frame shorter than the EFB's 528 rows keeps the rows below it in a strip, a target of its own, so passes over
   the frame never load or store them. Draws whose viewport reaches past the frame's last row render into both
   targets. Copies across that row read both (two blits, or one copy program with a second sampler); their clears
-  clear both. Fast copies that are neither are refused. A frame of all 528 rows has no strip.
+  clear both. Fast copies that are neither are refused. A frame of all 528 rows has no strip. Peeks into the
+  strip's rows read it live; depth peeks with no EFB write between them share one readback of its rows.
 - Offscreen passes (`begin_offscreen`/`end_offscreen`) swap both attachments for an EFB-sized colour and depth pair
   cleared to transparent black and the far plane. Draws, clears and copies in between use the pair; ending
   reattaches the EFB unchanged. This is the PC equivalent of the console's save and restore of an EFB corner:

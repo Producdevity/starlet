@@ -285,7 +285,11 @@ done, tokens, peeks that read the EFB and DMA over resident copies still wait fo
 ## EFB peeks
 
 `GXPeekARGB` and `GXPeekZ` read the EFB at their point in the command stream: top-left origin, D24 depth, colour
-as `0xAARRGGBB`. By default (`GpuSetup::sync_reads` off) the game does not wait for the GPU there:
+as `0xAARRGGBB`. Their x and y keep ten bits each, as the SDK packs them into the EFB address. All 528 rows are
+EFB memory: rows below a shorter frame read the strip target (`GLES-renderer.md`), live, as snapshots cover only the
+frame. The Wind Waker's sun, lantern and firefly tests peek down to row 526. What the console returns past x 639
+or row 527 is unverified: such a peek is reported and reads 0. By default (`GpuSetup::sync_reads` off) the game
+does not wait for the GPU there:
 
 - Peeks with no command between them form a group. Groups are numbered in the order they occur in a frame;
   `VIFlush` ends a frame.

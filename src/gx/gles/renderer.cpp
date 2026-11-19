@@ -405,6 +405,9 @@ struct GlesRenderer::Impl {
     // The EFB's packed depth, read whole by the first live depth peek after efb_writes reached
     // live_depth_writes; later peeks before the next EFB write read it (bottom row first).
     std::vector<std::uint8_t> live_depth;
+    // As live_depth for the strip's rows (EFB rows efb_height..527), bottom row first.
+    std::vector<std::uint8_t> live_strip_depth;
+    std::uint64_t live_strip_writes = ~std::uint64_t{0};
     // request_depth_readback: the whole EFB's packed depth read into a pixel-pack buffer, copied
     // into pixels once its fence has signalled.
     struct DepthReadback {
@@ -1196,7 +1199,11 @@ void main(){
     void present_gl(const FramebufferView&, int width, int height, bool black);
     // Packs D24 depth as RGB8 into target; with_color appends the EFB colour as a
     // second block of width columns.
-    void pack_efb(GLuint target, int x, int y, int width, int height, int scale = 1, bool with_color = false);
+    // Packs the depth (and colour) of the EFB's frame target, or of other depth and colour textures.
+    void pack_efb(GLuint target, int x, int y, int width, int height, int scale = 1, bool with_color = false,
+                  GLuint depth_texture = 0, GLuint color_texture = 0);
+    // A peek at EFB row y in the strip below the frame (efb_height <= y < 528), read live.
+    std::uint32_t peek_strip(int x, int y, bool color);
     // Stores width x height RGBA8 texels of texture from (x, y) into buffer as bytes, rows
     // stride texels apart from texel offset, as glReadPixels would pack them.
     void store_texels(GLuint texture, GLuint buffer, int x, int y, int width, int height, int offset, int stride) {
@@ -1835,7 +1842,8 @@ void main(){
     }
 };
 
-void GlesRenderer::Impl::pack_efb(GLuint target, int x, int y, int width, int height, int scale, bool with_color) {
+void GlesRenderer::Impl::pack_efb(GLuint target, int x, int y, int width, int height, int scale, bool with_color,
+                                  GLuint depth_texture, GLuint color_texture) {
     if (!depth_read_program) {
         GlesDrawPipeline p;
         p.vertex="#version 310 es\nvoid main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.0-1.0,0.0,1.0);}";
@@ -1854,8 +1862,8 @@ void GlesRenderer::Impl::pack_efb(GLuint target, int x, int y, int width, int he
     fullscreen_state();glBindFramebuffer(GL_FRAMEBUFFER,target);
     glViewport(0,0,with_color?2*width:width,height);glBindVertexArray(vao);glUseProgram(depth_read_program);
     glUniform4i(depth_read_position,x,y,scale,width);
-    glActiveTexture(GL_TEXTURE1);glBindSampler(1,0);glBindTexture(GL_TEXTURE_2D,color);
-    glActiveTexture(GL_TEXTURE0);glBindSampler(0,0);glBindTexture(GL_TEXTURE_2D,depth);
+    glActiveTexture(GL_TEXTURE1);glBindSampler(1,0);glBindTexture(GL_TEXTURE_2D,color_texture?color_texture:color);
+    glActiveTexture(GL_TEXTURE0);glBindSampler(0,0);glBindTexture(GL_TEXTURE_2D,depth_texture?depth_texture:depth);
     glDrawArrays(GL_TRIANGLES,0,3);
 }
 void GlesRenderer::Impl::read_depth(int x, int y, int width, int height, std::uint8_t* pixels, int snapshot_index) {
@@ -3053,9 +3061,10 @@ const std::uint8_t* GlesRenderer::Impl::peek_snapshot(int x, int y, bool color) 
 std::uint32_t GlesRenderer::peek_depth(int x, int y) {
     STARLET_GX_TRACE_RENDERER(peek_depth, [&](trace::Encoder& e) { e.w.i32(x); e.w.i32(y); });
     auto& g=*impl_;g.check_owner();
-    if (x<0 || x>=g.efb_width || y<0 || y>=g.efb_height)
-        throw std::invalid_argument("depth query outside native EFB");
+    if (x<0 || x>=g.efb_width || y<0 || y>=EfbLayout::rows)
+        throw std::invalid_argument("depth query outside the EFB");
     g.require_ready();
+    if (y>=g.efb_height) return g.peek_strip(x, y, false);
     if (const auto* pixel = g.peek_snapshot(x, y, false)) return packed_depth(pixel);
     ++g.stats.live_peeks;
     // Points tested in a row with no EFB write between them (RE4's lens flares and glows test 12
@@ -3147,9 +3156,10 @@ void GlesRenderer::release_depth_readback(int handle) {
 std::uint32_t GlesRenderer::peek_color(int x, int y) {
     STARLET_GX_TRACE_RENDERER(peek_color, [&](trace::Encoder& e) { e.w.i32(x); e.w.i32(y); });
     auto& g = *impl_; g.check_owner();
-    if (x < 0 || x >= g.efb_width || y < 0 || y >= g.efb_height)
-        throw std::invalid_argument("colour query outside native EFB");
+    if (x < 0 || x >= g.efb_width || y < 0 || y >= EfbLayout::rows)
+        throw std::invalid_argument("colour query outside the EFB");
     g.require_ready();
+    if (y >= g.efb_height) return g.peek_strip(x, y, true);
     if (const auto* pixel = g.peek_snapshot(x, y, true)) return argb(pixel);
     ++g.stats.live_peeks;
     std::array<std::uint8_t, 4> pixel{};
@@ -3164,6 +3174,43 @@ std::uint32_t GlesRenderer::peek_color(int x, int y) {
         } catch (...) { g.failed = true; throw; }
     }, true);
     return argb(pixel.data());
+}
+// The strip's rows lie below the frame, where snapshots do not reach: peeks there read the strip live.
+std::uint32_t GlesRenderer::Impl::peek_strip(int x, int y, bool color) {
+    ++stats.live_peeks;
+    const int row = EfbLayout::rows - 1 - y;  // The strip's GL row, its top row last.
+    if (color) {
+        std::array<std::uint8_t, 4> pixel{};
+        sync_stats::Context ctx("live-strip-color-peek");
+        execute([&] {
+            try {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, strip_framebuffer);
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+                glReadPixels(x, row, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel.data());
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+                gl_check("EFB strip colour query");
+            } catch (...) { failed = true; throw; }
+        }, true);
+        return argb(pixel.data());
+    }
+    if (live_strip_writes != efb_writes) {
+        live_strip_depth.resize(std::size_t(efb_width) * efb_strip_height * 4);
+        sync_stats::Context ctx("live-strip-depth-peek");
+        execute([&] {
+            try {
+                copy_surface();
+                pack_efb(copy_framebuffer, 0, 0, efb_width, efb_strip_height, 1, false, strip_depth, strip_color);
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0); glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                glPixelStorei(GL_PACK_ROW_LENGTH, 0); glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+                glReadPixels(0, 0, efb_width, efb_strip_height, GL_RGBA, GL_UNSIGNED_BYTE, live_strip_depth.data());
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+                gl_check("EFB strip depth query");
+            } catch (...) { failed = true; throw; }
+        }, true);
+        live_strip_writes = efb_writes;
+    }
+    return packed_depth(&live_strip_depth[(std::size_t(row) * efb_width + x) * 4]);
 }
 std::vector<std::uint8_t> GlesRenderer::readback() {
     auto& g = *impl_; g.require_ready();

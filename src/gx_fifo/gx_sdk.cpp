@@ -585,9 +585,12 @@ void GXDrawDone() {
     GXWaitDrawDone();
 }
 
-void GXPeekZ(u16 x, u16 y, u32* z) { *z = peek(true, x, y, reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))); }
+// The console's peeks read the EFB through an address that holds x and y in ten bits each.
+void GXPeekZ(u16 x, u16 y, u32* z) {
+    *z = peek(true, x & 0x3ff, y & 0x3ff, reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)));
+}
 void GXPeekARGB(u16 x, u16 y, u32* color) {
-    *color = peek(false, x, y, reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)));
+    *color = peek(false, x & 0x3ff, y & 0x3ff, reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)));
 }
 
 GXDrawSyncCallback GXSetDrawSyncCallback(GXDrawSyncCallback callback) {

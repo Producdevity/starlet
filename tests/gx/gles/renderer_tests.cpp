@@ -457,7 +457,8 @@ void depth_query_transfer_bounds() {
     auto calls=fake::draws;
     rejects([&]{renderer.peek_depth(-1,0);},"negative depth query rejected");
     rejects([&]{renderer.peek_depth(640,455);},"wide depth query rejected");
-    rejects([&]{renderer.peek_depth(639,456);},"tall depth query rejected");
+    rejects([&]{renderer.peek_depth(639,528);},"depth query below the EFB's 528 rows rejected");
+    rejects([&]{renderer.peek_color(0,528);},"colour query below the EFB's 528 rows rejected");
     check(fake::draws==calls,"invalid depth query performs no GL draw");
     glPixelStorei(GL_PACK_SKIP_ROWS,5);glPixelStorei(GL_PACK_SKIP_PIXELS,9);glBindBuffer(GL_PIXEL_PACK_BUFFER,123);
     renderer.peek_depth(639,455);
@@ -465,6 +466,23 @@ void depth_query_transfer_bounds() {
     GlesRenderer failing;
     fake::error=GL_INVALID_OPERATION;rejects([&]{failing.peek_depth(0,0);},"driver depth failure reported");
     rejects([&]{failing.peek_depth(0,0);},"failed depth renderer remains poisoned");
+}
+// Rows below a 456-row frame are the strip's: peeks there read the strip target, depth peeks
+// sharing one readback of its rows until the next EFB write.
+void strip_row_peeks() {
+    GlesRenderer renderer; Fixture f; const auto command=f.command();
+    renderer.draw_direct(f.decoder.state(),command,f.memory);
+    auto reads=fake::read_pixels;
+    renderer.peek_depth(0,456); renderer.peek_depth(639,527);
+    check(fake::read_pixels==reads+1 && fake::pack_required==640u*72u*4u,"strip depth peeks read the strip's rows once");
+    renderer.draw_direct(f.decoder.state(),command,f.memory);
+    renderer.peek_depth(5,500);
+    check(fake::read_pixels==reads+2,"an EFB write makes the next strip peek read again");
+    renderer.peek_color(5,500);
+    check(fake::read_pixels==reads+3 && fake::pack_required==4u,"a strip colour peek reads one pixel");
+    reads=fake::read_pixels;
+    renderer.peek_depth(10,10);
+    check(fake::read_pixels==reads+1 && fake::pack_required==640u*456u*4u,"frame peeks still read the frame's rows");
 }
 // Live depth peeks with no EFB write between them share one readback of the whole EFB's depth;
 // an EFB write in between makes the next peek read it again.
@@ -2568,7 +2586,7 @@ int main() {
         validation_precedes_mutation();
         warm_shader_validation(); rgb8_replacement_boundary(); clear_boundary(); waiting_clears(); efb_layout_boundary();
         display_copy_boundary(); repeated_presentation();
-        direct_draw_path(); live_depth_peeks_share_a_readback(); asynchronous_depth_readback();
+        direct_draw_path(); live_depth_peeks_share_a_readback(); strip_row_peeks(); asynchronous_depth_readback();
         rejected_program_skips_draws();
         unready_program_policy();
         program_reuse_across_tev_colours();

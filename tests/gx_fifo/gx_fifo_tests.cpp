@@ -198,6 +198,10 @@ int guest_main() {
     require(renderer.saw("present 640x448"), "VI presents the copied XFB");
     require(gx_fifo::gpu_failure()[0] == 0, "no command stream failure");
 
+    // Peek coordinates keep ten bits, as in the EFB address the console reads.
+    GXPeekZ(1024 + 3, 4, &z);
+    require(z == 3004, "peek coordinates wrap at ten bits");
+
     // A draw done set without waiting and one waited for: the wait returns once the GPU passed
     // the second, even when the first arrives while it waits.
     interrupts.clear();
