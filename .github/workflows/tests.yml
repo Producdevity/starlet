@@ -9,7 +9,8 @@ permissions:
 
 jobs:
   ctest:
-    runs-on: ubuntu-latest
+    # Starlet targets aarch64 Linux; the crash report decodes aarch64 registers only.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
         with:
