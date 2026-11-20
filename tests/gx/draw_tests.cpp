@@ -695,8 +695,45 @@ void lazy_register_sync() {
     }
 }
 
+// Every BP and XF address, one write at a time, against the register words read back from the
+// decoder. Random writes can leave a mapping error unvisited; this walk visits each address and
+// compares both register images with a copy whose keys the same writes rebuilt in one flat pass.
+void every_register_updates_its_keys() {
+    Fixture stepped, flat;
+    const auto layout = stepped.command().layout;
+    const auto write = [](Fixture& f, bool bp, unsigned address, std::uint32_t value) {
+        if (bp) f.bp(address, value); else f.xf(address, value);
+    };
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        for (unsigned index = 0; index < 256 + 0x58; ++index) {
+            const bool bp = index < 256;
+            const unsigned address = bp ? index : 0x1000 + index - 256;
+            if (bp && (address == 0x65 || address == 0xfe)) continue;
+            const std::uint32_t value = (0x6c5a3 + address * 0x9e3779b1u + pass * 0x51ed27u) & (bp ? 0xffffffu : ~0u);
+            write(stepped, bp, address, value); write(flat, bp, address, value);
+            std::vector<std::uint32_t> words;
+            direct_program_words(stepped.decoder.state(), layout, FramebufferFetch::none, DirectShading::fast, words);
+            const auto& registers = stepped.decoder.state().program_registers();
+            const bool same = words.size() > registers.size() &&
+                              std::equal(registers.begin(), registers.end(), words.begin() + 1);
+            if (!same) {
+                const std::string message = std::string(bp ? "BP " : "XF ") + std::to_string(address) +
+                                            ": the program registers differ from the words read back";
+                check(false, message.c_str());
+            }
+        }
+    }
+    const auto& a = stepped.decoder.state();
+    const auto& b = flat.decoder.state();
+    check(a.program_registers() == b.program_registers() && a.program_register_hash() == b.program_register_hash(),
+          "program registers and hash equal a flat rebuild after every address is written");
+    check(a.draw_registers().words == b.draw_registers().words && a.draw_registers().lanes == b.draw_registers().lanes,
+          "draw registers equal a flat rebuild after every address is written");
+}
+
 int main(int argc, char** argv) {
     try {
+        every_register_updates_its_keys();
         incremental_program_keys();
         draw_register_groups();
         lazy_register_sync();

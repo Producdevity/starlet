@@ -25,10 +25,13 @@ struct RegisterMapping {
     std::uint16_t program = 0xffff, draw = 0xffff;
     std::uint32_t mask = ~0u;
 };
+// GCC 12 to 14 zero the elements of a value-initialised constexpr array that follow its first modified
+// element instead of applying their default member initialisers, so each element is assigned its defaults.
 constexpr auto bp_mapping = [] {
     std::array<RegisterMapping, 256> result{};
     for (unsigned a = 0; a < result.size(); ++a) {
         auto& m = result[a];
+        m = RegisterMapping{};
         if (a == 0) { m.program = 25; m.mask = ~0xc000u; }
         else if (a >= 0x10 && a < 0x20) m.program = 26 + a - 0x10;
         else if (a >= 0x25 && a < 0x30) m.program = 42 + a - 0x25;
@@ -49,6 +52,7 @@ constexpr auto xf_mapping = [] {
     std::array<RegisterMapping, 88> result{};
     for (unsigned a = 0; a < result.size(); ++a) {
         auto& m = result[a];
+        m = RegisterMapping{};
         if (a >= 0x1a && a < 0x20) m.draw = 256 + a - 0x1a;
         if (a == 5) m.program = 0;
         else if (a == 9) m.program = 1;
