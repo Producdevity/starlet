@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 using namespace starlet::gx;
 namespace {
@@ -197,7 +198,7 @@ void preserved_state_and_gates() {
     const std::pair<unsigned, unsigned> unsupported[] = {
         {0x00,0x111},{0x00,0x211},{0x00,0x80011},
         {0x40,0x20},{0x41,0xf4ab},{0x41,0xfca9},
-        {0x41,0xf6a9},{0x41,0xf4c9},{0x42,0x100},{0x42,0x200},
+        {0x41,0xf6a9},{0x41,0xf4c9},{0x42,0x200},
         {0x43,1},{0x43,2},{0x43,8},{0x44,1},{0x44,2},{0x68,1},
         {0x22,1u<<22},{0xe8,1u<<10},{0xf1,2u<<21}
     };
@@ -270,6 +271,41 @@ void fast_constant_alpha() {
     p = plan(blend | color | alpha | (4u << 8) | (1u << 5));
     check(!p.premultiply && p.source_factor == 4 && !p.alpha_factors && !p.tev_alpha, "constant alpha disabled");
 }
+// GXSetDstAlpha under RGB8_Z24 is legal: the EFB stores no alpha, so the constant replaces nothing and
+// colour still blends with the TEV alpha. SMG's logo scene runs in RGB8 while the frame loop already
+// enables it after the scene switch.
+void constant_alpha_without_alpha_plane() {
+    constexpr std::uint32_t blend = 1, color = 8, alpha = 16, subtract = 1u << 11;
+    for (const std::uint32_t color_mode : {blend | color | (4u << 8) | (5u << 5), blend | color | (1u << 8) | (1u << 5),
+                                           blend | color | alpha | (5u << 8) | (3u << 5), color | alpha | subtract,
+                                           color | alpha | (4u << 8) | (1u << 5), blend | color | (4u << 8) | (1u << 5)}) {
+        Fixture f; f.bp(0x41, color_mode);
+        const auto plan = [&](std::uint32_t destination_alpha, bool fast) {
+            f.bp(0x42, destination_alpha); const auto c = f.capture(); check(bool(c), "capture");
+            return fast ? plan_gles_raster_fast(*c.snapshot) : plan_gles_raster(*c.snapshot);
+        };
+        for (const bool fast : {false, true}) {
+            if (!fast && (color_mode & subtract)) continue;
+            const auto off = plan(0, fast);
+            check(bool(off), std::string(off.status.message).c_str());
+            for (const std::uint32_t destination_alpha : {0x100u, 0x1ffu, 0x180u}) {
+                const auto on = plan(destination_alpha, fast);
+                check(bool(on), "RGB8 plans with constant alpha enabled");
+                check(on.plan.blend == off.plan.blend && on.plan.subtract == off.plan.subtract &&
+                      on.plan.source_factor == off.plan.source_factor && on.plan.destination_factor == off.plan.destination_factor &&
+                      on.plan.color_write == off.plan.color_write && on.plan.alpha_write == off.plan.alpha_write &&
+                      on.plan.blend_alpha == off.plan.blend_alpha && on.plan.tev_alpha == off.plan.tev_alpha &&
+                      on.plan.premultiply == off.plan.premultiply && on.plan.alpha_factors == off.plan.alpha_factors,
+                      "constant alpha changes nothing in RGB8");
+            }
+            check(!plan(0x200, fast) && !plan(0x300, fast), "YUV destination state is still refused");
+        }
+    }
+    // The same state in RGBA6 stays a stored-alpha replacement.
+    Fixture f; f.bp(0x43, 1); f.bp(0x41, blend | color | alpha | (1u << 8) | (1u << 5)); f.bp(0x42, 0x100);
+    const auto c = f.capture(); const auto p = plan_gles_raster_fast(*c.snapshot);
+    check(bool(p) && p.plan.alpha_write && p.plan.alpha_factors == 1, "RGBA6 still stores the constant");
+}
 }
 // A 640x480 frame (NTSC GameCube render modes) moves the frame/strip boundary to row 480.
 void frame_layouts() {
@@ -340,7 +376,7 @@ int main() {
         guard_band();
         fractional_viewport();
         baseline(); culling(); depth(); viewport_and_scissor(); coverage_oracle(); preserved_state_and_gates(); fast_fog();
-        fast_constant_alpha();
+        fast_constant_alpha(); constant_alpha_without_alpha_plane();
         std::cout << "GX raster tests passed: 128000 original-coordinate pixel membership checks\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

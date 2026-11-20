@@ -170,8 +170,10 @@ GlesRasterResult plan_gles_raster(const RasterSnapshot& r, bool rgba6_copy, Guar
         return reject("GX fog or range adjustment is not implemented");
     if (r.color_mode & (rgba6_copy ? (1u<<1) : ((1u << 1) | (1u << 11))))
         return reject("logic or subtract blend is not implemented");
-    if (r.destination_alpha & (rgba6_copy ? 0x600 : 0x700))
-        return reject("constant alpha or YUV state is not implemented");
+    // Constant destination alpha only replaces the alpha an RGBA6 EFB stores; an RGB8 EFB has none to replace,
+    // so enabling it there changes nothing.
+    if (r.destination_alpha & 0x600)
+        return reject("YUV destination state is not implemented");
     GlesRasterPlan p;
     p.strip = r.strip;
     p.viewport = {int(r.viewport.left), int(gl_y), int(r.viewport.width), int(r.viewport.height)};
@@ -207,7 +209,6 @@ GlesRasterResult plan_gles_raster_fast(const RasterSnapshot& r, GuardBand guard_
     base.fog[9] &= ~(7u << 21);
     if ((r.pixel_control & 7) > 1) return reject("fast GLES domain requires RGB8 or RGBA6");
     if (r.destination_alpha & 0x600) return reject("YUV destination state is not implemented");
-    if ((r.destination_alpha & 0x100) && !rgba6) return reject("constant alpha requires an alpha EFB");
     auto planned = plan_gles_raster(base, false, guard_band, fractional);
     if (!planned) return planned;
     auto& p = planned.plan;
@@ -225,7 +226,7 @@ GlesRasterResult plan_gles_raster_fast(const RasterSnapshot& r, GuardBand guard_
     }
     if (p.blend && !rgba6 && (p.source_factor >= 6 || p.destination_factor >= 6))
         return reject("destination-alpha blend factors require an alpha EFB");
-    if ((r.destination_alpha & 0x100) && (r.color_mode & ((1u << 11) | 1u))) {
+    if (rgba6 && (r.destination_alpha & 0x100) && (r.color_mode & ((1u << 11) | 1u))) {
         const bool reads_alpha = !p.subtract && (p.source_factor == 4 || p.source_factor == 5 ||
                                                  p.destination_factor == 4 || p.destination_factor == 5);
         if (!p.alpha_write) p.tev_alpha = reads_alpha;

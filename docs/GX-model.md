@@ -144,7 +144,7 @@ GX's setup unit draws lines and points as screen-aligned quads. `gx_line_point` 
 - GX clamps each depth to 24 bits, so a range just past [0, 1] (Freezeflame's star select ends at 1.00001) clamps the same; GL clamps the whole range instead.
 - GX front faces are clockwise on screen. The SDK swaps its public cull-mode bits into BP hardware encoding (back 1, front 2, both 3); the renderer maps that encoding to GLES face rejection with clockwise front faces. Culling disables the full-replacement shortcut, since a rejected primitive cannot replace existing EFB storage.
 - RGB8 has no alpha plane. The SDK alpha-update flag is kept in the snapshot but has no effect in RGB8 and must not prevent an otherwise valid draw. Dithering also has no effect in RGB8 (GX manual 11.4); GLES dither stays disabled.
-- Constant alpha while blending (`GXSetDstAlpha`): the destination alpha replaces only the stored alpha; colour blends with the TEV alpha (Freezeflame's ice).
+- Constant alpha while blending (`GXSetDstAlpha`): the destination alpha replaces only the stored alpha; colour blends with the TEV alpha (Freezeflame's ice). Under an RGB8 EFB the enable bit has no effect and is accepted: Super Mario Galaxy can leave it set when the logo scene switches to RGB8.
 - The exact domain rejects all fog. The fast domain admits it, below.
 
 ### Fog

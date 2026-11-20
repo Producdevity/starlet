@@ -156,11 +156,29 @@ void swaps_and_rejections() {
         check(!g.capture() && !direct(g, DirectShading::fast) && !direct(g, DirectShading::exact), "reserved op rejected");
     }
 }
+
+// The frame loop enables constant alpha while the EFB is still RGB8 after the logo scene: legal, no effect.
+void constant_alpha_in_rgb8() {
+    for (const std::uint32_t blend : {0u, 1u | (4u << 8) | (5u << 5)}) {
+        Fixture off; jfw_clear_efb(off, {{0x20, 0x40, 0x60, 0xff}}); off.bp(0x41, off.decoder.state().bp(0x41) | blend);
+        Fixture on; jfw_clear_efb(on, {{0x20, 0x40, 0x60, 0xff}}); on.bp(0x41, on.decoder.state().bp(0x41) | blend); on.bp(0x42, 0x1c8);
+        for (const auto shading : {DirectShading::fast, DirectShading::exact}) {
+            const auto a = direct(off, shading), b = direct(on, shading);
+            check(a && b && !b.program->constant_alpha, "RGB8 programs ignore constant alpha");
+            check(words(off, shading) == words(on, shading), "constant alpha is no RGB8 program word");
+            const auto x = direct_state(off, *a.program), y = direct_state(on, *b.program);
+            check(x.raster.blend == y.raster.blend && x.raster.source_factor == y.raster.source_factor &&
+                  x.raster.destination_factor == y.raster.destination_factor && x.raster.alpha_write == y.raster.alpha_write &&
+                  x.raster.tev_alpha == y.raster.tev_alpha && x.raster.premultiply == y.raster.premultiply &&
+                  x.raster.alpha_factors == y.raster.alpha_factors && !y.alpha_write, "RGB8 draws the same with constant alpha");
+        }
+    }
+}
 } // namespace
 
 int main() {
     try {
-        jfw_clear(); ops_types_and_bias(); depth_and_fog_gates(); swaps_and_rejections();
+        jfw_clear(); ops_types_and_bias(); depth_and_fog_gates(); swaps_and_rejections(); constant_alpha_in_rgb8();
         std::cout << "GX Z-texture tests passed\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
