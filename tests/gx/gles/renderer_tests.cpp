@@ -2581,6 +2581,101 @@ void direct_range_generations() {
     s = renderer.stats().direct;
     check(s.geometry_misses == 2 && s.geometry_hits == 9, "a new range generation with the same bytes compares and hits");
 }
+// A reader that names a write epoch lets a resident geometry skip its span checks while the epoch
+// holds; a vertex array rewritten in place must still be seen on the next draw once it advances.
+void direct_write_epoch() {
+    struct Epoch : test::Memory {
+        std::vector<std::uint8_t> positions;
+        std::uint64_t generation = 1, epoch = 1, generation_calls = 0;
+        MemoryArrayView array_view(std::uint32_t address) override {
+            if (address != 0x9000) return {};
+            return {{positions.data(), positions.size()}, 0};
+        }
+        std::uint64_t range_generation(const MemoryArrayView&, std::uint32_t address, std::size_t size) override {
+            ++generation_calls;
+            return address >= 0x9000 && address + size <= 0x9000 + positions.size() ? generation : 0;
+        }
+        std::uint64_t write_epoch() override { return epoch; }
+    };
+    Fixture f; Epoch memory; memory.bytes = f.memory.bytes;
+    for (unsigned i = 0; i < 8; ++i) for (float c : {100.0f + 25 * i, 100.0f + 10 * i, -0.5f}) append_float(memory.positions, c);
+    f.cp(0x50, (2u << 9) | (1u << 13)); f.cp(0xa0, 0x9000); f.cp(0xb0, 12);
+    std::vector<std::uint8_t> fifo;
+    for (unsigned i = 0; i < 8; ++i) {
+        fifo.push_back(static_cast<std::uint8_t>(i));
+        fifo.insert(fifo.end(), {255, 32, 64, 255});
+        append_float(fifo, .25f); append_float(fifo, .75f); append_float(fifo, i & 1 ? 1 : 0); append_float(fifo, i & 2 ? 1 : 0);
+    }
+    Draw draw; draw.primitive = 0x80; draw.vertex_count = 8;
+    std::string error; check(f.decoder.state().vertex_layout(0, draw.layout, error), error.c_str());
+    draw.vertices = {fifo.data(), fifo.size()};
+    GlesRenderer renderer;
+    auto draw_frame = [&] { renderer.present(640, 480); renderer.draw_direct(f.decoder.state(), draw, memory); renderer.wait_until_idle(); };
+    draw_frame(); draw_frame();
+    memory.generation_calls = 0;
+    for (unsigned i = 0; i < 4; ++i) { renderer.draw_direct(f.decoder.state(), draw, memory); }
+    renderer.wait_until_idle();
+    auto s = renderer.stats().direct;
+    check(s.geometry_misses == 1 && s.geometry_hits == 5, "resident geometry keeps hitting while the write epoch holds");
+    check(memory.generation_calls == 0, "an unchanged write epoch skips the span checks of later draws");
+    memory.positions[0] ^= 1; ++memory.generation; ++memory.epoch;
+    draw_frame();
+    s = renderer.stats().direct;
+    check(s.geometry_misses == 2, "a vertex array rewritten in place is seen once the write epoch advances");
+    ++memory.epoch;
+    memory.generation_calls = 0;
+    draw_frame();
+    check(memory.generation_calls > 0 && renderer.stats().direct.geometry_hits == s.geometry_hits + 1,
+          "an advanced write epoch revalidates the spans");
+    memory.epoch = 0;
+    memory.generation_calls = 0;
+    draw_frame(); draw_frame();
+    check(memory.generation_calls >= 2, "a reader without an epoch is checked on every draw");
+    memory.positions[4] ^= 1; ++memory.generation;
+    draw_frame();
+    check(renderer.stats().direct.geometry_misses == 3, "a reader without an epoch sees a rewritten array");
+    fifo[0] = 1; ++memory.epoch;
+    const auto misses = renderer.stats().direct.geometry_misses;
+    draw_frame();
+    check(renderer.stats().direct.geometry_misses == misses + 1, "a rewritten FIFO payload never hits a resident entry");
+}
+// A display list rewritten in place under the same pointer: a reported write is seen at once, an
+// unreported one by the comparison each entry makes once every 64 frames.
+void direct_rewritten_list() {
+    struct Listed : test::Memory {
+        std::vector<std::uint8_t> arrays;
+        std::uint64_t generation = 1;
+        MemoryArrayView array_view(std::uint32_t address) override {
+            if (address != 0x9000) return {};
+            return {{arrays.data(), arrays.size()}, 0};
+        }
+        SourceIdentity source_identity(const void* data, std::size_t) override { return {data, generation}; }
+    };
+    Fixture f; Listed memory; memory.bytes = f.memory.bytes;
+    for (unsigned i = 0; i < 8; ++i) for (float c : {100.0f + 25 * i, 100.0f + 10 * i, -0.5f}) append_float(memory.arrays, c);
+    f.cp(0x50, (2u << 9) | (1u << 13)); f.cp(0xa0, 0x9000); f.cp(0xb0, 12);
+    std::vector<std::uint8_t> fifo;
+    for (unsigned i = 0; i < 8; ++i) {
+        fifo.push_back(static_cast<std::uint8_t>(i));
+        fifo.insert(fifo.end(), {255, 32, 64, 255});
+        append_float(fifo, .25f); append_float(fifo, .75f); append_float(fifo, i & 1 ? 1 : 0); append_float(fifo, i & 2 ? 1 : 0);
+    }
+    Draw draw; draw.primitive = 0x80; draw.vertex_count = 8;
+    std::string error; check(f.decoder.state().vertex_layout(0, draw.layout, error), error.c_str());
+    draw.vertices = {fifo.data(), fifo.size()};
+    GlesRenderer renderer;
+    auto draw_frame = [&] { renderer.present(640, 480); renderer.draw_direct(f.decoder.state(), draw, memory); renderer.wait_until_idle(); };
+    for (unsigned i = 0; i < 4; ++i) draw_frame();
+    check(renderer.stats().direct.geometry_misses == 1 && renderer.stats().direct.geometry_hits == 3, "an unchanged list is named by its source");
+    fifo[1] = 128; ++memory.generation;
+    draw_frame();
+    check(renderer.stats().direct.geometry_misses == 2, "a list rewritten in place with a reported write draws its new bytes");
+    fifo[1] = 64;
+    const auto misses = renderer.stats().direct.geometry_misses;
+    bool seen = false;
+    for (unsigned i = 0; i < 64 && !seen; ++i) { draw_frame(); seen = renderer.stats().direct.geometry_misses > misses; }
+    check(seen, "a list rewritten without a report is found by the periodic comparison");
+}
 // Display-list payloads named by their source: one list drawn from several vertex arrays
 // keeps an entry per array, and a list whose arrays move every frame is streamed.
 void direct_source_geometry() {
@@ -2656,6 +2751,8 @@ int main() {
         direct_geometry_cache();
         direct_instancing();
         direct_range_generations();
+        direct_write_epoch();
+        direct_rewritten_list();
         direct_source_geometry();
     format_after_depth_copy();
     copy_clear_invalidation();

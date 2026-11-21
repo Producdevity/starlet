@@ -82,6 +82,11 @@ public:
 
   bool copy(std::uint32_t address, std::uint8_t* destination, std::size_t size) override;
   starlet::gx::ByteView view(std::uint32_t address, std::size_t size) override;
+  // Every counter a generation derives from only grows, so their sum names the memory's state:
+  // write reports, array changes and hashes, window changes and the start of a feed.
+  std::uint64_t write_epoch() override {
+    return block_clock_.load(std::memory_order_relaxed) + writes_.load(std::memory_order_relaxed) + epoch_ + feed_;
+  }
   starlet::gx::MemoryArrayView array_view(std::uint32_t address) override;
 
 private:
@@ -120,10 +125,12 @@ private:
     std::uint64_t generation = 0;
   };
   std::map<const std::uint8_t*, TextureRange> textures_; // By data pointer.
+  // The span of the pointers textures_ names; source_generation skips the lock for pointers outside it.
+  std::atomic<std::uintptr_t> texture_low_{UINTPTR_MAX}, texture_high_{0};
   std::size_t largest_texture_ = 0;
   const std::uint8_t* pool_ = nullptr;
   std::size_t pool_size_ = 0;
-  std::uint64_t writes_ = 1;
+  std::atomic<std::uint64_t> writes_{1};
   // Write stamps of the arena in 1 KiB blocks; any thread's write report advances them.
   static constexpr unsigned block_bits = 10;
   std::unique_ptr<std::atomic<std::uint64_t>[]> block_stamps_;

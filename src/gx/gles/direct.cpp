@@ -6,6 +6,7 @@
 #include "starlet/gx/line_point.hpp"
 #include "starlet/gx/vertex.hpp"
 
+#include <tuple>
 #include <GLES3/gl32.h>
 #include <algorithm>
 #include <optional>
@@ -119,6 +120,36 @@ std::uint64_t hash_bytes(const std::uint8_t* p, std::size_t n) {
     }
     for (; i < n; ++i) a = rotate(a ^ p[i], 7) * k;
     return rotate(a, 1) ^ rotate(b, 7) ^ rotate(c, 13) ^ rotate(d, 19) ^ (a * b) ^ (c + d);
+}
+struct Hash128 { std::uint64_t low, high; };
+// hash_bytes and a second word from the same four lanes mixed through a different chain,
+// so two byte strings that share the first word still differ in the other.
+Hash128 hash_bytes128(const std::uint8_t* p, std::size_t n) {
+    constexpr std::uint64_t k = 0x9e3779b97f4a7c15ull;
+    std::uint64_t a = n, b = k, c = ~k, d = n * k;
+    auto rotate = [](std::uint64_t x, unsigned r) { return (x << r) | (x >> (64 - r)); };
+    std::size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        std::uint64_t w[4]; std::memcpy(w, p + i, 32);
+        a = rotate(a ^ w[0], 29) * k; b = rotate(b ^ w[1], 31) * k;
+        c = rotate(c ^ w[2], 27) * k; d = rotate(d ^ w[3], 33) * k;
+    }
+    for (; i < n; ++i) a = rotate(a ^ p[i], 7) * k;
+    const auto mix = [](std::uint64_t x) {
+        x ^= x >> 32; x *= 0xd6e8feb86659fd93ull; x ^= x >> 32; x *= 0xd6e8feb86659fd93ull; return x ^ (x >> 32);
+    };
+    std::uint64_t high = mix(a);
+    high = mix(high ^ b); high = mix(high ^ c); high = mix(high ^ d);
+    return {rotate(a, 1) ^ rotate(b, 7) ^ rotate(c, 13) ^ rotate(d, 19) ^ (a * b) ^ (c + d), high};
+}
+// hash_words and a second chain over the same words; independent, so they run in parallel.
+std::pair<std::uint64_t, std::uint64_t> hash_words_twice(const std::vector<std::uint32_t>& words) {
+    std::uint64_t h = 14695981039346656037ull, g = 0xcbf29ce484222325ull ^ 0x517cc1b727220a95ull;
+    for (auto w : words) {
+        h ^= w; h *= 1099511628211ull;
+        g = (g ^ w) * 0xbf58476d1ce4e5b9ull; g ^= g >> 31;
+    }
+    return {h, g};
 }
 template<class T> struct Cached {
     GLint location = -1;
@@ -264,6 +295,10 @@ struct GlesDirect::Impl {
     // bytes and source-span hashes stay on the CPU for validation.
     struct Geometry {
         std::uint64_t hash = 0, key_hash = 0;
+        // Second word of the payload-and-key hash: a hit needs both words and the size.
+        std::uint64_t hash2 = 0;
+        // MemoryReader::write_epoch when every span was last found unchanged.
+        std::uint64_t validated_epoch = 0;
         std::vector<std::uint32_t> key;
         std::vector<std::uint8_t> fifo;
         struct Span { unsigned array; std::uint32_t base; std::size_t first, end; std::uint8_t native_unit; bool host_order;
@@ -383,7 +418,7 @@ struct GlesDirect::Impl {
     std::unordered_map<const void*, SourceUse> source_uses;
     MemoryReader::SourceIdentity source; // The current draw's payload source (find_geometry_by_pointer).
     std::vector<std::uint32_t> geometry_key;
-    std::uint64_t geometry_key_hash = 0;
+    std::uint64_t geometry_key_hash = 0, geometry_key_hash2 = 0, draw_hash2 = 0;
     StreamArraySpans spans;
     // Resident geometry as drawn: copied at record time, since packing moves entries
     // while earlier segments may still be executing.
@@ -1837,8 +1872,10 @@ struct GlesDirect::Impl {
         for (const auto& a : l.texcoords) if (indexed(a)) return true;
         return false;
     }
-    std::uint64_t geometry_hash(const Draw& draw) const {
-        return hash_bytes(draw.vertices.data, draw.vertices.size) ^ (geometry_key_hash * 0x9e3779b97f4a7c15ull);
+    std::uint64_t geometry_hash(const Draw& draw) {
+        const auto h = hash_bytes128(draw.vertices.data, draw.vertices.size);
+        draw_hash2 = h.high ^ (geometry_key_hash2 * 0x9e3779b97f4a7c15ull);
+        return h.low ^ (geometry_key_hash * 0x9e3779b97f4a7c15ull);
     }
     void build_geometry_key(const State& state, const Draw& draw, const StreamFormat& format, bool bases = true) {
         auto& k = geometry_key; k.clear();
@@ -1852,7 +1889,7 @@ struct GlesDirect::Impl {
             k.push_back(state.cp(static_cast<std::uint8_t>(0xb0 + i)) & 255);
         }
         if (format.matrices) for (auto w : stream_matrix_latches(state)) k.push_back(w);
-        geometry_key_hash = hash_words(k);
+        std::tie(geometry_key_hash, geometry_key_hash2) = hash_words_twice(k);
     }
     StreamResult append_converted(const State& state, const Draw& draw, MemoryReader& memory, const StreamFormat& format,
                                   std::vector<std::uint8_t>& output, std::vector<std::uint32_t>& elements, std::uint32_t first,
@@ -1914,10 +1951,23 @@ struct GlesDirect::Impl {
         for (auto index : entry.stream.indices()) elements.push_back(first + index);
         return result;
     }
+    // MemoryReader::array_view, kept while the reader's write epoch holds: every draw of a frame reads the same few arrays.
+    MemoryArrayView array_view_of(MemoryReader& memory, std::uint32_t base) const {
+        const auto epoch = memory.write_epoch();
+        if (!epoch) return memory.array_view(base);
+        auto& slot = view_cache[(base >> 4) % view_cache.size()];
+        if (slot.epoch == epoch && slot.base == base) return slot.view;
+        slot.view = memory.array_view(base);
+        slot.base = base;
+        slot.epoch = memory.write_epoch();
+        return slot.view;
+    }
+    struct ViewSlot { std::uint32_t base = 0; std::uint64_t epoch = 0; MemoryArrayView view; };
+    mutable std::array<ViewSlot, 64> view_cache;
     // Unchanged reported-write generations prove the span unchanged, except on the
     // entry's periodic full comparison, which also detects unreported writers.
     bool span_valid(Geometry::Span& span, MemoryReader& memory, bool full) {
-        const auto view = memory.array_view(span.base);
+        const auto view = array_view_of(memory, span.base);
         if (!view.bytes.data || !same_encoding(view, span.native_unit, span.host_order) || span.end > view.bytes.size)
             return false;
         const auto generation = memory.range_generation(view, span.base + span.first, span.end - span.first);
@@ -1972,7 +2022,12 @@ struct GlesDirect::Impl {
         const auto entry = it->second;
         bool valid = true;
         const bool full = entry->volatile_data || ((frame + entry->phase) & full_check_period) == 0;
-        for (auto& span : entry->spans) if (!span_valid(span, memory, full)) { valid = false; break; }
+        const auto epoch = full ? 0 : memory.write_epoch();
+        if (!epoch || entry->validated_epoch != epoch) {
+            for (auto& span : entry->spans) if (!span_valid(span, memory, full)) { valid = false; break; }
+            // Taken after the checks: reading an array may advance the epoch it was checked against.
+            entry->validated_epoch = valid && !full ? memory.write_epoch() : 0;
+        }
         if (!valid) {
             if (unstable_geometry.size() > 4096) unstable_geometry.clear();
             auto& changes = unstable_geometry[hash];
@@ -1989,8 +2044,13 @@ struct GlesDirect::Impl {
         const auto range = geometry_index.equal_range(hash);
         for (auto it = range.first; it != range.second; ++it) {
             const auto entry = it->second;
-            if (entry->key != geometry_key || entry->fifo.size() != draw.vertices.size ||
-                std::memcmp(entry->fifo.data(), draw.vertices.data, draw.vertices.size)) continue;
+            if (entry->hash2 != draw_hash2 || entry->key_hash != geometry_key_hash || entry->fifo.size() != draw.vertices.size) continue;
+            // Two 64-bit hashes and the size name the payload; the entry's own bytes confirm it once per period.
+            if (((frame + entry->phase) & full_check_period) == 0 &&
+                (entry->key != geometry_key || std::memcmp(entry->fifo.data(), draw.vertices.data, draw.vertices.size))) {
+                erase_geometry(it);
+                return nullptr;
+            }
             const auto found = validate_geometry(it, memory, hash);
             // The compared bytes now stand for the payload's source at its current generation.
             if (found && source.generation) name_geometry(entry);
@@ -2170,7 +2230,7 @@ struct GlesDirect::Impl {
                               const StreamFormat& format, const StreamResult& result) {
         if (!spans.viewed) return nullptr;
         Geometry g;
-        g.hash = hash; g.key = geometry_key; g.key_hash = geometry_key_hash; g.format = format;
+        g.hash = hash; g.hash2 = draw_hash2; g.key = geometry_key; g.key_hash = geometry_key_hash; g.format = format;
         g.fifo.assign(draw.vertices.data, draw.vertices.data + draw.vertices.size);
         g.vertex_count = result.vertices; g.index_count = result.indices;
         for (unsigned a = 0; a < 12; ++a) {
@@ -2320,7 +2380,7 @@ struct GlesDirect::Impl {
         MemoryArrayView array;
         std::uint32_t stride = 0;
         if (!direct) {
-            array = memory.array_view(state.cp(0xa0));
+            array = array_view_of(memory, state.cp(0xa0));
             stride = state.cp(0xb0) & 255;
             if (!array.bytes.data || (array.native_unit && !array.host_order && array.native_unit != size)) return false;
         }

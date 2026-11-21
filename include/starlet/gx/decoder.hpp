@@ -53,6 +53,11 @@ public:
         (void)size;
         return view.generation;
     }
+    // A counter that advances whenever any generation this reader reports could change, or zero
+    // when it cannot say. While it holds the same nonzero value, array_view results are the same
+    // and memory a consumer validated by generation is still valid: the renderer then reuses
+    // views and skips revalidating for every later draw.
+    virtual std::uint64_t write_epoch() { return 0; }
     // Write generation of the registered source containing native bytes, such as a
     // draw's display-list payload; zero when unknown. See MemoryArrayView::generation.
     virtual std::uint64_t source_generation(const void*) { return 0; }

@@ -292,6 +292,7 @@ struct DecoderTap {
         std::uint64_t source_generation(const void* data) override {
             return tap_.recording() ? 0 : tap_.inner_memory.source_generation(data);
         }
+        std::uint64_t write_epoch() override { return tap_.recording() ? 0 : tap_.inner_memory.write_epoch(); }
         SourceIdentity source_identity(const void* bytes, std::size_t size) override {
             if (tap_.recording()) return {bytes, 0};
             return tap_.inner_memory.source_identity(bytes, size);

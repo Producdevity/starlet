@@ -184,6 +184,8 @@ void HostMemory::note_texture(const void* pointer, std::size_t size, std::uint32
   }
   std::lock_guard<std::mutex> lock(mutex_);
   auto& texture = textures_[static_cast<const std::uint8_t*>(pointer)];
+  texture_low_.store(std::min(texture_low_.load(std::memory_order_relaxed), reinterpret_cast<std::uintptr_t>(p)), std::memory_order_relaxed);
+  texture_high_.store(std::max(texture_high_.load(std::memory_order_relaxed), reinterpret_cast<std::uintptr_t>(p) + 1), std::memory_order_relaxed);
   if (!texture.generation || texture.version != version || texture.size < size) {
     texture.size = std::max(texture.size, size);
     texture.version = version;
@@ -193,6 +195,10 @@ void HostMemory::note_texture(const void* pointer, std::size_t size, std::uint32
 }
 
 std::uint64_t HostMemory::source_generation(const void* pointer) {
+  const auto at = reinterpret_cast<std::uintptr_t>(pointer);
+  if (at < texture_low_.load(std::memory_order_relaxed) || at >= texture_high_.load(std::memory_order_relaxed)) {
+    return 0;
+  }
   std::lock_guard<std::mutex> lock(mutex_);
   const auto found = textures_.find(static_cast<const std::uint8_t*>(pointer));
   return found == textures_.end() ? 0 : found->second.generation;
