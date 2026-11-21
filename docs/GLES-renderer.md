@@ -424,6 +424,10 @@ every consumed array span is unchanged.
 - A source whose new entries go unused until its next insert, twice in a row, is streamed and retried every 64
   frames. Resident Evil 4 draws skinned models from arrays the CPU rewrites at another address every frame;
   caching those inserted about 25 entries a frame that never hit.
+- Without a source name, an entry is found by two 64-bit hashes of the payload (and its key) and the payload size.
+  The entry's own copy of the payload and key is compared once every 64 frames per entry, like the spans.
+- While `MemoryReader::write_epoch` holds a nonzero value, an entry whose spans were all found unchanged is
+  not checked again, and `array_view` results are reused. A reader that returns zero has every draw checked.
 - A span whose source reports no CPU write since conversion (the game's cache store or flush, reported through
   `MemoryArrayView::generation`) is accepted, and every entry is also compared byte for byte against a retained
   copy once every 64 frames. A span found changed without a reported write marks its array volatile, compared on

@@ -240,7 +240,14 @@ Other GPUs and other Aurora games are untested.
   arrays, which PC code writes without reporting, are hashed once per feed (the game does not run
   while a FIFO drains) and their generation advances when the hash changes; arrays above a size
   limit keep generation zero. A texture rewritten during the frame is copied at load
-  (`texture_data()`), so each draw reads it as it was loaded.
+  (`texture_data()`), so each draw reads it as it was loaded. The copy is kept: later loads of the
+  same pointer reuse it until a reported write reaches its bytes (compared against the live bytes
+  once every 16 frames, against unreported writes), so a texture the game stopped rewriting costs one
+  copy, not one per load. A texture rewritten more than four times, or a full pool (12 MiB), falls
+  back to one copy per load in the frame pool.
+- Write epoch. `HostMemory::write_epoch` sums the counters every generation derives from (write
+  reports, array changes and hashes, window changes, feed starts). While it holds, the renderer keeps
+  `array_view` results and does not revalidate resident geometry.
 - EFB copies. Aurora keeps each copy as a texture named by its destination pointer, and PC code
   can copy the frame at full size into a buffer it still describes at half size, so a texture whose
   data pointer is a copy destination reads the copy as made. The bridge gives every destination a

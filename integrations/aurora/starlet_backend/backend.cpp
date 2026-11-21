@@ -4,6 +4,7 @@
 #include "host_memory.hpp"
 #include "issues.hpp"
 #include "overlay.hpp"
+#include "texture_writes.hpp"
 
 #include "aurora_host.hpp"
 
@@ -211,64 +212,6 @@ std::string data_directory() {
   return path.string();
 }
 
-// Pages written through the data-cache hooks this frame, and texture pointers seen rewritten
-// while in use; both decide which texture loads are copied (texture_data).
-class TextureWrites {
-public:
-  static constexpr unsigned page_bits = 12;
-  static constexpr std::size_t pool_bytes = 4 << 20;
-
-  TextureWrites() : pool_(static_cast<std::uint8_t*>(std::aligned_alloc(32, pool_bytes))) {}
-  const std::uint8_t* pool() const { return pool_; }
-
-  void note(const void* pointer, std::size_t size) {
-    const auto begin = reinterpret_cast<std::uintptr_t>(pointer) >> page_bits;
-    const auto end = (reinterpret_cast<std::uintptr_t>(pointer) + size - 1) >> page_bits;
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++notes;
-    for (auto page = begin; page <= end && page - begin < 4096; ++page) pages_.insert(page);
-  }
-
-  const void* load(const void* data, std::size_t size, const HostMemory& memory) {
-    ++loads;
-    if (!data || !size || memory.copy_destination(data)) return data;
-    const auto at = reinterpret_cast<std::uintptr_t>(data);
-    bool written = volatile_.count(data) != 0;
-    if (!written) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      for (auto page = at >> page_bits; page <= (at + size - 1) >> page_bits && !written; ++page) written = pages_.count(page);
-    }
-    if (!written) return data;
-    volatile_.insert(data);
-    const std::size_t offset = (used_ + 31) & ~std::size_t{31};
-    if (size > pool_bytes - offset) {
-      ++overflows;
-      return data;
-    }
-    std::memcpy(pool_ + offset, data, size);
-    used_ = offset + size;
-    ++copies;
-    copied_bytes += size;
-    return pool_ + offset;
-  }
-
-  // Main thread, after the frame's FIFO drained: its copies have been decoded.
-  void end_frame() {
-    used_ = 0;
-    std::lock_guard<std::mutex> lock(mutex_);
-    pages_.clear();
-  }
-
-  std::uint64_t copies = 0, copied_bytes = 0, overflows = 0, notes = 0, loads = 0;
-
-private:
-  std::uint8_t* pool_;
-  std::size_t used_ = 0;
-  std::mutex mutex_;
-  std::unordered_set<std::uintptr_t> pages_;
-  std::unordered_set<const void*> volatile_;
-};
-
 TextureWrites& texture_writes() {
   static TextureWrites writes;
   return writes;
@@ -308,7 +251,7 @@ struct Backend {
   , stream(memory, decoder, efb_target) {
     sink.stream = &stream;
     memory.map_region(texture_writes().pool(), TextureWrites::pool_bytes);
-    memory.set_snapshot_pool(texture_writes().pool(), TextureWrites::pool_bytes);
+    memory.set_snapshot_pool(texture_writes().pool(), TextureWrites::frame_bytes);
   }
 
   // Aurora's GXCopyDisp does not run; Aurora clears colour, alpha and depth to the copy-clear
@@ -364,10 +307,10 @@ struct Backend {
     last_stream = s;
     last_direct = d; last_frames = frames; last_feed_us = feed_us; last_gl_us = gl_us; last_draws = sink.draws;
     Log.info("[starlet] totals: frames={} rejected={} copies={} expanded={} ignored={} unmapped={} repaired={} "
-             "failed_copies={} resized_copies={} texture_snapshots={} ({} KB, {} overflows, {} notes, {} loads) shaders={}{}",
+             "failed_copies={} resized_copies={} texture_snapshots={} ({} KB, {} overflows, {} notes, {} loads, {} kept) shaders={}{}",
              frames, failures.total(), s.copies, s.expanded_draws, s.ignored, s.unmapped, s.repaired, s.failed_copies,
              s.resized_copies, texture_writes().copies, texture_writes().copied_bytes / 1024, texture_writes().overflows,
-             texture_writes().notes, texture_writes().loads, r.shader_compiles, failures.summary());
+             texture_writes().notes, texture_writes().loads, texture_writes().hits, r.shader_compiles, failures.summary());
   }
 };
 
@@ -705,7 +648,7 @@ void end_frame() {
     gl::invalidate_texture_bindings();
   });
 #endif
-  texture_writes().end_frame();
+  if (texture_writes().end_frame()) b->memory.note_write(texture_writes().kept_pool(), TextureWrites::kept_bytes);
   b->frame_started = false;
   ++b->frames;
   issues::set_frame(b->frames);
@@ -796,7 +739,7 @@ void note_write(const void* pointer, std::size_t size) {
 
 const void* texture_data(const void* data, std::size_t size) {
   auto* b = instance.load();
-  return b ? texture_writes().load(data, size, b->memory) : data;
+  return b ? texture_writes().load(data, size, b->memory.copy_destination(data)) : data;
 }
 
 void note_display_list(const void* data, std::size_t size) {
