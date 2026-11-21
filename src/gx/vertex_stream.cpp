@@ -210,7 +210,37 @@ bool numbers_column(const Column& c) {
     const auto& in = c.in;
     const unsigned components = Components ? Components : in.components;
     InPlace array(in, c.bounded);
-    for (std::size_t i = 0; i < c.count; ++i) {
+    std::size_t start = 0;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    // Float vectors through 16-bit indices, the common draw, read their words straight from the array.
+    // The first element the array does not hold goes to the general loop below.
+    if constexpr (IndexBytes == 2 && Format == 4 && (Components == 2 || Components == 3)) {
+        if (!c.disabled && in.vectors == 1 && array.data && in.width == Components && in.element_bytes == Components * 4u) {
+            const std::uint8_t* const data = array.data;
+            const std::size_t size = array.size, stride = in.stride;
+            const bool swap = !array.native;
+            std::size_t first = array.first, end = array.end;
+            const std::uint8_t* cursor = c.fifo + in.fifo_offset;
+            std::uint8_t* target = c.out + in.output;
+            for (; start < c.count; ++start, cursor += c.fifo_stride, target += c.out_stride) {
+                const std::size_t relative = std::size_t{be16(cursor)} * stride;
+                if (!c.bounded && (relative > size || Components * 4u > size - relative)) break;
+                std::uint32_t words[Components];
+                std::memcpy(words, data + relative, sizeof words);
+                float values[Components];
+                for (unsigned k = 0; k < Components; ++k) {
+                    const std::uint32_t word = swap ? __builtin_bswap32(words[k]) : words[k];
+                    std::memcpy(&values[k], &word, 4);
+                }
+                if (!c.bounded) { first = std::min(first, relative); end = std::max(end, relative + Components * 4u); }
+                if constexpr (Components == 3) { if (c.bounds) extend_bounds(*c.bounds, values); }
+                std::memcpy(target, values, sizeof values);
+            }
+            array.first = first; array.end = end;
+        }
+    }
+#endif
+    for (std::size_t i = start; i < c.count; ++i) {
         if (c.disabled && c.disabled[i]) {
             if (c.bounds) {
                 float position[3]; std::memcpy(position, c.out + i * c.out_stride, sizeof position);

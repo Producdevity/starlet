@@ -2410,6 +2410,33 @@ struct GlesDirect::Impl {
         // Two-component positions have z = 0.
         const float z = position.components == 3 ? INFINITY : 0.0f;
         std::array<float, 6> box{{INFINITY, INFINITY, z, -INFINITY, -INFINITY, -z}};
+        if (position.format == 4 && position.components == 3 && !direct) {
+            // Float positions through an index: the common case reads three words per vertex.
+            const bool short_index = position.mode == AttributeMode::index16;
+            const auto* data = draw.vertices.data;
+            for (std::size_t v = 0; v < draw.vertex_count; ++v, data += draw.layout.stride) {
+                const unsigned element = short_index ? unsigned{data[0]} << 8 | data[1] : data[0];
+                if (element == (short_index ? 0xffffu : 0xffu)) return false;
+                const std::uint64_t at = std::uint64_t{element} * stride;
+                if (at > array.bytes.size || bytes > array.bytes.size - at || (native && (at & (size - 1)))) return false;
+                const auto* in = array.bytes.data + at;
+                std::uint32_t words[3];
+                std::memcpy(words, in, 12);
+                float values[3];
+                for (unsigned k = 0; k < 3; ++k) {
+                    // Native words are in host order; GX data is big-endian.
+                    const bool swap = !native && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__;
+                    const std::uint32_t word = swap ? __builtin_bswap32(words[k]) : words[k];
+                    std::memcpy(&values[k], &word, 4);
+                }
+                for (unsigned k = 0; k < 3; ++k) {
+                    box[k] = std::min(box[k], values[k]);
+                    box[3 + k] = std::max(box[3 + k], values[k]);
+                }
+            }
+            out = box;
+            return true;
+        }
         for (std::size_t v = 0; v < draw.vertex_count; ++v) {
             const auto* data = draw.vertices.data + v * draw.layout.stride;
             if (!direct) {
