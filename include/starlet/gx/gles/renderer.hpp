@@ -42,6 +42,8 @@ struct GlesStats {
     // mapped readback out on the owner thread (microseconds).
     std::uint64_t write_back_issue_us = 0, write_back_copy_us = 0;
     std::uint64_t known_copies = 0;
+    // Frames ended after skip_frame(), and those of them that rendered anyway.
+    std::uint64_t skipped_frames = 0, skipped_frames_rendered = 0;
     TextureCacheStats capture_cache;
     VertexCacheStats geometry_cache;
     GlesDirectStats direct;
@@ -112,6 +114,12 @@ public:
     // presenting. With start_submission_on, the host then calls present_into on its GL thread
     // after the posted work, in task order.
     void end_frame();
+    // Owner thread, once per frame after the previous end_frame, opt-in: the frame's draws are
+    // recorded and its textures and programs update, but end_frame does not render them. A frame
+    // that reads or writes the EFB through any other call (texture and display copies, offscreen
+    // passes, clears, peeks, snapshots) or fills a segment renders fully, since later frames
+    // may sample what it left. The frame is not presented either way.
+    void skip_frame();
     // Host GL thread only: draws the frame's top-left source_width x source_height pixels (the
     // game's display-copy source) into rectangle (x, y, width, height) of the host's
     // framebuffer, lower-left origin, without swapping.

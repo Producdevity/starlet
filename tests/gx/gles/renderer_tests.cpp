@@ -2025,6 +2025,67 @@ void frames_in_flight() {
     frame();
     check(fake::waited_fences.size() == 2, "one frame in flight again waits for both queued frames");
 }
+// A skipped frame records its draws and drops them at end_frame, unless something read or wrote the EFB:
+// later frames sample what a copy took from it.
+void skipped_frames() {
+    GlesLimits limits; limits.direct.shading = DirectShading::fast;
+    GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
+    const auto frame = [&](bool skip, unsigned draws, const std::function<void()>& middle = {}) {
+        if (skip) renderer.skip_frame();
+        for (unsigned i = 0; i < draws; ++i) {
+            f.f(3, 10.0f * i);
+            renderer.draw_direct(f.decoder.state(), command, f.memory);
+            if (i == 0 && middle) middle();
+        }
+        renderer.end_frame();
+    };
+    auto before = fake::draws;
+    frame(false, 3);
+    check(fake::draws > before && renderer.stats().skipped_frames == 0 && renderer.stats().direct.dropped_draws == 0,
+          "frames not marked skipped render and count nothing as skipped");
+    before = fake::draws;
+    const auto recorded = renderer.stats().direct.draws;
+    frame(true, 3);
+    auto s = renderer.stats();
+    check(fake::draws == before && s.direct.draws == recorded + 3 && s.skipped_frames == 1 &&
+              s.skipped_frames_rendered == 0 && s.direct.dropped_draws > 0,
+          "a skipped frame records its draws and the GL thread runs none of them");
+    frame(false, 3);
+    check(fake::draws > before && renderer.stats().skipped_frames == 1, "the next frame renders again");
+
+    TextureCopy p; p.width = 8; p.height = 4; p.format = 1; p.luminance = true; p.stride = 32;
+    alignas(32) std::array<std::uint8_t, 64> bytes{};
+    before = fake::draws;
+    const auto dropped = renderer.stats().direct.dropped_draws;
+    frame(true, 3, [&] { renderer.copy_texture_resident(p, bytes.data(), bytes.size(), 0x8000); });
+    s = renderer.stats();
+    check(fake::draws > before && s.skipped_frames == 2 && s.skipped_frames_rendered == 1 &&
+              s.direct.dropped_draws == dropped && s.direct.resident_copies == 1,
+          "a skipped frame with an EFB texture copy renders every draw, those after the copy too");
+    before = fake::draws;
+    renderer.skip_frame();
+    renderer.begin_offscreen(); renderer.end_offscreen();
+    f.f(3, 0.0f); renderer.draw_direct(f.decoder.state(), command, f.memory);
+    renderer.end_frame();
+    check(fake::draws > before && renderer.stats().skipped_frames_rendered == 2, "an offscreen pass makes a skipped frame render");
+    before = fake::draws;
+    renderer.skip_frame();
+    f.f(3, 0.0f); renderer.draw_direct(f.decoder.state(), command, f.memory);
+    renderer.peek_color(10, 10);
+    renderer.draw_direct(f.decoder.state(), command, f.memory);
+    renderer.end_frame();
+    check(fake::draws > before && renderer.stats().skipped_frames_rendered == 3, "so does an EFB peek");
+
+    GlesLimits small = limits; small.direct.segment_bytes = 1;
+    GlesRenderer filled(small); Fixture g; const auto filler = g.command();
+    before = fake::draws;
+    filled.skip_frame();
+    g.f(3, 0.0f); filled.draw_direct(g.decoder.state(), filler, g.memory);
+    g.f(3, 10.0f); filled.draw_direct(g.decoder.state(), filler, g.memory);
+    filled.end_frame();
+    check(fake::draws > before && filled.stats().skipped_frames_rendered == 1,
+          "a frame that fills a segment before it ends renders");
+}
 void direct_texture_copy_readback() {
     GlesLimits limits; limits.direct.shading = DirectShading::fast;
     GlesRenderer renderer(limits); Fixture f; const auto command = f.command();
@@ -2624,7 +2685,7 @@ int main() {
         snapshot_layout();
         full_resolution_snapshots();
         exact_snapshots();
-        frames_in_flight();
+        frames_in_flight(); skipped_frames();
         region_snapshots(); panfrost_readback(); idle_snapshot_publication();
         texture_generations();
         present_mapping(); no_blits_on_the_frame_path();

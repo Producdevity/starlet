@@ -510,7 +510,9 @@ struct GlesDirect::Impl {
         std::vector<std::uint8_t> vertices, dynamic_vertices;
         UniformBytes uniforms;
         std::vector<std::uint32_t> indices;
+        bool drop = false;
     };
+    std::uint64_t rendered_flushes = 0;
     std::vector<std::function<void()>> pending, retiring;
     std::vector<Program*> warming;
     // Executed segments return here with their storage kept for the next flush.
@@ -2951,8 +2953,9 @@ struct GlesDirect::Impl {
         for (unsigned map = 0; map < 8; ++map) if ((p.plan->maps & (1u << map)) && p.sampler_lod[map].update(s.sampler_lod[map]))
             glUniform4f(p.sampler_lod[map].location, s.sampler_lod[map][0], s.sampler_lod[map][1], s.sampler_lod[map][2], s.sampler_lod[map][3]);
     }
-    void flush() {
+    void flush(bool drop = false) {
         if (records.empty() && pending.empty() && retiring.empty() && warming.empty()) { reset_segment(); return; }
+        if (!drop && !records.empty()) ++rendered_flushes;
         seal_stream_page();
         trim_stream_pages();
         prepare_record_changes();
@@ -2963,6 +2966,7 @@ struct GlesDirect::Impl {
         }
         if (!segment_data) segment_data = std::make_shared<Segment>();
         auto& seg = *segment_data;
+        seg.drop = drop;
         seg.before.swap(pending);
         seg.warm.swap(warming);
         seg.records.swap(records); seg.states.swap(states); seg.runs.swap(runs);
@@ -2979,7 +2983,15 @@ struct GlesDirect::Impl {
     void execute(const std::shared_ptr<Segment>& segment_data) {
         auto& seg = *segment_data;
         { sync_stats::Task timed("seg: creations"); for (auto& op : seg.before) op(); }
-        if (!seg.records.empty()) draw_segment(seg);
+        if (!seg.records.empty()) {
+            if (seg.drop) {
+                // Uniform deltas are recorded against the program's previous draw; this one never ran.
+                for (auto& r : seg.records) r.program->uniform_chain_valid = false;
+                stats.dropped_draws += seg.records.size();
+            } else {
+                draw_segment(seg);
+            }
+        }
         // After the visible draws, so their programs reach the builder first.
         for (Program* p : seg.warm)
             if (!p->name && !p->rejected && builder && builder->running()) ready(*p);
@@ -3159,6 +3171,8 @@ void GlesDirect::draw(const State& state, const Draw& draw, MemoryReader& memory
     impl_->draw(state, draw, memory, cmpr);
 }
 void GlesDirect::flush() { impl_->flush(); }
+void GlesDirect::discard_draws() { impl_->flush(true); }
+std::uint64_t GlesDirect::rendered_flushes() const { return impl_->rendered_flushes; }
 void GlesDirect::next_frame() { ++impl_->frame; impl_->textures_changed(); impl_->pack_loose(); }
 void GlesDirect::invalidate(const void* data, std::size_t size) {
     impl_->invalidate_pointer(static_cast<const std::uint8_t*>(data), size);

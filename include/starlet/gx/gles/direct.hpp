@@ -111,6 +111,8 @@ struct GlesDirectStats {
     std::uint64_t static_stream_bytes = 0;
     std::uint64_t stream_reuses = 0, stream_updates = 0, stream_verified = 0;
     std::size_t geometry_bytes = 0, geometries = 0;
+    // Draws discard_draws() dropped; counted on the GL thread.
+    std::uint64_t dropped_draws = 0;
     std::uint64_t program_misses = 0, state_plans = 0, batched_draws = 0, culled_draws = 0, culled_clusters = 0;
     std::uint64_t state_hits = 0, state_misses = 0, program_hits = 0;
     std::uint64_t state_reuses = 0, raster_plan_hits = 0, texture_plan_hits = 0;
@@ -179,6 +181,11 @@ public:
     GlesDirect& operator=(const GlesDirect&) = delete;
     void draw(const State&, const Draw&, MemoryReader&, TextureCmprModel);
     void flush();
+    // As flush(), but the draws recorded since the last flush are not rendered. Their textures,
+    // programs and geometry still reach the GL side, so later draws find the caches as recorded.
+    void discard_draws();
+    // Flushes that handed draws to the GL thread, for telling whether anything rendered since.
+    std::uint64_t rendered_flushes() const;
     void next_frame();
     // CPU bytes in [data, data+size) changed; textures decoded from them are stale.
     void invalidate(const void* data, std::size_t size);

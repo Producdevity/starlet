@@ -147,6 +147,24 @@ without it the hooks do nothing.
 - Before `spo_frame` the bridge rebinds framebuffer 0, `GL_BACK` and texture unit 0, because the
   overlay expects the window's default state and Starlet's last pass leaves other bindings.
 
+### Skipping frames
+
+A port that runs two game ticks per presented frame calls `aurora_starlet_skip_frame()` after
+`aurora_begin_frame` in the first tick. That frame's GX state still updates and its draws are
+recorded, so textures, programs and geometry stay in step, but the GL thread does not render the
+draws and the frame is not presented. A frame that copies or reads the EFB (texture copies,
+offscreen passes, peeks) or fills a segment renders fully, because later frames may sample what it
+took from the EFB; it is not presented either. The log's `[starlet] rates:` line gives ticks,
+presented and skipped frames per second, and how many skipped frames rendered anyway.
+
+The call changes nothing unless the port makes it.
+
+### Menu options
+
+`aurora_starlet_overlay_option` adds a toggle or a choice to the overlay menu (see
+`backend.hpp`). `on_change` runs when the option registers, with the saved value, and on every
+change, on the GL thread or the main thread; hand the value to the game thread there.
+
 ## Performance
 
 Dusklight on an RG35XX H (H700, Mali-G31, muOS), 608x448, two lockstep runs each:

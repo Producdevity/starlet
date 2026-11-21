@@ -285,7 +285,12 @@ struct Backend {
   Efb efb_target;
   AuroraStream stream;
   bool frame_started = false;
+  // The frame in progress was marked with aurora_starlet_skip_frame.
+  bool skipping = false;
   std::atomic<bool> drawn{false};
+  std::atomic<bool> last_skipped{false};
+  std::atomic<std::uint64_t> presented{0};
+  std::uint64_t skipped_frames = 0, last_presented = 0, last_skipped_frames = 0;
   bool reported = false;
   std::uint64_t frames = 0, feed_us = 0;
   starlet::gx::GlesDirectStats last_direct;
@@ -327,6 +332,7 @@ struct Backend {
     if (now - last_report < std::chrono::seconds(5)) {
       return;
     }
+    const double seconds = std::chrono::duration<double>(now - last_report).count();
     last_report = now;
     const auto& s = stream.stats();
     const auto r = renderer->stats();
@@ -346,6 +352,12 @@ struct Backend {
              (d.culled_draws - last_direct.culled_draws) / n, (feed_us - last_feed_us) / n / 1000,
              (gl_us - last_gl_us) / n / 1000, (d.resident_copies - last_direct.resident_copies) / n,
              (d.resident_hits - last_direct.resident_hits) / n, (d.materialized - last_direct.materialized) / n);
+    const auto shown = presented.load();
+    Log.info("[starlet] rates: ticks={:.1f}/s presented={:.1f}/s skipped={:.1f}/s rendered_anyway={} dropped_records={}",
+             n / seconds, (shown - last_presented) / seconds, (skipped_frames - last_skipped_frames) / seconds,
+             r.skipped_frames_rendered, d.dropped_draws);
+    last_presented = shown;
+    last_skipped_frames = skipped_frames;
     Log.info("[starlet] stream per frame: aurora={:.0f} decoder_feeds={:.0f} drains={:.1f}",
              (s.aurora_commands - last_stream.aurora_commands) / n, (s.decoder_feeds - last_stream.decoder_feeds) / n,
              (s.drains - last_stream.drains) / n);
@@ -360,6 +372,7 @@ struct Backend {
 };
 
 std::atomic<Backend*> instance{nullptr};
+std::atomic<bool> skip_requested{false};
 std::once_flag created;
 
 #if STARLET_AURORA_UPSTREAM
@@ -539,6 +552,14 @@ void process(const std::uint8_t* data, std::size_t size) {
   if (!b->frame_started) {
     b->clear_efb();
     b->frame_started = true;
+    if (skip_requested.load()) {
+      try {
+        b->renderer->skip_frame();
+        b->skipping = true;
+      } catch (const std::exception& e) {
+        b->failures.note(e.what());
+      }
+    }
   }
   const auto start = std::chrono::steady_clock::now();
   b->memory.begin_feed();
@@ -642,6 +663,7 @@ static void present_frame(Backend& b) {
           Log.error("Starlet could not swap the window: {}", SDL_GetError());
         }
       }
+      ++b.presented;
     } catch (const std::exception& e) {
       b.failures.note(e.what());
     }
@@ -659,14 +681,22 @@ void end_frame() {
   if (!b) {
     return;
   }
+  const bool skipped = std::exchange(b->skipping, false) || skip_requested.load();
+  skip_requested = false;
   try {
     b->renderer->end_frame();
-    b->drawn = true;
+    if (!skipped) {
+      b->drawn = true;
+    }
   } catch (const std::exception& e) {
     b->failures.note(e.what());
   }
+  b->last_skipped = skipped;
+  b->skipped_frames += skipped;
 #if STARLET_AURORA_UPSTREAM
-  present_frame(*b);
+  if (!skipped) {
+    present_frame(*b);
+  }
 #else
   // Aurora's own passes this frame (UI, overlays) run after Starlet's work on the same
   // context and must not trust their state shadow.
@@ -685,7 +715,7 @@ void end_frame() {
 #if !STARLET_AURORA_UPSTREAM
 bool present(std::uint32_t target, std::uint32_t surface_width, std::uint32_t surface_height) {
   auto* b = instance.load();
-  if (!b || !b->drawn) {
+  if (!b || !b->drawn || b->last_skipped) {
     return false;
   }
   clear_aurora_errors();
@@ -707,6 +737,7 @@ bool present(std::uint32_t target, std::uint32_t surface_width, std::uint32_t su
   gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, target);
   gl::reset_state_cache();
   gl::invalidate_texture_bindings();
+  ++b->presented;
   return true;
 }
 #endif
@@ -784,4 +815,14 @@ void note_display_list(const void* data, std::size_t size) {
 
 extern "C" void aurora_starlet_note_write(const void* pointer, unsigned size) {
   aurora::starlet_backend::note_write(pointer, size);
+}
+
+extern "C" void aurora_starlet_skip_frame(void) {
+  if (aurora::starlet_backend::enabled()) {
+    aurora::starlet_backend::skip_requested = true;
+  }
+}
+
+extern "C" int aurora_starlet_overlay_option(const aurora_starlet_option* option) {
+  return option != nullptr && aurora::starlet_backend::overlay::add_option(*option) ? 1 : 0;
 }

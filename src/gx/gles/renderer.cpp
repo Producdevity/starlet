@@ -425,6 +425,8 @@ struct GlesRenderer::Impl {
     std::array<DepthReadback, 4> depth_readbacks;
     std::uint64_t live_depth_writes = ~std::uint64_t{0};
     std::uint64_t efb_writes = 0, last_snapshot_writes = 0;
+    bool skipping = false, skip_touched = false;
+    std::uint64_t skip_flushes = 0;
     // Each packed snapshot is read back asynchronously into its buffer; once the fence
     // signals, the GL thread maps it and publishes the generation, so peeks read single
     // pixels from the mapping instead of waiting for queued GL work. The mapping lasts
@@ -1005,6 +1007,7 @@ void main(){
     void require_ready() {
         check_owner();
         if (failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
+        if (skipping) skip_touched = true;
         flush_copies();
         flush_direct();
     }
@@ -2970,9 +2973,29 @@ void GlesRenderer::start_submission_on(std::function<void(std::function<void()>)
     q.running = true;
     g.ensure_direct();
 }
+void GlesRenderer::skip_frame() {
+    auto& g = *impl_; g.check_owner();
+    if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
+    if (g.skipping) return;
+    g.ensure_direct();
+    g.skipping = true; g.skip_touched = false;
+    g.skip_flushes = g.direct->rendered_flushes();
+}
 void GlesRenderer::end_frame() {
     STARLET_GX_TRACE_RENDERER(end_frame);
-    auto& g = *impl_; g.require_ready();
+    auto& g = *impl_;
+    if (g.skipping) {
+        g.skipping = false;
+        const bool rendered = g.skip_touched || g.direct->rendered_flushes() != g.skip_flushes;
+        g.check_owner();
+        if (g.failed) throw std::runtime_error("GLES renderer failed; destroy it before further rendering");
+        g.flush_copies();
+        try { if (rendered) g.direct->flush(); else g.direct->discard_draws(); } catch (...) { g.failed = true; throw; }
+        ++g.stats.skipped_frames;
+        if (rendered) ++g.stats.skipped_frames_rendered;
+    } else {
+        g.require_ready();
+    }
     g.execute([&g] {
         try { g.bound_frames(); gl_check("GLES frame end"); } catch (...) { g.failed = true; throw; }
     }, false);

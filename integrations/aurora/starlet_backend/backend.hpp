@@ -49,5 +49,36 @@ void note_display_list(const void* data, std::size_t size);
 
 } // namespace aurora::starlet_backend
 
+extern "C" {
 // The game's DCStoreRange and DCFlushRange stubs call this.
-extern "C" void aurora_starlet_note_write(const void* pointer, unsigned size);
+void aurora_starlet_note_write(const void* pointer, unsigned size);
+
+// Opt-in. Game thread, after aurora_begin_frame and before the frame's first draw: the frame's GX
+// state updates and its draws are recorded, but the GL thread does not render them and the frame
+// is not presented. A frame that copies or reads the EFB, or fills a segment, renders anyway,
+// since later frames may sample the copy; it is still not presented. Without it, and without
+// AURORA_RENDERER=starlet, nothing changes.
+void aurora_starlet_skip_frame(void);
+
+enum { AURORA_STARLET_OPTION_TOGGLE = 0, AURORA_STARLET_OPTION_CHOICE = 1 };
+// One row of the overlay menu. Strings are copied. A page is created by its first option, and
+// all options of a page must be added together. Add them before the first presented frame; the
+// overlay refuses later ones. key and page_key use a-z, 0-9, _ and -, at most 32 characters.
+typedef struct aurora_starlet_option {
+  const char* page_key;
+  const char* page_label;
+  int type;
+  const char* key;
+  const char* label;
+  const char* help;
+  int default_value; // A toggle's 0 or 1, or a choice's index; a saved value replaces it.
+  const char* const* choices;
+  unsigned choice_count;
+  // Runs when the option registers (with the saved or default value) and on every change, on the
+  // GL thread or the main thread, with the overlay locked. Return 0 to accept the value.
+  int (*on_change)(int value, void* user);
+  void* user;
+} aurora_starlet_option;
+// Any thread. False when the overlay is not built in.
+int aurora_starlet_overlay_option(const aurora_starlet_option* option);
+}
