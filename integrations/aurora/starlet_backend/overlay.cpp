@@ -114,6 +114,10 @@ bool event(const SDL_Event& e) {
     return false;
   }
   std::lock_guard lock(g_lock);
+  // The second screen's window and touch events; the overlay keeps its own touches from the game.
+  if (spo_handle_sdl3_screen_event(&e) != 0) {
+    return true;
+  }
   switch (e.type) {
   case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
   case SDL_EVENT_GAMEPAD_BUTTON_UP:
