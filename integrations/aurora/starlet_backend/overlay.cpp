@@ -208,8 +208,13 @@ bool event(const SDL_Event& e) {
   switch (e.type) {
   case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
   case SDL_EVENT_GAMEPAD_BUTTON_UP:
-    return spo_handle_input(e.gbutton.which, e.gbutton.button < kButtons.size() ? kButtons[e.gbutton.button] : SPO_OTHER,
-                            e.gbutton.down ? 1 : 0) != 0;
+    if (spo_handle_input(e.gbutton.which, e.gbutton.button < kButtons.size() ? kButtons[e.gbutton.button] : SPO_OTHER,
+                         e.gbutton.down ? 1 : 0) != 0) {
+      return true;
+    }
+    // Aurora's process_event owns the event and reads it next; "Face buttons" rewrites it there.
+    spo_map_sdl3_event(const_cast<SDL_Event*>(&e));
+    return false;
   case SDL_EVENT_GAMEPAD_AXIS_MOTION:
     if (e.gaxis.axis >= kAxes.size()) {
       return spo_input_captured() != 0;

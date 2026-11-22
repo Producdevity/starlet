@@ -3,12 +3,25 @@
 #include <SDL.h>
 
 #include <array>
+#include <cstdint>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 
+#if defined(__ELF__)
+// sbc-port-overlay's "Face buttons" option; absent unless the port links the overlay.
+extern "C" uint32_t spo_face_button(uint32_t) __attribute__((weak));
+#endif
+
 namespace starlet::host {
 namespace {
+
+unsigned face_mapped(unsigned button) {
+#if defined(__ELF__)
+    if (spo_face_button) return unsigned(spo_face_button(button));
+#endif
+    return button;
+}
 
 constexpr unsigned max_slots = 4;
 
@@ -16,7 +29,7 @@ Gamepad sample(SDL_GameController* controller) {
     Gamepad pad;
     pad.connected = true;
     for (unsigned i = 0; i <= unsigned(Input::dpad_right); ++i)
-        if (SDL_GameControllerGetButton(controller, SDL_GameControllerButton(i))) pad.buttons |= bit(Input(i));
+        if (SDL_GameControllerGetButton(controller, SDL_GameControllerButton(face_mapped(i)))) pad.buttons |= bit(Input(i));
     pad.left_x = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTX);
     pad.left_y = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY);
     pad.right_x = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_RIGHTX);
