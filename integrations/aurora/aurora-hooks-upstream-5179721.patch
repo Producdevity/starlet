@@ -1,7 +1,7 @@
 From 1a10548156b0b94b487bf80c0922a368ad77781d Mon Sep 17 00:00:00 2001
 From: Producdevity <y.gherbi.dev@gmail.com>
 Date: Tue, 17 Nov 2026 14:52:49 +0100
-Subject: [PATCH 1/2] Add an AURORA_RENDERER=starlet path without Dawn
+Subject: [PATCH 1/3] Add an AURORA_RENDERER=starlet path without Dawn
 
 With AURORA_STARLET_DIR set, AURORA_RENDERER=starlet makes Aurora create
 its SDL3 window with SDL_WINDOW_OPENGL and OpenGL ES 3.1 attributes,
@@ -445,7 +445,7 @@ index cf84de3..b509d22 100644
 From 11699416e485a7dcff16621292239f68ede2b0ab Mon Sep 17 00:00:00 2001
 From: Producdevity <y.gherbi.dev@gmail.com>
 Date: Tue, 17 Nov 2026 21:24:53 +0100
-Subject: [PATCH 2/2] Offer SDL events to the Starlet overlay and build it when
+Subject: [PATCH 2/3] Offer SDL events to the Starlet overlay and build it when
  STARLET_OVERLAY_DIR is set
 
 ---
@@ -517,6 +517,167 @@ index b509d22..6f56926 100644
    const bool primaryWindow = targets_primary_window(&event);
    const bool routed = primaryWindow && input::sdl::is_routed_event(event);
    if (primaryWindow && !routed) {
+-- 
+2.56.0
+
+
+From 32464a8890c8de54efbd21fce2dec43fc3141900 Mon Sep 17 00:00:00 2001
+From: Producdevity <y.gherbi.dev@gmail.com>
+Date: Fri, 27 Nov 2026 00:05:24 +0100
+Subject: [PATCH 3/3] Draw RmlUi through the Starlet bridge under
+ AURORA_RENDERER=starlet
+
+---
+ cmake/aurora_gx.cmake                        |  3 ++
+ lib/aurora.cpp                               |  8 ++++-
+ lib/rmlui.cpp                                | 33 ++++++++++++++++----
+ lib/rmlui.hpp                                |  3 ++
+ lib/starlet_stub/starlet_backend/backend.hpp |  6 ++++
+ 5 files changed, 46 insertions(+), 7 deletions(-)
+
+diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
+index 5bd3ee6..515ff0c 100644
+--- a/cmake/aurora_gx.cmake
++++ b/cmake/aurora_gx.cmake
+@@ -69,6 +69,9 @@ if (AURORA_STARLET_DIR)
+     foreach (_name aurora_stream backend host_memory issues overlay texture_convert)
+         list(APPEND _starlet_bridge_sources "${AURORA_STARLET_BRIDGE_DIR}/starlet_backend/${_name}.cpp")
+     endforeach ()
++    if (AURORA_ENABLE_RMLUI)
++        list(APPEND _starlet_bridge_sources "${AURORA_STARLET_BRIDGE_DIR}/starlet_backend/rmlui.cpp")
++    endif ()
+     target_sources(aurora_gx PRIVATE ${_starlet_bridge_sources})
+     # The bridge reaches Aurora's internal headers through lib/.
+     set_source_files_properties(${_starlet_bridge_sources} PROPERTIES
+diff --git a/lib/aurora.cpp b/lib/aurora.cpp
+index cb4dc39..4fbfac3 100644
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -203,7 +203,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
+ #endif
+ 
+ #ifdef AURORA_ENABLE_RMLUI
+-  if (!starlet_backend::enabled()) {
++  if (!starlet_backend::enabled() || starlet_backend::rmlui_interface() != nullptr) {
+     rmlui::initialize(size);
+   }
+ #endif
+@@ -223,6 +223,9 @@ void shutdown() noexcept {
+ #ifdef AURORA_ENABLE_GX
+   gx::fifo::shutdown();
+   if (starlet_backend::enabled()) {
++#ifdef AURORA_ENABLE_RMLUI
++    rmlui::shutdown();
++#endif
+     starlet_backend::shutdown();
+   } else {
+     gfx::render_worker::synchronize();
+@@ -288,6 +291,9 @@ void end_frame() noexcept {
+   gx::fifo::drain();
+   gx::fifo::end_frame();
+   if (starlet_backend::enabled()) {
++#ifdef AURORA_ENABLE_RMLUI
++    rmlui::record_starlet_frame();
++#endif
+     starlet_backend::end_frame();
+     return;
+   }
+diff --git a/lib/rmlui.cpp b/lib/rmlui.cpp
+index b3a662a..9731615 100644
+--- a/lib/rmlui.cpp
++++ b/lib/rmlui.cpp
+@@ -19,6 +19,8 @@
+ #include "rmlui/WebGPURenderInterface.hpp"
+ #include "webgpu/gpu.hpp"
+ 
++#include <starlet_backend/backend.hpp>
++
+ namespace aurora::rmlui {
+ Rml::Context* g_context = nullptr;
+ FileInterface_SDL* g_fileInterface = nullptr;
+@@ -420,14 +422,17 @@ void initialize(const AuroraWindowSize& size) noexcept {
+ 
+   g_fileInterface = new FileInterface_SDL();
+ 
+-  auto* renderInterface = get_render_interface();
+   Rml::SetSystemInterface(Backend::GetSystemInterface());
+-  Rml::SetRenderInterface(renderInterface);
+   Rml::SetFileInterface(g_fileInterface);
+-
+-  renderInterface->SetWindowSize(dim);
+-  renderInterface->SetRenderTargetFormat(webgpu::g_graphicsConfig.surfaceConfiguration.format);
+-  renderInterface->CreateDeviceObjects();
++  if (auto* starletInterface = starlet_backend::rmlui_interface()) {
++    Rml::SetRenderInterface(starletInterface);
++  } else {
++    auto* renderInterface = get_render_interface();
++    Rml::SetRenderInterface(renderInterface);
++    renderInterface->SetWindowSize(dim);
++    renderInterface->SetRenderTargetFormat(webgpu::g_graphicsConfig.surfaceConfiguration.format);
++    renderInterface->CreateDeviceObjects();
++  }
+ 
+   Rml::Initialise();
+   register_image_effects();
+@@ -564,6 +569,22 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
+   };
+ }
+ 
++void record_starlet_frame() noexcept {
++  if (g_context == nullptr) {
++    return;
++  }
++  ZoneScoped;
++  const auto size = window::get_window_size();
++  const Rml::Vector2i dim = presentation_dimensions_from_window_size(size);
++  sync_context_metrics(dim);
++  g_context->Update();
++  // The same rectangle map_native_point_to_content maps input from.
++  const auto viewport = webgpu::calculate_present_viewport(size.native_fb_width, size.native_fb_height,
++                                                           static_cast<uint32_t>(dim.x), static_cast<uint32_t>(dim.y));
++  starlet_backend::rmlui_record(*g_context, static_cast<int>(viewport.left), static_cast<int>(viewport.top),
++                                static_cast<int>(viewport.width), static_cast<int>(viewport.height));
++}
++
+ void shutdown() noexcept {
+   if (g_context == nullptr) {
+     return;
+diff --git a/lib/rmlui.hpp b/lib/rmlui.hpp
+index 22c31d4..1a30c99 100644
+--- a/lib/rmlui.hpp
++++ b/lib/rmlui.hpp
+@@ -17,6 +17,9 @@ struct RecordedFrame {
+ void initialize(const AuroraWindowSize& size) noexcept;
+ void handle_window_event(const SDL_Event& event) noexcept;
+ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept;
++// AURORA_RENDERER=starlet, main thread before starlet_backend::end_frame: hands the context's
++// draws to the Starlet bridge, which draws them over the frame it presents.
++void record_starlet_frame() noexcept;
+ void shutdown() noexcept;
+ 
+ } // namespace aurora::rmlui
+diff --git a/lib/starlet_stub/starlet_backend/backend.hpp b/lib/starlet_stub/starlet_backend/backend.hpp
+index af0ff30..1cc235f 100644
+--- a/lib/starlet_stub/starlet_backend/backend.hpp
++++ b/lib/starlet_stub/starlet_backend/backend.hpp
+@@ -4,6 +4,10 @@
+ #include <cstdint>
+ 
+ union SDL_Event;
++namespace Rml {
++class Context;
++class RenderInterface;
++} // namespace Rml
+ 
+ // Stand-in for the Starlet bridge when AURORA_STARLET_DIR is not set: every hook is inert.
+ namespace aurora::starlet_backend {
+@@ -16,4 +20,6 @@ inline void shutdown() {}
+ inline const void* texture_data(const void* data, std::size_t) { return data; }
+ inline void note_display_list(const void*, std::size_t) {}
+ inline bool overlay_event(const union SDL_Event&) { return false; }
++inline Rml::RenderInterface* rmlui_interface() { return nullptr; }
++inline void rmlui_record(Rml::Context&, int, int, int, int) {}
+ } // namespace aurora::starlet_backend
 -- 
 2.56.0
 

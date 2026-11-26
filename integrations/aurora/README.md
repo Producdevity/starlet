@@ -28,7 +28,8 @@ cmake -S . -B build -DAURORA_STARLET_DIR="$PWD/extern/starlet" -DSTARLET_HOST=OF
 Without `AURORA_STARLET_DIR` the hooks compile to nothing. With it, `AURORA_RENDERER=starlet`:
 
 - creates the SDL3 window with `SDL_WINDOW_OPENGL` and OpenGL ES 3.1 attributes;
-- skips Dawn, `gfx::initialize`, the render worker, ImGui and RmlUi (neither is available);
+- skips Dawn, `gfx::initialize`, the render worker and ImGui;
+- draws RmlUi with the bridge's render interface when Aurora is built with `AURORA_ENABLE_RMLUI`;
 - drains the GX FIFO on the calling thread into the bridge;
 - presents each frame letterboxed 4:3 from the bridge's GL thread with `SDL_GL_SwapWindow`.
 

@@ -11,8 +11,8 @@ It has the bridge (`starlet_backend/`) and one Aurora patch per tree.
 
 | Aurora | Patch | Overlays under Starlet |
 |---|---|---|
-| encounter/aurora `5794daa` (upstream, WebGPU) | `aurora-hooks-upstream.patch` | none |
-| encounter/aurora `5179721` (upstream, older) | `aurora-hooks-upstream-5179721.patch` | none |
+| encounter/aurora `5794daa` (upstream, WebGPU) | `aurora-hooks-upstream.patch` | RmlUi, drawn by Starlet |
+| encounter/aurora `5179721` (upstream, older) | `aurora-hooks-upstream-5179721.patch` | RmlUi, drawn by Starlet |
 | bmdhacks/aurora `3fbacee` (OpenGL ES fork, Dusklight) | `aurora-hooks-gles-fork.patch` | RmlUi and ImGui keep working |
 
 Other upstream revisions need the patch applied by hand; the changes are listed below.
@@ -56,7 +56,9 @@ All of them are gated by `starlet_backend::enabled()`.
 |---|---|
 | `cmake/aurora_gx.cmake` | Adds the bridge sources and `starlet::gx_gles`, or the stubs in `lib/starlet_stub` |
 | `lib/window.cpp` | Window with `SDL_WINDOW_OPENGL` and ES 3.1 attributes; no WebGPU surface |
-| `lib/aurora.cpp`, init | Skips Dawn, `gfx::initialize`, the render worker, ImGui and RmlUi |
+| `lib/aurora.cpp`, init | Skips Dawn, `gfx::initialize`, the render worker and ImGui |
+| `lib/rmlui.cpp`, `initialize` | Uses the bridge's RmlUi render interface instead of the WebGPU one |
+| `lib/aurora.cpp`, `end_frame()` | `rmlui::record_starlet_frame()` updates the RmlUi context and records its draws |
 | `lib/gx/fifo.cpp`, `drain()` | `starlet_backend::process()` replaces Aurora's command processor; FIFO in drain mode |
 | `lib/aurora.cpp`, `end_frame()` | Drain, `starlet_backend::end_frame()`, present, return |
 | `lib/aurora.cpp`, shutdown | `starlet_backend::shutdown()` before the rest |
@@ -74,9 +76,26 @@ Aurora's `GXSetScissorBoxOffset` writes BP `0x59` with the wrong sign: field 853
 writes 171. The bridge rewrites it. Without that, every draw falls outside the scissor and only the
 frame-start clear colour reaches the screen.
 
-Under Starlet the port has no launcher, ESC menu or overlays, and no texture replacement. A port that
-requires RmlUi or ImGui at startup needs a change to start without them; pass the disc image on the
-command line.
+Under Starlet the port has no ImGui and no texture replacement. Code that calls ImGui, including
+code in RmlUi screens, must check `ImGui::GetCurrentContext()` first.
+
+### RmlUi under Starlet
+
+RmlUi renders on the main thread into a recording. The GL thread draws it over the game frame in the
+same render pass, before sbc-port-overlay and the swap. RmlUi's `Context::Update()` runs every frame,
+as it does with WebGPU.
+
+| RmlUi feature | Under Starlet |
+|---|---|
+| Geometry, textures, fonts, transforms, scissor | Drawn |
+| Linear, radial and conic gradients, repeating or not | Drawn |
+| `box-shadow` | Drawn; a blurred shadow has a hard edge |
+| `opacity` and `brightness` filters | Applied to the colour of each draw, not to a flattened layer, so overlapping children show through each other |
+| Other filters: `blur`, `drop-shadow`, `backdrop-filter`, Aurora's `glass` | Ignored; the element is drawn without the effect |
+| Clip masks (`border-radius` with `overflow: hidden`, `clip-path`) | Rectangular clipping only |
+| `mask-image` | Ignored |
+| Other shaders | Not drawn; the log names the shader |
+| Blend modes | Normal blending only |
 
 ## Build: GLES fork
 

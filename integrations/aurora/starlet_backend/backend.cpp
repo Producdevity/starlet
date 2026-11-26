@@ -4,6 +4,7 @@
 #include "host_memory.hpp"
 #include "issues.hpp"
 #include "overlay.hpp"
+#include "rmlui.hpp"
 #include "texture_writes.hpp"
 
 #include "aurora_host.hpp"
@@ -591,14 +592,17 @@ static void present_frame(Backend& b) {
     g.idle.wait(lock, [&] { return g.presents_pending < 2; });
     ++g.presents_pending;
   }
-  g.thread.post([&b, &g, left, bottom, width, height, surface_width, surface_height] {
+  std::shared_ptr<rmlui::Frame> ui = rmlui::take_frame();
+  g.thread.post([&b, &g, ui, left, bottom, width, height, surface_width, surface_height] {
     try {
+      if (ui) rmlui::prepare(*ui);
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
       glDisable(GL_SCISSOR_TEST);
       glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
       glClearColor(0.f, 0.f, 0.f, 1.f);
       glClear(GL_COLOR_BUFFER_BIT);
       b.renderer->present_into(0, b.frame_width, b.efb.height, left, bottom, width, height);
+      if (ui) rmlui::draw(*ui, surface_width, surface_height);
       overlay::frame(surface_width, surface_height);
       if (!SDL_GL_SwapWindow(g.window)) {
         static bool reported = false;
@@ -697,6 +701,7 @@ void shutdown() {
     // GL objects die on the thread that owns the context.
     g.thread.run([b] {
       b->renderer->adopt_thread();
+      rmlui::shutdown_gl();
       overlay::shutdown();
       delete b;
     });

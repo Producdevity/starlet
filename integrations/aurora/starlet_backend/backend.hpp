@@ -4,6 +4,10 @@
 #include <cstdint>
 
 union SDL_Event;
+namespace Rml {
+class Context;
+class RenderInterface;
+} // namespace Rml
 
 // Draws Aurora's GX command stream with Starlet's OpenGL ES renderer instead of Aurora's
 // own, when the environment sets AURORA_RENDERER=starlet.
@@ -35,6 +39,12 @@ void shutdown();
 // Upstream tree, main thread, from Aurora's SDL event loop: offers an event to the optional
 // performance overlay. True when the overlay used it, so the game must not see it.
 bool overlay_event(const union SDL_Event& event);
+// Upstream tree with AURORA_ENABLE_RMLUI: the render interface RmlUi draws through, or null when
+// the bridge is off.
+Rml::RenderInterface* rmlui_interface();
+// Main thread, before end_frame: records what the context shows, drawn over the game frame into
+// the window rectangle (x, y from the top left, in pixels) at the next present.
+void rmlui_record(Rml::Context& context, int x, int y, int width, int height);
 // Any thread: the game stored, flushed or invalidated a range of its data cache, which it
 // does around CPU writes and DMA into memory the GPU reads.
 void note_write(const void* pointer, std::size_t size);
