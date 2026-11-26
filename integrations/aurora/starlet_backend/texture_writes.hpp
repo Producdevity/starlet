@@ -7,6 +7,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <new>
 #include <unordered_set>
 
 namespace aurora::starlet_backend {
@@ -22,7 +23,7 @@ public:
   static constexpr std::size_t frame_bytes = 4 << 20, kept_bytes = 12 << 20, pool_bytes = frame_bytes + kept_bytes;
   static constexpr unsigned verify_period = 16, max_refreshes = 4;
 
-  TextureWrites() : pool_(static_cast<std::uint8_t*>(std::aligned_alloc(32, pool_bytes))) {}
+  TextureWrites() : pool_(static_cast<std::uint8_t*>(::operator new(pool_bytes, std::align_val_t(32)))) {}
   const std::uint8_t* pool() const { return pool_; }
 
   void note(const void* pointer, std::size_t size) {
