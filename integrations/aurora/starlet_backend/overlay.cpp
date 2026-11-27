@@ -134,6 +134,7 @@ bool start() {
   const char* name = std::getenv("STARLET_OVERLAY_NAME");
   config.port_name = name != nullptr && *name != '\0' ? name : "Aurora port";
   config.port_version = "Starlet renderer";
+  config.port_author = std::getenv("STARLET_OVERLAY_AUTHOR");
   if (const spo_result result = spo_init(&config); result != SPO_OK) {
     Log.error("overlay: spo_init failed ({})", static_cast<int>(result));
     return false;

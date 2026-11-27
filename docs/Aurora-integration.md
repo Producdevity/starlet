@@ -158,7 +158,7 @@ keep an unstripped build and use gdb.
 FPS, load and memory readout. Build with `-DSTARLET_OVERLAY_DIR=<sbc-port-overlay checkout>`;
 without it the hooks do nothing.
 
-- `STARLET_OVERLAY_NAME` names the port in the menu. Settings live in `conf/overlay.ini`, relative
+- `STARLET_OVERLAY_NAME` names the port in the menu. `STARLET_OVERLAY_AUTHOR` shows "Port by <author>" for 5 seconds at start and on the About tab. Settings live in `conf/overlay.ini`, relative
   to the working directory.
 - The bridge draws the overlay on its GL thread after the frame and before `SDL_GL_SwapWindow`.
 - Aurora's event loop offers each gamepad event to the overlay first. While its menu is open, the
